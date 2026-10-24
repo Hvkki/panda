@@ -1,0 +1,95 @@
+# Runbook
+
+Load the keys first, in the shell you work from:
+
+```bash
+set -a; . ./panda-api-keys.env; set +a
+```
+
+## Start, stop, check
+
+- **Start / Stop:** the chip in the app's top bar. Or call the `session` function with the owner's
+  sign-in: `POST $SUPABASE_URL/functions/v1/session` with `{"action": "start" | "stop" | "status"}`.
+- **Check the worker:** the newest `worker_sessions` row (`status`, `heartbeat_at`). Or insert a
+  `commands` row with `op = "ping"` and read its `result`.
+- **Read the worker log:** `kaggle kernels output vladraf/kirocrew-worker -p out -o`. Look for
+  `running; waiting for messages` and `answered message N`.
+- **A running worker keeps its code.** After any worker change: `./scripts/deploy-worker.sh`,
+  then Stop, then Start.
+
+## Deploy
+
+- **Web app:** `python3 scripts/deploy-app.py`. It builds `app/` and deploys to production through
+  the Vercel REST API. The Vercel CLI rejected the account token, so the API is used.
+- **Worker:** `./scripts/deploy-worker.sh`. It uploads `worker/worker.py`, `worker/prompt.md` and the
+  skills to the Storage bucket `kirocrew-state`.
+- **Database:** in the Supabase SQL editor, run `supabase/schema.sql`, then
+  `supabase/migration_002_app.sql`, then `supabase/migration_003_panda.sql`. Safe to re-run.
+- **`session` function:** Supabase dashboard → Edge Functions → `session`. Paste
+  `supabase/functions/session/index.ts`. Set the function secrets `KAGGLE_API_TOKEN`,
+  `KAGGLE_KERNEL` and `KAGGLE_DATASET` (values in the keys file).
+- **Auth settings:** Site URL `https://panda-app-gamma.vercel.app`. Redirect URL
+  `https://panda-app-gamma.vercel.app/**`. "Allow new users to sign up" OFF.
+
+## Rotate keys
+
+The keys were pasted into a chat transcript while Panda was built, so rotate them.
+
+1. Rotate each one at its provider:
+   - Supabase: secret and publishable keys (API settings). Reset the worker user's password.
+   - Kiro portal: API key.
+   - Kaggle: API token.
+   - Vercel: account token (and revoke the unused `vck_` key).
+   - Google Cloud: OAuth client secret. Then sign in to Drive again (below).
+   - VAPID: generate a new key pair. Users must turn notifications on again.
+   - Browser key: a new key makes the saved browser logins unreadable. Ask Panda to run
+     `pb forget` or use Settings → Forget.
+2. Update `panda-api-keys.env`.
+3. `python3 scripts/kaggle-dataset-sync.py --dry-run` shows which fields differ (names only).
+   Run it without `--dry-run` to upload the new values to the Kaggle dataset.
+4. Stop, then Start the worker. It reads the dataset when it starts.
+
+## Google Drive sign-in (when the refresh token stops working)
+
+Testing-mode refresh tokens expire after 7 days. The published app avoids this for new grants.
+To sign in again, use an OAuth link with scope `https://www.googleapis.com/auth/drive.file`,
+PKCE, and redirect `http://127.0.0.1:8765`. Copy the full address you land on, exchange the
+code for a refresh token, put it in `panda-api-keys.env` as `GOOGLE_DRIVE_REFRESH_TOKEN`, and
+run the dataset sync.
+
+## Live tests
+
+These use Kaggle time and Kiro credits, and they create chats. Each one should end with a stop.
+
+Before a test run, give the tester account a new random password through the admin API (the tests
+sign in with it):
+
+```bash
+PW="T-$(python3 -c 'import secrets;print(secrets.token_urlsafe(18))')"
+curl -s -o /dev/null -X PUT "$SUPABASE_URL/auth/v1/admin/users/<tester-user-id>" \
+  -H "apikey: $SUPABASE_SECRET_KEY" -H "Authorization: Bearer $SUPABASE_SECRET_KEY" \
+  -H "Content-Type: application/json" -d "{\"password\":\"$PW\"}"
+export TESTER_PASSWORD="$PW" TESTER_EMAIL=tester@kirocrew.local
+export SB_URL="$SUPABASE_URL" SB_PUBLISHABLE="$SUPABASE_PUBLISHABLE_KEY"
+```
+
+Use the tester user id that appears in `tools/*.py`. Lock the account again afterwards.
+
+| Script | What it proves |
+|---|---|
+| `tools/test_phase2.py start \| test \| test2 \| stop` | Files, attachments, projects, vault, commands |
+| `tools/test_drive_kaggle.py start \| test \| stop` | Big-file offload to Drive and the `drive` command |
+| `tools/probe_stream.py` | Step-by-step timing of one reply |
+| `tools/probe_think.py` | The thinking stream |
+| `tools/test_browser_kaggle.py start \| run \| check \| stop` | Browser on Kaggle, take-over, cookies after restart |
+| `tools/test_browser_local.py` | Browser engine on your machine, against live Realtime |
+| `tools/test_client.py` | Phone stand-in: request, wait, chat, stop |
+
+## Local setup
+
+- **Python:** `pip install -r tools/requirements.txt`.
+- **Playwright Chromium:** `python -m playwright install chromium`. The worker installs it on Kaggle.
+  In the authoring sandbox the binary was `/inner_container/opt/playwright/chromium-1232/chrome-linux64/chrome`,
+  launched with `--no-sandbox --disable-crash-reporter --disable-gpu`.
+- **Kiro CLI** (only to run Kiro Crew locally): `curl -fsSL https://cli.kiro.dev/install | bash`.
+- **Node 22** for `app/`.

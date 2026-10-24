@@ -1,0 +1,58 @@
+import { useSettings } from "./settings";
+
+const en = {
+  morning: "Morning", afternoon: "Afternoon", evening: "Evening", night: "Up late",
+  placeholder: "Ask anything, or type / for shortcuts", newChat: "New chat", search: "Search",
+  chats: "Chats", pinned: "Pinned", settings: "Settings", signOut: "Log out",
+  start: "Start", stop: "Stop", starting: "Starting…", stopping: "Saving…", running: "Online",
+  offline: "Offline", queued: "Queued — Panda will answer when it's online",
+  thinking: "Thinking", thought: "Thought process", approve: "Approve", deny: "Deny",
+  alwaysAllow: "Always allow", approvalNeeded: "Panda wants to use a tool",
+  copy: "Copy", copied: "Copied", stopGen: "Stop", retry: "Retry", rename: "Rename", pin: "Pin",
+  unpin: "Unpin", delete: "Delete", effort: "Effort", moreModels: "More models",
+  notifications: "Notifications", empty: "No chats yet", noResults: "No results",
+};
+type Dict = typeof en;
+
+const it: Dict = {
+  morning: "Buongiorno", afternoon: "Buon pomeriggio", evening: "Buonasera", night: "Ancora sveglio",
+  placeholder: "Chiedi qualsiasi cosa, o scrivi / per le scorciatoie", newChat: "Nuova chat", search: "Cerca",
+  chats: "Chat", pinned: "Fissate", settings: "Impostazioni", signOut: "Esci",
+  start: "Avvia", stop: "Ferma", starting: "Avvio…", stopping: "Salvataggio…", running: "Online",
+  offline: "Offline", queued: "In coda — Panda risponderà appena online",
+  thinking: "Sto pensando", thought: "Ragionamento", approve: "Approva", deny: "Rifiuta",
+  alwaysAllow: "Consenti sempre", approvalNeeded: "Panda vuole usare uno strumento",
+  copy: "Copia", copied: "Copiato", stopGen: "Ferma", retry: "Riprova", rename: "Rinomina", pin: "Fissa",
+  unpin: "Sblocca", delete: "Elimina", effort: "Sforzo", moreModels: "Altri modelli",
+  notifications: "Notifiche", empty: "Nessuna chat", noResults: "Nessun risultato",
+};
+
+const uk: Dict = {
+  morning: "Доброго ранку", afternoon: "Доброго дня", evening: "Добрий вечір", night: "Ще не спиш",
+  placeholder: "Запитай будь-що або введи / для швидких команд", newChat: "Новий чат", search: "Пошук",
+  chats: "Чати", pinned: "Закріплені", settings: "Налаштування", signOut: "Вийти",
+  start: "Запуск", stop: "Стоп", starting: "Запуск…", stopping: "Збереження…", running: "Онлайн",
+  offline: "Офлайн", queued: "У черзі — Panda відповість, щойно буде онлайн",
+  thinking: "Думаю", thought: "Хід думок", approve: "Дозволити", deny: "Відхилити",
+  alwaysAllow: "Завжди дозволяти", approvalNeeded: "Panda хоче використати інструмент",
+  copy: "Копіювати", copied: "Скопійовано", stopGen: "Стоп", retry: "Повторити", rename: "Перейменувати",
+  pin: "Закріпити", unpin: "Відкріпити", delete: "Видалити", effort: "Зусилля", moreModels: "Інші моделі",
+  notifications: "Сповіщення", empty: "Ще немає чатів", noResults: "Нічого не знайдено",
+};
+
+const DICTS = { en, it, uk };
+export type Key = keyof Dict;
+
+export function useT() {
+  const { settings } = useSettings();
+  const d = DICTS[settings.language] ?? en;
+  return (k: Key) => d[k] ?? en[k];
+}
+
+export function greetingKey(): Key {
+  const h = new Date().getHours();
+  if (h < 5) return "night";
+  if (h < 12) return "morning";
+  if (h < 18) return "afternoon";
+  return "evening";
+}

@@ -1,0 +1,14 @@
+{
+  "id": "vladraf/kirocrew-worker",
+  "title": "kirocrew worker",
+  "code_file": "worker.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": ["vladraf/kirocrew-test-secret"],
+  "competition_sources": [],
+  "kernel_sources": []
+}

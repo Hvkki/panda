@@ -1,0 +1,14 @@
+{
+  "id": "vladraf/kirocrew-kaggle-smoke-test",
+  "title": "kirocrew kaggle smoke test",
+  "code_file": "kiro_test.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": ["vladraf/kirocrew-test-secret"],
+  "competition_sources": [],
+  "kernel_sources": []
+}

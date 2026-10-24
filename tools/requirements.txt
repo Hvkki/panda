@@ -1,0 +1,18 @@
+# Live tests and probes (tools/)
+kaggle
+requests
+websockets
+websocket-client
+google-auth
+playwright
+aiohttp
+cryptography
+pywebpush
+py-vapid
+pyflakes
+
+# Skills, only needed to test them locally (the worker installs them itself)
+reportlab
+python-docx
+python-pptx
+pillow

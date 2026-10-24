@@ -1,0 +1,34 @@
+# Keys and credentials: never commit. The owner keeps the real values in
+# panda-api-keys.env, outside this repository.
+.env
+.env.*
+!.env.example
+*.env
+panda-api-keys*
+secrets/
+.vapid.json
+drive.json
+worker.json
+.gauth/
+.gcp/
+service-account*.json
+*.pem
+*.key
+
+# Build output and dependencies
+node_modules/
+app/dist/
+__pycache__/
+*.pyc
+.venv/
+.kvenv/
+.kirohome/
+.pwhome/
+.pytest_cache/
+
+# Vendored upstream: fetched by scripts/fetch-kirocrew.sh, pinned in vendor/KIROCREW.md
+vendor/KiroCrew/
+
+# OS files and archives
+.DS_Store
+*.zip
