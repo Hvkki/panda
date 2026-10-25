@@ -219,7 +219,7 @@ function Shell({ userId, email }: { userId: string; email: string }) {
         </header>
         {view === "projects" ? (
           <ProjectsPage userId={userId} chats={chats} openId={projectId} onOpenProject={setProjectId} onOpenChat={open}
-            onStartChat={startChat} draft={draft} onDraft={(model, effort) => setDraft({ model, effort })} />
+            onStartChat={startChat} draft={draft} onDraft={(model, effort) => setDraft({ model, effort })} online={online} />
         ) : view === "files" ? (
           <FilesPage onOpenChat={open} />
         ) : view === "customize" ? (

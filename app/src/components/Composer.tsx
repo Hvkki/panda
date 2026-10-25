@@ -8,6 +8,7 @@ import { fileKind, uploadFile, type Attachment } from "../lib/files";
 import { ALL_MODELS, EFFORTS } from "../lib/models";
 import { buildCatalog, matchCommands, parseCommand, useCrewCommands, type SlashCmd } from "../lib/slash";
 import { fmtTokens } from "../lib/usage";
+import { useVoice } from "../lib/voice";
 
 /** `steer`: sent while Panda is answering, so it goes into the running reply instead of waiting. */
 export type SendMeta = { command?: string; steer?: boolean };
@@ -36,7 +37,6 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
   const { settings } = useSettings();
   const t = useT();
   const [text, setText] = useState(initialText);
-  const [listening, setListening] = useState(false);
   const [files, setFiles] = useState<(Attachment & { uploading?: boolean; error?: string })[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [active, setActive] = useState(0);
@@ -46,7 +46,7 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
   const fileInput = useRef<HTMLInputElement>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  const recog = useRef<{ stop: () => void } | null>(null);
+  const voiceBase = useRef("");
   const live = useCrewCommands(online);
   const catalog = useMemo(() => buildCatalog(live), [live]);
 
@@ -170,28 +170,22 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
     clear();
   };
 
-  // Voice input (phase 1): the browser's speech recognition.
-  const SR = (window as unknown as { SpeechRecognition?: unknown; webkitSpeechRecognition?: unknown })
-    .SpeechRecognition || (window as unknown as { webkitSpeechRecognition?: unknown }).webkitSpeechRecognition;
+  // Voice input: tap to talk, tap again to stop. The words land in the box, ready to edit or send.
+  const voice = useVoice({
+    online, language: settings.language, onNotice: setNotice,
+    onText: (said) => {
+      if (!said) return;
+      const base = voiceBase.current;
+      setText((prev) => (prev.startsWith(base) ? base : prev.trimEnd() + " ") + said);
+      ref.current?.focus();
+    },
+  });
   const toggleMic = () => {
-    if (listening) { recog.current?.stop(); return; }
-    if (!SR) return;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const r: any = new (SR as any)();
-    r.lang = { en: "en-US", it: "it-IT", uk: "uk-UA" }[settings.language];
-    r.interimResults = true;
-    r.continuous = false;
-    const base = text ? text.trimEnd() + " " : "";
-    r.onresult = (e: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => {
-      let said = "";
-      for (let i = 0; i < e.results.length; i++) said += e.results[i][0].transcript;
-      setText(base + said);
-    };
-    r.onend = () => setListening(false);
-    r.start();
-    recog.current = r;
-    setListening(true);
+    if (voice.state === "idle") voiceBase.current = text.trim() ? text.trimEnd() + " " : "";
+    voice.toggle();
   };
+  const micLabel = voice.state === "recording" ? "Stop and turn into text"
+    : voice.state === "listening" ? "Stop listening" : voice.state === "transcribing" ? "Turning your voice into text" : "Voice input";
 
   // kiro-cli often reports only the percentage (reset: no token counts); the meter still shows it.
   const pct = context && typeof context.pct === "number" && Number.isFinite(context.pct) ? Math.max(0, Math.min(100, context.pct)) : null;
@@ -286,9 +280,11 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
           </div>
         )}
         <div className="grow" />
-        {SR ? (
-          <button type="button" className={`icon-btn ${listening ? "rec" : ""}`} onClick={toggleMic} title="Voice input" aria-label="Voice input">
-            <IconMic />
+        {voice.available ? (
+          <button type="button" className={`icon-btn mic-btn ${voice.state === "recording" || voice.state === "listening" ? "rec" : ""} ${voice.state === "transcribing" ? "busy" : ""}`}
+            onClick={toggleMic} disabled={voice.state === "transcribing"} title={micLabel} aria-label={micLabel} aria-pressed={voice.state !== "idle"}>
+            {voice.state === "recording" ? <span className="mic-secs">{Math.floor(voice.secs / 60)}:{String(voice.secs % 60).padStart(2, "0")}</span>
+              : voice.state === "transcribing" ? <span className="mic-spin" aria-hidden /> : <IconMic />}
           </button>
         ) : null}
         {busy && onStop && !text.trim() ? (

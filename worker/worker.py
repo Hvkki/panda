@@ -850,6 +850,109 @@ def stop_browser(sb: "Supabase"):
         log("final browser backup failed:", exc)
 
 
+# ── Voice input: free local Whisper (faster-whisper on the worker's CPU) ─────
+# The app records the user's voice and sends it as an `stt` command; this turns it into text.
+# Its packages live in their own folder so they never change Kiro Crew's numpy or huggingface-hub.
+STT_LIB = os.path.expanduser("~/.panda/stt-lib")
+STT_PKGS = "faster-whisper==1.2.1 av==16.1.0"
+STT_MAX_BYTES = 4 * 1024 * 1024        # about 4 minutes of phone audio
+STT_LANGS = {"en", "it", "uk"}
+STT_SERVER = r'''
+import json, os, sys
+from faster_whisper import WhisperModel
+models = {}
+def get(name):
+    if name not in models:
+        models[name] = WhisperModel(name, device="cpu", compute_type="int8",
+                                    cpu_threads=max(1, (os.cpu_count() or 2) - 1),
+                                    download_root=os.path.expanduser("~/.cache/panda-whisper"))
+    return models[name]
+get("base")
+print(json.dumps({"ready": True}), flush=True)
+for line in sys.stdin:
+    try:
+        req = json.loads(line)
+        lang = req.get("lang") or None
+        # base is fast and good in English; small is needed for Italian and Ukrainian.
+        segs, info = get("base" if lang == "en" else "small").transcribe(
+            req["path"], language=lang, beam_size=1, vad_filter=True, condition_on_previous_text=False)
+        out = {"text": " ".join(s.text.strip() for s in segs).strip(), "secs": round(info.duration, 1)}
+    except Exception as exc:
+        out = {"error": str(exc)[:300]}
+    print(json.dumps(out), flush=True)
+'''
+_stt = {"p": None, "state": "off", "error": "", "lock": threading.Lock()}
+
+
+def _stt_spawn():
+    script = f"{STT_LIB}/panda_stt_server.py"
+    with open(script, "w") as f:
+        f.write(STT_SERVER)
+    env = dict(ENV, PYTHONPATH=STT_LIB, HF_HUB_DISABLE_TELEMETRY="1")
+    p = subprocess.Popen([sys.executable, "-u", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, env=env, bufsize=1)
+    first = p.stdout.readline()  # waits for the model to load (downloads it the first time)
+    if '"ready"' not in first:
+        p.kill()
+        raise RuntimeError("voice model did not load")
+    _stt["p"] = p
+
+
+def _stt_install():
+    """Background thread: install faster-whisper, then load the model so the first clip is quick."""
+    _stt["state"] = "installing"
+    try:
+        if not os.path.isdir(f"{STT_LIB}/faster_whisper"):
+            os.makedirs(STT_LIB, exist_ok=True)
+            sh(f"{sys.executable} -m pip install -q --target {shlex.quote(STT_LIB)} {STT_PKGS}", timeout=900, check=True)
+        with _stt["lock"]:
+            _stt_spawn()
+        _stt["state"] = "ready"
+        log("voice input ready")
+    except Exception as exc:
+        _stt.update(state="failed", error=str(exc)[:200])
+        log("voice input install failed:", exc)
+
+
+def start_stt():
+    threading.Thread(target=_stt_install, daemon=True).start()
+
+
+def speech_to_text(args: dict) -> dict:
+    if _stt["state"] == "installing":
+        deadline = time.time() + 120  # the first minute or two after Start
+        while _stt["state"] == "installing" and time.time() < deadline:
+            time.sleep(1)
+    if _stt["state"] != "ready":
+        raise RuntimeError("voice input is not ready yet" + (f": {_stt['error']}" if _stt["error"] else ""))
+    raw = base64.b64decode(str(args.get("audio") or ""), validate=True)
+    if not raw:
+        raise ValueError("no audio")
+    if len(raw) > STT_MAX_BYTES:
+        raise ValueError("recording is too long")
+    mime = str(args.get("mime") or "")
+    ext = ".m4a" if "mp4" in mime or "aac" in mime else ".ogg" if "ogg" in mime else ".webm"
+    lang = str(args.get("lang") or "")
+    path = f"{WORK}/stt-{uuid.uuid4().hex}{ext}"
+    with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
+        f.write(raw)
+    try:
+        with _stt["lock"]:  # one clip at a time; the model uses every core anyway
+            p = _stt["p"]
+            if p is None or p.poll() is not None:
+                _stt_spawn()
+                p = _stt["p"]
+            p.stdin.write(json.dumps({"path": path, "lang": lang if lang in STT_LANGS else None}) + "\n")
+            p.stdin.flush()
+            reply = json.loads(p.stdout.readline() or '{"error": "voice server stopped"}')
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+    if reply.get("error"):
+        raise RuntimeError("could not read the recording" if "Invalid data" in reply["error"] else reply["error"])
+    return {"text": reply.get("text", ""), "secs": reply.get("secs")}
+
+
 ENGINE = f"http://127.0.0.1:{os.environ.get('PANDA_BROWSER_PORT', '5480')}"
 
 
@@ -1985,15 +2088,19 @@ def run_command(sb: Supabase, gw: Gateway, cmd: dict):
             result = {"names": sync_secrets(sb)}
         elif op == "browser.forget":
             result = browser_forget(sb)
+        elif op == "stt":
+            result = speech_to_text(args)
         elif op == "ping":
             result = {"ok": True, "uptime_secs": round(time.time() - T0), "crew": CREW_VERSION["v"]}
         else:
             raise ValueError(f"unknown op {op}")
         sb.rest("PATCH", "commands", params={"id": f"eq.{cmd['id']}"},
-                body={"status": "done", "result": json.loads(scrub(json.dumps(result if result is not None else {})))})
+                body={"status": "done", "result": json.loads(scrub(json.dumps(result if result is not None else {}))),
+                      **({"args": {}} if op == "stt" else {})})  # the voice clip is not kept
     except Exception as exc:
         sb.rest("PATCH", "commands", params={"id": f"eq.{cmd['id']}"},
-                body={"status": "error", "result": {"error": scrub(exc)[:500]}})
+                body={"status": "error", "result": {"error": scrub(exc)[:500]},
+                      **({"args": {}} if op == "stt" else {})})
 
 
 # Requests the app makes while Panda is offline time out in the app after a minute; running them
@@ -2119,6 +2226,7 @@ def main():
         mem_on = user_settings(sb, OWNER).get("memory", True)
         sh(f"kirocrew config set memory.writes_enabled {'true' if mem_on else 'false'}")
         start_browser(sb)
+        start_stt()
         gw_proc = start_gateway()
         gw = Gateway()
         # Kiro Crew settings changed in the app, re-applied in case the snapshot predates them.

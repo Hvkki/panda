@@ -24,6 +24,7 @@ type Props = {
   onStartChat: (text: string, attachments: Attachment[], projectId: string) => void;
   draft: { model: string; effort: string };
   onDraft: (model: string, effort: string) => void;
+  online?: boolean;
 };
 
 export function ProjectsPage(p: Props) {
@@ -74,7 +75,7 @@ export function ProjectsPage(p: Props) {
   );
 }
 
-function ProjectDetail({ project, userId, chats, onOpenProject, onOpenChat, onStartChat, onChanged, draft, onDraft }: Props & { project: Project; onChanged: () => void }) {
+function ProjectDetail({ project, userId, chats, onOpenProject, onOpenChat, onStartChat, onChanged, draft, onDraft, online }: Props & { project: Project; onChanged: () => void }) {
   const [form, setForm] = useState({ name: project.name, description: project.description, instructions: project.instructions });
   const [files, setFiles] = useState<FileRow[]>([]);
   const [saved, setSaved] = useState(true);
@@ -118,7 +119,7 @@ function ProjectDetail({ project, userId, chats, onOpenProject, onOpenChat, onSt
 
       <div className="project-layout">
         <div className="project-main">
-          <Composer model={draft.model} effort={draft.effort} onModel={onDraft}
+          <Composer model={draft.model} effort={draft.effort} onModel={onDraft} online={online}
             onSend={(text, att) => onStartChat(text, att, project.id)} />
           <h3 className="section-title">Chats in this project</h3>
           {projectChats.length === 0 && <p className="muted small">Start a chat above — Panda will use this project's instructions and files.</p>}
