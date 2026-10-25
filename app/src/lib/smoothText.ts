@@ -1,17 +1,22 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 /**
- * Smooth streaming. The worker writes the reply about every half second, so the raw text arrives
- * in jumps. This reveals it at a steady pace instead: each frame shows a few more characters, and
- * the pace adapts to the backlog so the screen catches up in roughly one push interval and never
- * lags far behind. While the reply is live and nothing new has arrived yet, it keeps "typing" the
- * backlog it already has, so the reply flows instead of freezing and jumping.
+ * Smooth streaming. The model writes much faster than people read, and the worker pushes the
+ * reply in bursts, so the raw text arrives in big jumps. This shows it at a calm, steady typing
+ * pace instead: the reveal keeps a small buffer behind the real text, its speed only changes
+ * gradually (no sudden rushes), and it speeds up just enough to never fall far behind a long
+ * reply. Once the reply is done the rest is typed out a little faster, never dumped at once.
  *
  * Only messages that are live while on screen animate; history renders at once.
  */
-const CATCH_UP_SECS = 0.6;   // drain the backlog in about this long while streaming
-const FINISH_SECS = 0.35;    // once the reply is done, finish the remainder faster
-const MIN_CPS = 45;          // never slower than this (characters per second)
+const LAG_SECS = 2.2;        // while streaming, aim to drain the backlog over about this long
+const FINISH_LAG_SECS = 1.2; // once the reply is done, a bit quicker
+const MIN_CPS = 28;          // never slower than this (characters per second)
+const FINISH_MIN_CPS = 70;   // once done, do not crawl through the last words
+const BASE_MAX_CPS = 150;    // calm reading pace while streaming
+const FINISH_MAX_CPS = 380;  // top pace once the reply is done
+const BEHIND_CHARS = 900;    // past this much backlog, allow faster so we never lag far behind
+const ACCEL = 110;           // how fast the speed itself may change (cps per second)
 const RENDER_MS = 33;        // re-render at most ~30 fps (markdown is not free)
 
 export function useSmoothText(target: string, live: boolean): { text: string; typing: boolean } {
@@ -20,6 +25,7 @@ export function useSmoothText(target: string, live: boolean): { text: string; ty
   if (live && !animate) setAnimate(true);
   const [shown, setShown] = useState(() => (live ? 0 : target.length));
   const pos = useRef(shown);
+  const cps = useRef(0); // current speed; kept across new chunks so the pace never resets
   const tgt = useRef(target);
   const liveRef = useRef(live);
   useLayoutEffect(() => { tgt.current = target; liveRef.current = live; }, [target, live]);
@@ -37,8 +43,15 @@ export function useSmoothText(target: string, live: boolean): { text: string; ty
       const goal = tgt.current.length;
       const backlog = goal - pos.current;
       if (backlog <= 0) { raf = 0; return; }
-      const cps = Math.max(MIN_CPS, backlog / (liveRef.current ? CATCH_UP_SECS : FINISH_SECS));
-      pos.current = Math.min(goal, pos.current + cps * dt);
+      const streaming = liveRef.current;
+      const behind = Math.max(0, backlog - BEHIND_CHARS) * 0.6;
+      const max = (streaming ? BASE_MAX_CPS : FINISH_MAX_CPS) + behind;
+      const floor = streaming ? MIN_CPS : FINISH_MIN_CPS;
+      const want = Math.min(max, Math.max(floor, backlog / (streaming ? LAG_SECS : FINISH_LAG_SECS)));
+      // Ease toward the wanted speed instead of jumping to it.
+      const step = (streaming ? ACCEL : ACCEL * 3) * dt;
+      cps.current = Math.max(floor, cps.current + Math.max(-step, Math.min(step, want - cps.current)));
+      pos.current = Math.min(goal, pos.current + cps.current * dt);
       if (now - lastRender >= RENDER_MS || pos.current >= goal) {
         lastRender = now;
         setShown(Math.floor(pos.current));
