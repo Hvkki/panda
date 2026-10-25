@@ -22,6 +22,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -226,28 +227,63 @@ class Engine:
         self.mobile = False                # a phone is watching: real mobile page, touch taps
         self.dpr = 1.0                     # device pixels per CSS pixel of the live picture
         self.emu = None                    # CDP session of the current page for emulation and sharp captures
+        self.xvfb: subprocess.Popen | None = None  # the virtual screen Chromium draws on
 
     # lifecycle ----------------------------------------------------------------
+    def _virtual_screen(self) -> bool:
+        """Start a private virtual screen (Xvfb), so Chromium runs with a window instead of headless.
+
+        Google's sign-in refuses headless browsers ("This browser or app may not be secure"); the
+        same Chromium with a screen is accepted. Falls back to headless when Xvfb is missing.
+        """
+        if os.environ.get("PANDA_BROWSER_HEADLESS") == "1":
+            return False
+        if os.environ.get("DISPLAY"):
+            return True
+        xvfb = shutil.which("Xvfb")
+        if not xvfb:
+            log("Xvfb missing, running headless")
+            return False
+        for n in range(99, 120):
+            if Path(f"/tmp/.X11-unix/X{n}").exists() or Path(f"/tmp/.X{n}-lock").exists():
+                continue
+            self.xvfb = subprocess.Popen([xvfb, f":{n}", "-screen", "0", "1600x1800x24", "-nolisten", "tcp", "-ac"],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(50):
+                if Path(f"/tmp/.X11-unix/X{n}").exists():
+                    os.environ["DISPLAY"] = f":{n}"
+                    return True
+                if self.xvfb.poll() is not None:
+                    break
+                time.sleep(0.1)
+            with contextlib.suppress(Exception):
+                self.xvfb.kill()
+            self.xvfb = None
+        log("virtual screen did not start, running headless")
+        return False
+
     async def start(self):
         from playwright.async_api import async_playwright
+        headless = not self._virtual_screen()  # first: Playwright's driver takes DISPLAY when it starts
         self.pw = await async_playwright().start()
         exe = os.environ.get("PANDA_CHROMIUM") or None
         args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-crash-reporter",
-                "--disable-blink-features=AutomationControlled", "--lang=en-US"]
+                "--disable-blink-features=AutomationControlled", "--lang=en-US", "--window-size=1600,1800",
+                "--no-first-run", "--no-default-browser-check"]
         try:
-            self.browser = await self.pw.chromium.launch(headless=True, executable_path=exe, args=args)
+            self.browser = await self.pw.chromium.launch(headless=headless, executable_path=exe, args=args)
         except Exception as exc:
             if "Executable doesn't exist" not in str(exc):
                 raise
             log("chromium missing, installing…")
             subprocess.run([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"], check=False)
-            self.browser = await self.pw.chromium.launch(headless=True, executable_path=exe, args=args)
+            self.browser = await self.pw.chromium.launch(headless=headless, executable_path=exe, args=args)
         self.ua_major = self.browser.version.split(".")[0]
         await self._new_context(STATE_PATH if STATE_PATH.exists() else None)
         asyncio.create_task(self._frame_sender())
         asyncio.create_task(self._housekeeping())
         self._load_cfg(force=True)
-        log("engine ready, chromium", self.browser.version)
+        log("engine ready, chromium", self.browser.version, "headless" if headless else f"with screen {os.environ.get('DISPLAY')}")
 
     async def _new_context(self, state):
         if self.ctx:
@@ -919,6 +955,8 @@ async def main():
     await eng.save_state()
     with contextlib.suppress(Exception):
         await eng.browser.close()
+    if eng.xvfb:
+        eng.xvfb.terminate()
 
 
 if __name__ == "__main__":
