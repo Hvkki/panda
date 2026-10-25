@@ -56,7 +56,7 @@ export function useVoice({ online, language, onText, onNotice }: {
   const timer = useRef<number>(0);
   const cancelled = useRef(false);
   const cb = useRef({ onText, onNotice });
-  cb.current = { onText, onNotice };
+  useEffect(() => { cb.current = { onText, onNotice }; });
 
   const available = canRecord() || !!SRCtor();
 
@@ -65,7 +65,12 @@ export function useVoice({ online, language, onText, onNotice }: {
     stream.current?.getTracks().forEach((t) => t.stop());
     stream.current = null;
   };
-  useEffect(() => () => { cancelled.current = true; rec.current?.state === "recording" && rec.current.stop(); sr.current?.abort(); release(); }, []);
+  useEffect(() => () => {
+    cancelled.current = true;
+    if (rec.current?.state === "recording") rec.current.stop();
+    sr.current?.abort();
+    release();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const transcribe = async (blob: Blob, mime: string) => {
     if (blob.size < 1200) { setState("idle"); cb.current.onNotice("That was too short. Hold on a little longer."); return; }
