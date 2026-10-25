@@ -1,118 +1,233 @@
-import { useEffect, useRef, useState } from "react";
-import type { BrowserLink } from "../lib/browser";
-import { IconChevron, IconRetry, IconX } from "./Icons";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { hostOf, isAlive, useBrowserSnapshot, useBrowserViewer, type BrowserLink } from "../lib/browser";
+import { useT } from "../lib/i18n";
+import { AgentCursor, TapRipples } from "./AgentCursor";
+import {
+  IconArrowLeft, IconArrowRight, IconBackspace, IconCursor, IconEnter, IconGlobe, IconHand, IconKeyboard, IconList,
+  IconLock, IconPlus, IconRetry, IconSpinner, IconX,
+} from "./Icons";
+
+const SPECIAL = ["Enter", "Backspace", "Tab", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Delete", "Home", "End", "PageUp", "PageDown"];
 
 /**
- * Live view of Panda's browser. Panda drives; you watch. Tap "Take over" to click, type
- * and scroll yourself (logins, captchas), then "Done" to hand it back.
+ * Panda's browser, full size. Panda drives and narrates each step (a pointer shows where it
+ * clicks); you watch. "Take over" lets you tap, scroll and type yourself (logins, captchas);
+ * "Give back to Panda" hands it back. On wide screens it docks beside the chat.
  */
-export function BrowserPanel({ link, online, onClose }: { link: BrowserLink; online: boolean; onClose: () => void }) {
-  const { status, frame, dims, lastSeen, send, setViewing } = link;
+export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserLink; online: boolean; onClose: () => void; docked: boolean }) {
+  const t = useT();
+  const snap = useBrowserSnapshot(link);
+  const { status, frame, dims, actions } = snap;
   const [address, setAddress] = useState("");
-  const [typed, setTyped] = useState("");
   const [tabsOpen, setTabsOpen] = useState(false);
+  const [logOpen, setLogOpen] = useState(false);
+  const [replay, setReplay] = useState<string | null>(null);
+  const [taps, setTaps] = useState<{ id: number; x: number; y: number }[]>([]);
+  const [size, setSize] = useState<{ vw: number; vh: number } | undefined>(undefined);
+  const [typed, setTyped] = useState("");
+  const typedRef = useRef("");
   const editing = useRef(false);
   const view = useRef<HTMLDivElement>(null);   // the rendered page (exact size of the picture)
   const stage = useRef<HTMLDivElement>(null);  // the free area it is fitted into
-  const touch = useRef<{ x: number; y: number; moved: boolean } | null>(null);
+  const kbd = useRef<HTMLInputElement>(null);
+  const touch = useRef<{ x: number; y: number; t: number; moved: boolean } | null>(null);
+  const wheel = useRef({ dx: 0, dy: 0, x: 0.5, y: 0.5, timer: 0 });
 
-  useEffect(() => {
-    const r = stage.current?.getBoundingClientRect();
-    setViewing(true, { vw: r?.width || window.innerWidth, vh: r?.height || window.innerHeight * 0.6 });
-    return () => setViewing(false);
-  }, [setViewing]);
+  // Tell the engine how big we are (phones get a tall page that fills the screen).
+  useLayoutEffect(() => {
+    const el = stage.current;
+    if (!el) return;
+    const measure = () => {
+      const r = el.getBoundingClientRect();
+      const next = { vw: Math.round(r.width / 20) * 20, vh: Math.round(r.height / 20) * 20 };
+      setSize((s) => (s && s.vw === next.vw && s.vh === next.vh ? s : next));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  useBrowserViewer(link, !!size, size);  // wait for the measured size: one hello, one page resize
+
   useEffect(() => { if (status && !editing.current) setAddress(status.url === "about:blank" ? "" : status.url); }, [status?.url]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { typedRef.current = ""; setTyped(""); }, [status?.focus?.label, status?.control]);
+  useEffect(() => {
+    const esc = (e: KeyboardEvent) => { if (e.key === "Escape" && !(e.target instanceof HTMLInputElement)) onClose(); };
+    window.addEventListener("keydown", esc);
+    return () => window.removeEventListener("keydown", esc);
+  }, [onClose]);
 
+  const send = link.send;
   const control = status?.control ?? "agent";
-  const mine = control !== "agent";           // user may interact
-  const alive = Date.now() - lastSeen < 25000;
+  const mine = control !== "agent";           // the user may interact
+  const alive = isAlive(snap);
+  const lastAction = actions[actions.length - 1];
   const rel = (clientX: number, clientY: number) => {
     const r = view.current!.getBoundingClientRect();
     return { x: Math.min(1, Math.max(0, (clientX - r.left) / r.width)), y: Math.min(1, Math.max(0, (clientY - r.top) / r.height)) };
   };
+  const tap = (clientX: number, clientY: number) => {
+    const p = rel(clientX, clientY);
+    send({ t: "click", ...p });
+    const id = Date.now() + Math.random();
+    setTaps((list) => [...list.slice(-4), { id, ...p }]);
+    window.setTimeout(() => setTaps((list) => list.filter((x) => x.id !== id)), 650);
+  };
+  const scrollBy = (x: number, y: number, dx: number, dy: number) => {   // coalesced, ~20 per second at most
+    const w = wheel.current;
+    w.dx += dx; w.dy += dy; w.x = x; w.y = y;
+    if (w.timer) return;
+    w.timer = window.setTimeout(() => {
+      send({ t: "scroll", x: w.x, y: w.y, dx: Math.round(w.dx), dy: Math.round(w.dy) });
+      w.dx = 0; w.dy = 0; w.timer = 0;
+    }, 50);
+  };
 
   const key = (e: React.KeyboardEvent) => {
     if (!mine || e.target instanceof HTMLInputElement) return;
-    const special = ["Enter", "Backspace", "Tab", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Delete", "Home", "End", "PageUp", "PageDown"];
-    if (special.includes(e.key)) { e.preventDefault(); send({ t: "key", key: e.key }); }
+    if (SPECIAL.includes(e.key)) { e.preventDefault(); send({ t: "key", key: e.key }); }
     else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) { e.preventDefault(); send({ t: "text", text: e.key }); }
     else if ((e.ctrlKey || e.metaKey) && e.key.length === 1) { e.preventDefault(); send({ t: "key", key: `Control+${e.key}` }); }
   };
 
-  const badge = control === "needs_user" ? "needs" : status?.busy ? "busy" : control === "user" ? "you" : "idle";
-  const banner =
-    control === "needs_user" ? (status?.message || "Panda needs your help.") :
-    control === "user" ? "You're in control. Press Done to hand it back to Panda." :
-    status?.busy ? "Panda is browsing…" : "Panda's browser — watching live.";
+  // Phone keyboard: everything typed in the bar goes straight into the focused field on the page.
+  const onTyped = (v: string) => {
+    const prev = typedRef.current;
+    let i = 0;
+    while (i < prev.length && i < v.length && prev[i] === v[i]) i++;
+    for (let k = 0; k < prev.length - i; k++) send({ t: "key", key: "Backspace" });
+    if (v.slice(i)) send({ t: "text", text: v.slice(i) });
+    typedRef.current = v;
+    setTyped(v);
+  };
+
+  const pill = !online ? "off" : control === "needs_user" ? "needs" : control === "user" ? "you" : status?.busy ? "busy" : "idle";
+  const caption = control === "needs_user" ? (status?.message || "Panda needs your help.")
+    : control === "user" ? (status?.message || "You're in control. Tap the page to click, swipe to scroll.")
+    : status?.action || (status?.busy ? "Working…" : lastAction && Date.now() - lastAction.t < 20000 ? lastAction.c : "Panda's browser — watching live.");
+  const focus = mine ? status?.focus : null;
+  const secure = (status?.url || "").startsWith("https://");
 
   return (
-    <div className="browser-panel" role="dialog" aria-label="Panda's browser">
+    <div className={`browser-panel ${docked ? "docked" : ""} ctl-${control}`} role="dialog" aria-label="Panda's browser">
       <div className="bp-head">
         <button className="icon-btn" onClick={onClose} aria-label="Close"><IconX /></button>
-        <div className="bp-title">{status?.title || "Browser"}</div>
-        <span className={`bp-badge ${badge}`}>{{ needs: "Needs you", busy: "Working", you: "You", idle: "Idle" }[badge]}</span>
+        <div className="bp-titles">
+          <div className="bp-title">{status?.title || hostOf(status?.url) || "Panda's browser"}</div>
+          <div className="bp-sub muted">{hostOf(status?.url) || "Panda's browser"}</div>
+        </div>
+        <span className={`bp-pill ${pill}`}>{pill === "busy" && <i className="dot" />}
+          {{ off: t("offline"), needs: t("needsYou"), you: "You", busy: t("live"), idle: "Idle" }[pill]}</span>
+        <button className={`icon-btn ${logOpen ? "on" : ""}`} onClick={() => setLogOpen((v) => !v)} aria-label="Steps" title="Steps"><IconList /></button>
       </div>
 
-      <div className={`bp-banner ${control}`}>
-        <span>{banner}</span>
-        {control === "agent" && online && <button className="btn small-btn" onClick={() => send({ t: "takeover" })}>Take over</button>}
-        {control !== "agent" && <button className="btn primary small-btn" onClick={() => send({ t: "done" })}>Done</button>}
-      </div>
-
-      <form className="bp-url" onSubmit={(e) => { e.preventDefault(); if (mine && address.trim()) send({ t: "nav", url: address.trim() }); editing.current = false; }}>
-        <button type="button" className="icon-btn" disabled={!mine} onClick={() => send({ t: "back" })} aria-label="Back"><span style={{ transform: "rotate(90deg)", display: "grid" }}><IconChevron size={18} /></span></button>
+      <form className="bp-url" onSubmit={(e) => { e.preventDefault(); if (mine && address.trim()) send({ t: "nav", url: address.trim() }); editing.current = false; (document.activeElement as HTMLElement)?.blur(); }}>
+        <button type="button" className="icon-btn" disabled={!mine} onClick={() => send({ t: "back" })} aria-label="Back"><IconArrowLeft size={18} /></button>
+        <button type="button" className="icon-btn" disabled={!mine} onClick={() => send({ t: "forward" })} aria-label="Forward"><IconArrowRight size={18} /></button>
         <button type="button" className="icon-btn" disabled={!mine} onClick={() => send({ t: "reload" })} aria-label="Reload"><IconRetry size={17} /></button>
-        <input value={address} disabled={!mine} placeholder={mine ? "Search or type an address" : "Take over to navigate"}
-          onFocus={() => (editing.current = true)} onBlur={() => (editing.current = false)} onChange={(e) => setAddress(e.target.value)} />
-        <button type="button" className="chip bp-tabs" onClick={() => setTabsOpen((v) => !v)}>{status?.tabs.length || 1}</button>
+        <div className={`bp-address ${status?.loading ? "loading" : ""}`}>
+          <span className="bp-lock">{secure ? <IconLock size={13} /> : <IconGlobe size={13} />}</span>
+          <input value={address} disabled={!mine} placeholder={mine ? "Search or type an address" : "Take over to type an address"}
+            inputMode="url" autoCapitalize="off" autoCorrect="off" spellCheck={false}
+            onFocus={(e) => { editing.current = true; e.target.select(); }} onBlur={() => (editing.current = false)} onChange={(e) => setAddress(e.target.value)} />
+          <span className="bp-progress" />
+        </div>
+        <button type="button" className="chip bp-tabs" onClick={() => setTabsOpen((v) => !v)} aria-label="Tabs">{status?.tabs.length || 1}</button>
       </form>
       {tabsOpen && (
         <div className="bp-tabmenu">
-          {(status?.tabs || []).map((t) => (
-            <button key={t.i} className={t.active ? "active" : ""} disabled={!mine} onClick={() => { send({ t: "tab", i: t.i }); setTabsOpen(false); }}>
-              {t.u.replace(/^https?:\/\//, "").slice(0, 60) || "New tab"}
+          {(status?.tabs || []).map((tb) => (
+            <button key={tb.i} className={tb.active ? "active" : ""} disabled={!mine} onClick={() => { send({ t: "tab", i: tb.i }); setTabsOpen(false); }}>
+              <IconGlobe size={13} /> {tb.u.replace(/^https?:\/\//, "").slice(0, 60) || "New tab"}
             </button>
           ))}
-          <button disabled={!mine} onClick={() => { send({ t: "newtab" }); setTabsOpen(false); }}>+ New tab</button>
+          <button disabled={!mine} onClick={() => { send({ t: "newtab" }); setTabsOpen(false); }}><IconPlus size={13} /> New tab</button>
         </div>
       )}
 
-      <div className="bp-stage" ref={stage}>
-        <div className={`bp-view ${mine ? "mine" : ""}`} ref={view} tabIndex={0} onKeyDown={key}
-          style={{ ["--r" as string]: dims.w / dims.h }}
-          onClick={(e) => { if (mine) { send({ t: "click", ...rel(e.clientX, e.clientY) }); view.current?.focus(); } }}
-          onWheel={(e) => { if (mine) send({ t: "scroll", ...rel(e.clientX, e.clientY), dx: e.deltaX, dy: e.deltaY }); }}
-          onTouchStart={(e) => { const t = e.touches[0]; touch.current = { x: t.clientX, y: t.clientY, moved: false }; }}
-          onTouchMove={(e) => {
-            const t = e.touches[0], s = touch.current;
-            if (!mine || !s) return;
-            const dy = s.y - t.clientY, dx = s.x - t.clientX;
-            if (Math.abs(dy) + Math.abs(dx) > 6) {
-              s.moved = true;
-              send({ t: "scroll", ...rel(t.clientX, t.clientY), dx: dx * 1.6, dy: dy * 1.6 });
-              s.x = t.clientX; s.y = t.clientY;
-            }
-          }}
-          onTouchEnd={(e) => {
-            const s = touch.current; touch.current = null;
-            if (mine && s && !s.moved) { const t = e.changedTouches[0]; send({ t: "click", ...rel(t.clientX, t.clientY) }); e.preventDefault(); }
-          }}>
-          {frame ? <img src={frame} alt="Live browser view" draggable={false} /> :
-            <div className="bp-empty">{online ? (alive ? "Waiting for the first frame…" : "Connecting to Panda's browser…") :
-              "Panda is offline. Start it to use the browser."}</div>}
-          {control === "agent" && frame && <div className="bp-glow" />}
+      <div className="bp-body">
+        <div className="bp-stage" ref={stage}>
+          <div className={`bp-view ${mine ? "mine" : ""}`} ref={view} tabIndex={0} onKeyDown={key}
+            style={{ ["--r" as string]: dims.w / dims.h }}
+            onClick={(e) => { if (mine && !("ontouchstart" in window)) { tap(e.clientX, e.clientY); view.current?.focus(); } }}
+            onWheel={(e) => { if (mine) { const p = rel(e.clientX, e.clientY); scrollBy(p.x, p.y, e.deltaX, e.deltaY); } }}
+            onTouchStart={(e) => { const tt = e.touches[0]; touch.current = { x: tt.clientX, y: tt.clientY, t: Date.now(), moved: false }; }}
+            onTouchMove={(e) => {
+              const tt = e.touches[0], s = touch.current;
+              if (!mine || !s) return;
+              const dy = s.y - tt.clientY, dx = s.x - tt.clientX;
+              if (s.moved || Math.abs(dy) + Math.abs(dx) > 8) {
+                s.moved = true;
+                const p = rel(tt.clientX, tt.clientY);
+                scrollBy(p.x, p.y, dx * 1.6, dy * 1.6);
+                s.x = tt.clientX; s.y = tt.clientY;
+              }
+            }}
+            onTouchEnd={(e) => {
+              const s = touch.current; touch.current = null;
+              if (mine && s && !s.moved && Date.now() - s.t < 700) { const tt = e.changedTouches[0]; tap(tt.clientX, tt.clientY); e.preventDefault(); }
+            }}>
+            {frame ? <img src={frame} alt="Live browser view" draggable={false} /> :
+              <div className="bp-empty">{!online ? "Panda is offline. Start it to use the browser." :
+                alive ? <><IconSpinner size={18} /> Waiting for the first frame…</> : <><IconSpinner size={18} /> Connecting to Panda's browser…</>}</div>}
+            {!mine && <AgentCursor action={lastAction} />}
+            <TapRipples taps={taps} />
+            {control === "agent" && status?.busy && frame && <div className="bp-working" aria-hidden />}
+          </div>
         </div>
+        {logOpen && (
+          <aside className="bp-log">
+            <div className="bp-log-head">Steps <span className="muted small">{actions.length}</span></div>
+            {actions.length === 0 && <p className="muted small">Panda's steps in the browser show up here.</p>}
+            {[...actions].reverse().map((a) => (
+              <button key={a.t} className="bp-step" onClick={() => a.shot && setReplay(a.shot)} disabled={!a.shot}>
+                {a.shot ? <img src={a.shot} alt="" /> : <span className="bp-step-blank"><IconCursor size={14} /></span>}
+                <span className="bp-step-text"><span>{a.c}</span>
+                  <span className="muted small">{new Date(a.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span></span>
+              </button>
+            ))}
+          </aside>
+        )}
+        {replay && (
+          <button className="bp-replay" onClick={() => setReplay(null)} aria-label="Close the step screen">
+            <img src={replay} alt="Screen after this step" /><span className="chip">Back to live</span>
+          </button>
+        )}
+      </div>
+
+      <div className={`bp-caption ${control}`}>
+        <span className="bp-caption-icon">{status?.busy && control === "agent" ? <IconSpinner size={15} /> : control === "agent" ? <IconCursor size={15} /> : <IconHand size={15} />}</span>
+        <span className="bp-caption-text">{caption}</span>
       </div>
 
       {mine && (
-        <form className="bp-type" onSubmit={(e) => { e.preventDefault(); if (typed) send({ t: "text", text: typed }); send({ t: "key", key: "Enter" }); setTyped(""); }}>
-          <input value={typed} onChange={(e) => setTyped(e.target.value)} placeholder="Type here, then Enter — goes into the selected field"
-            autoComplete="off" autoCapitalize="off" spellCheck={false} />
-          <button type="button" className="chip" onClick={() => { if (typed) { send({ t: "text", text: typed }); setTyped(""); } }}>Insert</button>
+        <form className="bp-typebar" onSubmit={(e) => { e.preventDefault(); send({ t: "key", key: "Enter" }); typedRef.current = ""; setTyped(""); }}>
+          <span className="bp-kbd-icon"><IconKeyboard size={17} /></span>
+          <input ref={kbd} value={typed} type={focus?.secret ? "password" : "text"} onChange={(e) => onTyped(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Backspace" && !typedRef.current) { e.preventDefault(); send({ t: "key", key: "Backspace" }); } }}
+            placeholder={focus ? `Typing into ${focus.label || "the selected field"}…` : "Tap a field on the page, then type here"}
+            autoComplete="off" autoCapitalize="off" autoCorrect="off" spellCheck={false} enterKeyHint="go" />
           <button type="button" className="chip" onClick={() => send({ t: "key", key: "Tab" })}>Tab</button>
-          <button type="button" className="chip" onClick={() => send({ t: "key", key: "Backspace" })}>Del</button>
+          <button type="button" className="chip icon-chip" onClick={() => send({ t: "key", key: "Backspace" })} aria-label="Delete"><IconBackspace size={16} /></button>
+          <button type="submit" className="chip icon-chip" aria-label="Enter"><IconEnter size={16} /></button>
         </form>
       )}
+
+      <div className="bp-actions">
+        {control === "agent" ? (
+          <>
+            <span className="muted small bp-actions-note">{online ? "Panda drives. You can take over any time." : "Start Panda to use its browser."}</span>
+            <button className="btn" disabled={!online} onClick={() => send({ t: "takeover" })}><IconHand size={16} /> {t("takeOver")}</button>
+          </>
+        ) : control === "needs_user" ? (
+          <>
+            <button className="btn primary grow" onClick={() => { send({ t: "takeover" }); window.setTimeout(() => kbd.current?.focus(), 50); }}><IconHand size={16} /> {t("takeOver")}</button>
+            <button className="btn" onClick={() => send({ t: "done" })}>I'm done</button>
+          </>
+        ) : (
+          <button className="btn primary grow" onClick={() => send({ t: "done" })}>{t("giveBack")}</button>
+        )}
+      </div>
     </div>
   );
 }

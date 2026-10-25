@@ -60,13 +60,13 @@ export function SessionChip({ worker }: { worker: Worker }) {
     }
   };
 
-  const label = state === "on" ? `${t("running")} · ${up}` : state === "starting" ? t("starting")
+  const label = state === "on" ? <>{t("running")}<span className="session-up"> · {up}</span></> : state === "starting" ? t("starting")
     : state === "stopping" ? t("stopping") : t("offline");
   return (
     <div className="session">
       <button className={`session-chip ${state}`} onClick={click} disabled={busy || state === "stopping"}
-        title={state === "off" ? t("start") : t("stop")}>
-        <span className="dot" /> {busy ? "…" : label}
+        title={state === "off" ? t("start") : state === "on" ? `${t("running")} · ${up} — ${t("stop")}` : t("stop")}>
+        <span className="dot" /> <span className="session-label">{busy ? "…" : label}</span>
         {(state === "off" || state === "on") && <span className="session-action"><IconPower size={14} />
           {state === "off" ? t("start") : t("stop")}</span>}
       </button>

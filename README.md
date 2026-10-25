@@ -23,7 +23,7 @@ Earlier names: Embra.
 | Path | What it is |
 |---|---|
 | `app/` | React + TypeScript + Vite web app (PWA). Deployed to the Vercel project `panda-app`. |
-| `worker/worker.py` | Runs inside the Kaggle notebook. Starts Kiro Crew, answers chats, streams replies, thinking, tool steps and approvals, mirrors notifications, publishes files, offloads big files to Google Drive, runs the browser, syncs the key vault, serves the app's command relay. |
+| `worker/worker.py` | Runs inside the Kaggle notebook. Starts Kiro Crew, answers chats, streams replies, thinking, tool steps and approvals, records credits, runs Kiro Crew's slash commands and settings, mirrors notifications, publishes files, offloads big files to Google Drive, runs the browser, syncs the key vault, serves the app's command relay. |
 | `worker/prompt.md` | Panda's system prompt. Stored in Supabase Storage (`config/prompt.md`), so you can change it without redeploying the worker. |
 | `worker/skills/` | Skills the agent loads: `panda-docs` (PDF, DOCX, PPTX), `image-search`, `panda-browser` (real Chromium, live view, take-over), `panda-drive` (Google Drive). |
 | `supabase/` | Schema and migrations (run in order), and the `session` Edge Function (Start, Stop, Status). |

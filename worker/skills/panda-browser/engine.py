@@ -2,7 +2,13 @@
 """Panda browser engine: one real Chromium that Panda drives and the user can watch/take over.
 
   agent  --(pb.py, local HTTP :5480)-->  engine  --(CDP)-->  Chromium  (cookies persist)
-  phone  <--(Supabase Realtime: JPEG frames, status)--  engine  <--(taps, keys, scroll)--  phone
+  phone  <--(Supabase Realtime: JPEG frames, status, actions)--  engine  <--(taps, keys, scroll)--  phone
+
+Realtime events the engine broadcasts on the private topic:
+  frame   {d: base64 JPEG, w, h}                       live screen (only while someone watches)
+  status  {url, title, tabs, control, message, busy, loading, action, focus, w, h, ...}
+  action  {k: kind, c: caption, t: ms, x?, y?, w?, h?}  what Panda is doing, with the target's box
+                                                       (0..1 of the page) so the app can move a cursor
 
 Config (written by the worker): ~/.panda/browser.json
   {"supabase_url": ..., "anon": ..., "topic": "pbr-<secret>"}   topic empty => no live view
@@ -35,6 +41,29 @@ VIEW_W, VIEW_H = 1024, 720
 VIEWER_TTL = 20          # seconds a viewer stays "present" after its last hello
 MIN_FRAME_GAP = 0.12     # max ~8 fps
 MAX_FRAME_B64 = 190_000  # Realtime free tier payload limit is ~250 KB
+BEST_QUALITY = 60
+CURSOR_LEAD = 0.35       # while someone watches, show where Panda will click before it clicks
+
+# The focused element, so the app can offer the keyboard when the user tapped a text field.
+FOCUS_JS = """() => {
+  const el = document.activeElement;
+  if (!el || el === document.body || el === document.documentElement) return null;
+  const tag = el.tagName.toLowerCase();
+  const type = (el.getAttribute('type') || '').toLowerCase();
+  const nonText = ['button','submit','checkbox','radio','range','color','file','image','reset','hidden'];
+  const editable = el.isContentEditable || tag === 'textarea' || (tag === 'input' && !nonText.includes(type));
+  if (!editable) return null;
+  const label = el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('name') || '';
+  return {kind: el.isContentEditable ? 'content' : tag === 'textarea' ? 'textarea' : (type || 'text'),
+          label: String(label).slice(0, 60), secret: type === 'password'};
+}"""
+
+ROLE_WORDS = {"link": "link", "button": "button", "textbox": "text field", "searchbox": "search box",
+              "combobox": "menu", "checkbox": "checkbox", "radio": "option", "tab": "tab", "menuitem": "menu item",
+              "option": "option", "img": "image", "heading": "heading", "switch": "switch", "listbox": "list"}
+# Outline lines look like `- link "Learn more" [ref=e13] [cursor=pointer]:`; after navigations the
+# refs carry a frame prefix (`f1e2`).
+_REF_LINE = re.compile(r'^\s*-\s+([A-Za-z]+)(?:\s+"((?:[^"\\]|\\.)*)")?[^\n]*?\[ref=([A-Za-z0-9]+)\]', re.M)
 
 
 def log(*a):
@@ -63,6 +92,16 @@ def normalize(url: str) -> str:
     if " " in url or "." not in url:
         return "https://duckduckgo.com/?q=" + urllib.parse.quote_plus(url)
     return "https://" + url
+
+
+def host_of(url: str) -> str:
+    h = urllib.parse.urlparse(url).hostname or url
+    return h[4:] if h.startswith("www.") else h
+
+
+def quoted(s: str, n: int = 48) -> str:
+    s = re.sub(r"\s+", " ", s or "").strip()
+    return "“" + (s if len(s) <= n else s[: n - 1] + "…") + "”"
 
 
 # ── Supabase Realtime (Phoenix protocol) ────────────────────────────────────
@@ -152,10 +191,17 @@ class Engine:
         self.message = ""
         self.done_evt = asyncio.Event()
         self.last_hello = 0.0
+        self.last_hello_snap = 0.0
         self.latest: str | None = None
         self.frame_evt = asyncio.Event()
         self.quality = 55
         self.busy = False
+        self.loading = False
+        self.action = ""                  # caption of what Panda is doing ("Clicking “Search”")
+        self.action_ts = 0.0
+        self.last_agent_ts = 0.0          # when Panda last used the browser (the worker keeps a final frame)
+        self.focus: dict | None = None    # the text field the user is typing into, if any
+        self.refs: dict[str, tuple[str, str]] = {}  # ref -> (role, name) from the last page outline
         self.cfg_mtime = 0.0
         self.last_status = ""
         self.ua_major = "140"
@@ -214,14 +260,36 @@ class Engine:
 
     async def _adopt(self, page):
         self.page = page
+        self.focus = None
         with contextlib.suppress(Exception):
             await page.set_viewport_size({"width": self.view[0], "height": self.view[1]})
         page.on("dialog", lambda d: asyncio.create_task(d.accept() if d.type in ("alert", "beforeunload") else d.dismiss()))
         page.on("download", lambda d: asyncio.create_task(self._download(d)))
         page.on("close", lambda: asyncio.create_task(self._page_closed(page)))
-        page.on("framenavigated", lambda f: asyncio.create_task(self.push_status()) if f == page.main_frame else None)
+        page.on("framenavigated", lambda f: asyncio.create_task(self._navigated(page)) if f == page.main_frame else None)
+        page.on("request", lambda r: self._nav_request(page, r, True))
+        page.on("requestfailed", lambda r: self._nav_request(page, r, False))
+        page.on("domcontentloaded", lambda _p: self._loading(page, False))
+        page.on("load", lambda _p: self._loading(page, False))
         await self._restart_screencast()
         await self.push_status()
+
+    def _nav_request(self, page, req, on: bool):
+        try:
+            if req.is_navigation_request() and req.frame == page.main_frame:
+                self._loading(page, on)
+        except Exception:  # service-worker requests have no frame
+            pass
+
+    def _loading(self, page, on: bool):
+        if page is self.page and self.loading != on:
+            self.loading = on
+            asyncio.create_task(self.push_status())
+
+    async def _navigated(self, page):
+        if page is self.page:
+            self.focus = None
+            await self.push_status()
 
     async def _page_closed(self, page):
         # Ignore closes caused by shutting down or swapping the whole context.
@@ -316,6 +384,7 @@ class Engine:
 
     async def _frame_sender(self):
         last = 0.0
+        small = 0
         while True:
             await self.frame_evt.wait()
             self.frame_evt.clear()
@@ -327,13 +396,22 @@ class Engine:
                 continue
             if len(data) > MAX_FRAME_B64 and self.quality > 25:  # page too detailed: compress harder
                 self.quality -= 10
+                small = 0
                 asyncio.create_task(self._restart_screencast())
                 continue
+            # Simple pages again: win back sharpness, slowly.
+            small = small + 1 if len(data) < MAX_FRAME_B64 * 0.45 else 0
+            if small > 40 and self.quality < BEST_QUALITY:
+                self.quality = min(BEST_QUALITY, self.quality + 5)
+                small = 0
+                asyncio.create_task(self._restart_screencast())
             last = time.time()
             await self.link.broadcast("frame", {"d": data, "w": self.view[0], "h": self.view[1]})
 
     async def snap_frame(self):
         """One immediate frame (used when a viewer opens, or the page is idle)."""
+        if not self.viewer_active():
+            return
         with contextlib.suppress(Exception):
             png = await self.page.screenshot(type="jpeg", quality=self.quality, timeout=5000)
             self.latest = base64.b64encode(png).decode()
@@ -349,8 +427,11 @@ class Engine:
         tabs = []
         for i, p in enumerate(self.ctx.pages):
             tabs.append({"i": i, "u": p.url[:200], "active": p is self.page})
+        recent = time.time() - self.action_ts < 6
         st = {"url": self.page.url, "title": title[:120], "tabs": tabs, "control": self.control,
-              "message": self.message, "busy": self.busy, "viewer": self.viewer_active(), "w": self.view[0], "h": self.view[1]}
+              "message": self.message, "busy": self.busy, "loading": self.loading, "viewer": self.viewer_active(),
+              "action": self.action if (self.busy or recent) else "", "focus": self.focus,
+              "w": self.view[0], "h": self.view[1]}
         key = json.dumps(st, sort_keys=True)
         if force or key != self.last_status:
             self.last_status = key
@@ -371,36 +452,87 @@ class Engine:
                 await pg.set_viewport_size({"width": w, "height": h})
         await self._restart_screencast()
 
+    # what Panda is doing, for the live view ----------------------------------
+    async def announce(self, kind: str, caption: str, box: dict | None = None, **extra):
+        self.action, self.action_ts = caption[:160], time.time()
+        payload = {"k": kind, "c": self.action, "t": int(self.action_ts * 1000), **extra}
+        if box:
+            payload.update(box)
+        await self.link.broadcast("action", payload)
+        await self.push_status(force=True)
+        if box and self.viewer_active():
+            await asyncio.sleep(CURSOR_LEAD)
+
+    async def _box(self, loc) -> dict | None:
+        """The element's box as fractions of the visible page (scrolled into view first)."""
+        try:
+            await loc.scroll_into_view_if_needed(timeout=3000)
+            b = await loc.bounding_box(timeout=2000)
+        except Exception:
+            return None
+        if not b or b["width"] <= 0 or b["height"] <= 0:
+            return None
+        w, h = self.view
+        r4 = lambda v: round(min(1.0, max(0.0, v)), 4)  # noqa: E731
+        return {"x": r4(b["x"] / w), "y": r4(b["y"] / h), "w": r4(b["width"] / w), "h": r4(b["height"] / h)}
+
+    def _target(self, ref: str) -> str:
+        role, name = self.refs.get(ref, ("", ""))
+        word = ROLE_WORDS.get(role, "")
+        if name:
+            return f"{quoted(name)}{' ' + word if word in ('link', 'button', 'tab', 'checkbox', 'switch') else ''}"
+        return f"the {word}" if word else "the page"
+
+    def _remember_refs(self, outline: str):
+        refs = {}
+        for role, name, ref in _REF_LINE.findall(outline or ""):
+            refs[ref] = (role, name.replace('\\"', '"'))
+        if refs:
+            self.refs = refs
+
     # input from the phone -----------------------------------------------------
     async def on_input(self, p: dict):
         t = p.get("t")
         try:
             if t == "hello":
+                first = not self.viewer_active()
                 self.last_hello = time.time()
                 if p.get("mode"):
                     await self.fit(str(p["mode"]), float(p.get("vw") or 0), float(p.get("vh") or 0))
                 if not self.cdp:
                     await self._restart_screencast()
-                await self.push_status(force=True)
-                await self.snap_frame()
+                # A hello repeats every few seconds; only a new viewer needs a fresh frame right away.
+                if first or time.time() - self.last_hello_snap > 6:
+                    self.last_hello_snap = time.time()
+                    await self.push_status(force=True)
+                    await self.snap_frame()
                 return
             if t == "takeover":
                 self.control, self.message = "user", ""
                 return await self.push_status(force=True)
             if t == "done":
-                self.control, self.message = "agent", ""
+                self.control, self.message, self.focus = "agent", "", None
                 self.done_evt.set()
                 return await self.push_status(force=True)
             if self.control == "agent":
                 return  # view only until the user takes over
             page = self.page
-            if t == "click":
-                await page.mouse.click(float(p["x"]) * self.view[0], float(p["y"]) * self.view[1])
+            if t in ("click", "dblclick"):
+                x, y = float(p["x"]) * self.view[0], float(p["y"]) * self.view[1]
+                if t == "click":
+                    await page.mouse.click(x, y)
+                else:
+                    await page.mouse.dblclick(x, y)
+                await asyncio.sleep(0.12)
+                await self._report_focus()
             elif t == "scroll":
                 await page.mouse.move(float(p.get("x", 0.5)) * self.view[0], float(p.get("y", 0.5)) * self.view[1])
                 await page.mouse.wheel(float(p.get("dx", 0)), float(p.get("dy", 0)))
             elif t == "key":
                 await page.keyboard.press(str(p["key"])[:30])
+                if p["key"] in ("Tab", "Shift+Tab", "Enter", "Escape"):
+                    await asyncio.sleep(0.1)
+                    await self._report_focus()
             elif t == "text":
                 await page.keyboard.insert_text(str(p["text"])[:2000])
             elif t == "nav":
@@ -410,6 +542,7 @@ class Engine:
                     asyncio.create_task(self._goto(url))
                 else:
                     self.message = why
+                    await self.push_status(force=True)
             elif t == "back":
                 await page.go_back(timeout=8000)
             elif t == "forward":
@@ -430,6 +563,14 @@ class Engine:
         except Exception as exc:
             log("input failed:", t, str(exc)[:120])
 
+    async def _report_focus(self):
+        try:
+            f = await asyncio.wait_for(self.page.evaluate(FOCUS_JS), 2)
+        except Exception:
+            f = None
+        self.focus = f if isinstance(f, dict) else None
+        await self.push_status(force=True)
+
     async def _goto(self, url):
         with contextlib.suppress(Exception):
             await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -441,6 +582,7 @@ class Engine:
             s = await asyncio.wait_for(self.page.aria_snapshot(mode="ai"), 12)
         except Exception as exc:
             s = f"(could not read the page: {str(exc)[:120]})"
+        self._remember_refs(s)
         limit = 40000 if full else 12000
         if len(s) > limit:
             s = s[:limit] + "\n… (truncated — `pb snap --full`, or `pb text` to read the content)"
@@ -470,7 +612,15 @@ class Engine:
         op = req.get("op")
         if op == "status":
             return {"ok": True, "control": self.control, "viewer": self.viewer_active(), "joined": self.link.joined,
-                    **await self.summary(snap=False)}
+                    "last_agent_ts": self.last_agent_ts, **await self.summary(snap=False)}
+        if op == "frame":  # read-only: the worker keeps the final screen of a turn with the reply
+            q = max(30, min(90, int(req.get("quality") or 70)))
+            try:
+                jpg = await self.page.screenshot(type="jpeg", quality=q, timeout=8000)
+            except Exception as exc:
+                return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+            return {"ok": True, "jpeg": base64.b64encode(jpg).decode(), "w": self.view[0], "h": self.view[1],
+                    **{k: v for k, v in (await self.summary(snap=False)).items() if k in ("url", "title")}}
         if self.control == "user":  # the user took over: wait for them to give it back
             self.message = "Panda is waiting for you to press Done"
             await self.push_status(force=True)
@@ -481,6 +631,7 @@ class Engine:
                 return {"ok": False, "error": "the user is still controlling the browser; try again later"}
         async with self.lock:
             self.busy = True
+            self.last_agent_ts = time.time()
             await self.push_status(force=True)
             try:
                 return await self._do(op, req)
@@ -489,6 +640,7 @@ class Engine:
                         **{k: v for k, v in (await self.summary(snap=False)).items() if k in ("url", "title")}}
             finally:
                 self.busy = False
+                self.last_agent_ts = time.time()
                 await self.push_status(force=True)
 
     async def _do(self, op: str, r: dict) -> dict:
@@ -499,44 +651,74 @@ class Engine:
             ok, why = url_ok(url)
             if not ok:
                 return {"ok": False, "error": why}
+            await self.announce("nav", f"Opening {host_of(url)}", url=url[:300])
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await self.settle(0.8)
         elif op == "snap":
-            pass
+            await self.announce("look", "Looking at the page")
         elif op == "click":
             if r.get("ref"):
-                await self._loc(r["ref"]).click(timeout=8000)
+                loc = self._loc(r["ref"])
+                await self.announce("click", f"Clicking {self._target(r['ref'])}", await self._box(loc))
+                await loc.click(timeout=8000)
             else:
-                await page.mouse.click(float(r["x"]), float(r["y"]))
+                x, y = float(r["x"]), float(r["y"])
+                box = {"x": round(x / self.view[0], 4), "y": round(y / self.view[1], 4), "w": 0, "h": 0}
+                await self.announce("click", "Clicking on the page", box)
+                await page.mouse.click(x, y)
             await self.settle()
         elif op == "type":
             loc = self._loc(r["ref"])
             text = r.get("text", "")
+            secret = False
+            with contextlib.suppress(Exception):
+                secret = (await loc.get_attribute("type", timeout=1500) or "").lower() == "password"
+            what = "a password" if secret else quoted(text, 40)
+            await self.announce("type", f"Typing {what} into {self._target(r['ref'])}", await self._box(loc))
             try:
                 await loc.fill(text, timeout=6000)
             except Exception:
                 await loc.click(timeout=5000)
                 await page.keyboard.type(text, delay=15)
             if r.get("submit"):
+                await self.announce("key", "Pressing Enter", key="Enter")
                 await page.keyboard.press("Enter")
             await self.settle()
+        elif op == "select":
+            loc = self._loc(r["ref"])
+            values = r.get("values") or [r.get("value", "")]
+            await self.announce("click", f"Choosing {quoted(', '.join(map(str, values)), 40)} in {self._target(r['ref'])}",
+                                await self._box(loc))
+            await loc.select_option([str(v) for v in values], timeout=8000)
+            await self.settle()
+        elif op == "hover":
+            loc = self._loc(r["ref"])
+            await self.announce("hover", f"Pointing at {self._target(r['ref'])}", await self._box(loc))
+            await loc.hover(timeout=8000)
+            await self.settle(0.3)
         elif op == "press":
+            await self.announce("key", f"Pressing {r['key']}", key=str(r["key"])[:30])
             await page.keyboard.press(r["key"])
             await self.settle()
         elif op == "scroll":
+            dy = float(r.get("dy", 600))
+            await self.announce("scroll", "Scrolling down" if dy >= 0 else "Scrolling up", dy=dy)
             await page.mouse.move(self.view[0] / 2, self.view[1] / 2)
-            await page.mouse.wheel(0, float(r.get("dy", 600)))
+            await page.mouse.wheel(0, dy)
             await self.settle(0.3)
         elif op in ("back", "forward", "reload"):
+            await self.announce("nav", {"back": "Going back", "forward": "Going forward", "reload": "Reloading the page"}[op])
             await {"back": page.go_back, "forward": page.go_forward, "reload": page.reload}[op](timeout=15000)
             await self.settle()
         elif op == "text":
+            await self.announce("read", "Reading the page")
             txt = await page.evaluate("document.body ? document.body.innerText : ''")
             limit = 40000 if r.get("full") else 9000
             out = await self.summary(snap=False)
             out["text"] = txt[:limit] + ("\n… (truncated; use --full)" if len(txt) > limit else "")
             return out
         elif op == "shot":
+            await self.announce("shot", "Taking a screenshot")
             OUT_DIR.mkdir(parents=True, exist_ok=True)
             name = re.sub(r"[^A-Za-z0-9._-]+", "_", r.get("name") or f"screenshot-{int(time.time())}.png")
             if not name.lower().endswith((".png", ".jpg")):
@@ -547,32 +729,39 @@ class Engine:
         elif op == "tabs":
             return await self.summary(snap=False)
         elif op == "tab":
+            await self.announce("nav", "Switching tabs")
             pages = self.ctx.pages
             await self._adopt(pages[int(r["i"])])
             await self.settle(0.2)
         elif op == "newtab":
+            await self.announce("nav", "Opening a new tab")
             await self._adopt(await self.ctx.new_page())
             if r.get("url"):
                 url = normalize(r["url"])
                 ok, why = url_ok(url)
                 if not ok:
                     return {"ok": False, "error": why}
+                await self.announce("nav", f"Opening {host_of(url)}", url=url[:300])
                 await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 await self.settle(0.6)
         elif op == "closetab":
+            await self.announce("nav", "Closing the tab")
             await page.close()
             await asyncio.sleep(0.2)
         elif op == "wait":
             if r.get("text"):
+                await self.announce("wait", f"Waiting for {quoted(r['text'], 40)}")
                 await page.get_by_text(r["text"]).first.wait_for(timeout=float(r.get("secs", 15)) * 1000)
             else:
+                await self.announce("wait", "Waiting for the page")
                 await asyncio.sleep(min(float(r.get("secs", 2)), 30))
             await self.snap_frame()
         elif op == "handoff":
             self.control, self.message = "needs_user", (r.get("message") or "Panda needs your help")[:300]
+            await self.announce("handoff", self.message)
             self.done_evt.clear()
-            await self.push_status(force=True)
             self.busy = False
+            await self.push_status(force=True)
             try:
                 await asyncio.wait_for(self.done_evt.wait(), float(r.get("timeout", 600)))
             except asyncio.TimeoutError:

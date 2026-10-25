@@ -46,6 +46,20 @@ export const IconUsers = (p: P) => <S {...p}><circle cx="9" cy="8" r="3.5" /><pa
 export const IconMoon = (p: P) => <S {...p}><path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5z" /></S>;
 export const IconArrowLeft = (p: P) => <S {...p}><path d="M19 12H5M11 6l-6 6 6 6" /></S>;
 export const IconFile = (p: P) => <S {...p}><path d="M6 3h8l4 4v14H6z" /><path d="M14 3v4h4" /></S>;
+export const IconCoins = (p: P) => <S {...p}><ellipse cx="9" cy="7" rx="6" ry="3" /><path d="M3 7v5c0 1.7 2.7 3 6 3s6-1.3 6-3V7" /><path d="M9 15v2c0 1.7 2.7 3 6 3s6-1.3 6-3v-5c0-1.6-2.3-2.8-5.3-3" /></S>;
+export const IconSlash = (p: P) => <S {...p}><rect x="3" y="3" width="18" height="18" rx="5" /><path d="m14.5 7-5 10" /></S>;
+export const IconKeyboard = (p: P) => <S {...p}><rect x="2.5" y="6" width="19" height="12" rx="2.5" /><path d="M6.5 10h.01M10 10h.01M13.5 10h.01M17 10h.01M7 14h10" /></S>;
+export const IconExpand = (p: P) => <S {...p}><path d="M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7" /></S>;
+export const IconArrowRight = (p: P) => <S {...p}><path d="M5 12h14M13 6l6 6-6 6" /></S>;
+export const IconLock = (p: P) => <S {...p}><rect x="5" y="10.5" width="14" height="10" rx="2.5" /><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5" /></S>;
+export const IconHand = (p: P) => <S {...p}><path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V11M11 10.5v-6a1.5 1.5 0 0 1 3 0v6M14 10.5v-4a1.5 1.5 0 0 1 3 0V14a7 7 0 0 1-7 7h-.6a6 6 0 0 1-4.6-2.2L2.6 15.9a1.5 1.5 0 0 1 2.2-2l3.2 2.6" /></S>;
+export const IconList = (p: P) => <S {...p}><path d="M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01" /></S>;
+export const IconCrew = (p: P) => <S {...p}><circle cx="12" cy="12" r="3" /><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1" /></S>;
+export const IconInfo = (p: P) => <S {...p}><circle cx="12" cy="12" r="9" /><path d="M12 11v5.5M12 7.6v.2" /></S>;
+export const IconEnter = (p: P) => <S {...p}><path d="M20 5v7a3 3 0 0 1-3 3H5" /><path d="m9 11-4 4 4 4" /></S>;
+export const IconBackspace = (p: P) => <S {...p}><path d="M8.5 5H20a1.5 1.5 0 0 1 1.5 1.5v11A1.5 1.5 0 0 1 20 19H8.5L2.5 12z" /><path d="m11.5 9.5 5 5M16.5 9.5l-5 5" /></S>;
+export const IconCursor = (p: P) => <S {...p}><path d="M5 3.5 19 10l-6.2 1.9L10 18.5z" /></S>;
+export const IconUndo = (p: P) => <S {...p}><path d="M9 14 4 9l5-5" /><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11" /></S>;
 export const IconSpinner = ({ size = 16 }: P) => (
   <svg width={size} height={size} viewBox="0 0 24 24" className="spin" aria-hidden>
     <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeOpacity="0.2" strokeWidth="2.4" />

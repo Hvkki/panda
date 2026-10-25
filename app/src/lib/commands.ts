@@ -1,8 +1,8 @@
-import { supabase } from "./supabase";
+import { supabase, type UsageInfo } from "./supabase";
 
 /**
- * Ask the running worker to do something in Kiro Crew (skills, connectors,
- * scheduled tasks). Resolves with the worker's result, or rejects on error/timeout.
+ * Ask the running worker to do something in Kiro Crew (skills, connectors, settings, usage...).
+ * Resolves with the worker's result, or rejects on error/timeout.
  */
 export async function runCommand<T = unknown>(op: string, args: Record<string, unknown> = {}, timeoutMs = 45000): Promise<T> {
   const { data: { user } } = await supabase.auth.getUser();
@@ -10,8 +10,10 @@ export async function runCommand<T = unknown>(op: string, args: Record<string, u
   if (error || !data) throw error || new Error("could not queue command");
   const id = data.id as number;
   const t0 = Date.now();
+  let wait = 600;
   while (Date.now() - t0 < timeoutMs) {
-    await new Promise((r) => setTimeout(r, 900));
+    await new Promise((r) => setTimeout(r, wait));
+    wait = Math.min(1500, wait + 150);
     const { data: row } = await supabase.from("commands").select("status,result").eq("id", id).single();
     if (row?.status === "done") return row.result as T;
     if (row?.status === "error") throw new Error((row.result as { error?: string })?.error || "failed");
@@ -22,3 +24,34 @@ export async function runCommand<T = unknown>(op: string, args: Record<string, u
 /** Shortcut for gateway calls the worker allows (skills, mcp, crons...). */
 export const gw = <T = unknown>(method: string, path: string, body?: unknown) =>
   runCommand<T>("gw", { method, path, body });
+
+export type CrewCommands = { commands: { name: string; description: string }[]; backend: string; version?: string };
+/** Kiro Crew's slash commands (GET /api/slash-commands) and which engine it runs on. */
+export const crewCommands = () => runCommand<CrewCommands>("crew.commands", {}, 30000);
+
+/** One Kiro Crew setting, as the worker sends it (short keys keep the payload small). */
+export type CrewSetting = {
+  p: string;               // dotted path, e.g. "session.autocompact_pct"
+  t: string;               // JSON type: string | integer | number | boolean | array | object
+  l: string;               // label
+  h?: string;              // help
+  e?: (string | number | boolean | null)[]; // enum values from the schema
+  d?: unknown;             // default
+  v?: unknown;             // current value
+  r?: 1;                   // needs a gateway restart
+  s?: 1;                   // sensitive (value masked)
+  w?: "patch" | "dash";    // how Panda may change it (absent: read-only)
+  x?: { type?: string; min?: number; max?: number; max_len?: number; values?: (string | number | boolean)[] };
+  k?: string;              // why Panda keeps it locked
+};
+export type CrewSettings = { items: CrewSetting[]; version?: string; backend?: string; spec?: string; at?: string };
+export const crewSettings = () => runCommand<CrewSettings>("crew.settings", {}, 90000);
+export const crewSet = (path: string, value: unknown) =>
+  runCommand<{ ok: boolean; path: string; value: unknown; clamp?: { stored?: number } }>("crew.set", { path, value }, 45000);
+
+/** Fresh account usage from Kiro Crew (and saved on the worker session for offline viewing). */
+export const usageNow = (refresh = false) => runCommand<UsageInfo>("usage", { refresh }, refresh ? 120000 : 45000);
+
+/** Side chat (/btw): a quick question that doesn't interrupt the running answer. */
+export const sideAsk = (chatId: string, question: string) =>
+  runCommand<{ answer: string; error?: boolean; note?: string }>("side", { chat_id: chatId, question }, 200000);

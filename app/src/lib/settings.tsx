@@ -19,6 +19,8 @@ export type Settings = {
   defaultEffort: string;
   name: string;
   browserTopic: string;
+  /** Kiro Crew settings changed in Panda; the worker re-applies them on every start. */
+  crewOverrides: Record<string, unknown>;
 };
 
 export const DEFAULTS: Settings = {
@@ -38,6 +40,7 @@ export const DEFAULTS: Settings = {
   defaultEffort: "medium",
   name: "",
   browserTopic: "",
+  crewOverrides: {},
 };
 
 type Ctx = { settings: Settings; update: (patch: Partial<Settings>) => void; loaded: boolean };
