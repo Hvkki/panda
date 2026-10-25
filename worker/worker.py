@@ -41,6 +41,19 @@ CFG = json.load(open(CFG_PATH)) if CFG_PATH else json.loads(os.environ["KIROCREW
 SB_URL = CFG["supabase_url"].rstrip("/")
 SB_ANON = CFG["supabase_publishable_key"]
 OWNER = CFG["owner_id"]  # replaced by whoever pressed Start (claim_session)
+PRIMARY_OWNER = CFG["owner_id"]  # the account worker.json was made for (its Drive, the legacy state paths)
+# The session function writes the worker_sessions id of the Start press here when it pushes this
+# file to the account's own Kaggle notebook, so each run serves exactly the person who started it.
+INJECTED_SESSION_ID = ""
+
+
+def state_key(name: str) -> str:
+    """Storage path of this account's state (snapshots, browser logins).
+
+    The primary account keeps the original paths; every other account has its own folder, so two
+    workers running at the same time never overwrite each other.
+    """
+    return name if OWNER == PRIMARY_OWNER else f"users/{OWNER}/{name}"
 SECRETS = [CFG["kiro_api_key"], CFG["worker_password"], CFG.get("vapid_private", ""),
            (CFG.get("drive") or {}).get("refresh_token", ""), (CFG.get("drive") or {}).get("client_secret", "")]
 FILES_BUCKET = "panda-files"
@@ -316,10 +329,10 @@ def _no_locks(info: tarfile.TarInfo):
 def restore(sb: Supabase) -> str:
     snap = f"{WORK}/restore-crew.tar.gz"
     extra = f"{WORK}/restore-kiro.tar.gz"
-    got = sb.download("latest-crew.tar.gz", snap)
+    got = sb.download(state_key("latest-crew.tar.gz"), snap)
     if got:
         sh(f"kirocrew restore {snap} --mode replace --force", timeout=900)
-    if sb.download("latest-kiro.tar.gz", extra):
+    if sb.download(state_key("latest-kiro.tar.gz"), extra):
         with tarfile.open(extra) as t:
             t.extractall(f"{HOME}/.kiro", filter="data")
         for lock in glob.glob(f"{HOME}/.kiro/sessions/cli/*.lock"):
@@ -336,14 +349,14 @@ def snapshot(sb: Supabase, reason: str) -> str:
     files = sorted(glob.glob(f"{out}/*.tar.gz"))
     if not files:
         raise RuntimeError("snapshot produced no file")
-    sb.upload("latest-crew.tar.gz", files[-1])
+    sb.upload(state_key("latest-crew.tar.gz"), files[-1])
     extra = f"{WORK}/kiro-extra.tar.gz"
     with tarfile.open(extra, "w:gz") as t:
         for d in EXTRA_DIRS:
             p = f"{HOME}/.kiro/{d}"
             if os.path.isdir(p):
                 t.add(p, arcname=d, filter=_no_locks)
-    sb.upload("latest-kiro.tar.gz", extra)
+    sb.upload(state_key("latest-kiro.tar.gz"), extra)
     log(f"snapshot uploaded ({reason}), {os.path.getsize(files[-1]) // 1024} KiB")
     return now_iso()
 
@@ -747,7 +760,7 @@ def browser_restore(sb: "Supabase"):
     """Download + decrypt the saved logins (cookies) so Panda is still signed in."""
     f = _fernet()
     tmp = f"{WORK}/browser-state.enc"
-    if not f or not sb.download(BROWSER_BLOB, tmp):
+    if not f or not sb.download(state_key(BROWSER_BLOB), tmp):
         return
     try:
         os.makedirs(BROWSER_DIR, exist_ok=True)
@@ -774,7 +787,7 @@ def browser_backup(sb: "Supabase", force: bool = False):
     with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as out:
         out.write(f.encrypt(open(BROWSER_STATE, "rb").read()))
     try:
-        sb.upload(BROWSER_BLOB, tmp, mime="application/octet-stream")
+        sb.upload(state_key(BROWSER_BLOB), tmp, mime="application/octet-stream")
         _browser_sync["mtime"] = m
     finally:
         with contextlib.suppress(OSError):
@@ -887,7 +900,7 @@ def browser_forget(sb: "Supabase") -> dict:
     for path in (BROWSER_STATE,):
         with contextlib.suppress(OSError):
             os.remove(path)
-    sb.delete_object(BROWSER_BLOB)
+    sb.delete_object(state_key(BROWSER_BLOB))
     _browser_sync["mtime"] = 0.0
     return {"forgotten": True, "note": note}
 
@@ -901,6 +914,9 @@ DRIVE_MIN = 45 * 2**20  # bigger outputs go to Drive (Supabase file limit is 50 
 def setup_drive():
     d = CFG.get("drive")
     if not d:
+        return False
+    if OWNER != PRIMARY_OWNER:  # worker.json's Drive belongs to the primary account, not to this user
+        log("google drive: not connected for this account (big files stay in Storage)")
         return False
     os.makedirs(os.path.dirname(DRIVE_CFG), exist_ok=True)
     with open(os.open(DRIVE_CFG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
@@ -1947,18 +1963,35 @@ def mirror_notifications(sb: Supabase, gw: Gateway, seen: set):
 
 
 def claim_session(sb: Supabase) -> dict:
-    """Claim the newest 'requested' session (the Start press); its owner is who we serve."""
+    """Claim the Start press this run serves; its owner is who we serve.
+
+    The session function writes the press's id into INJECTED_SESSION_ID. Without it (an older
+    function), take the oldest unclaimed press of the last 20 minutes: the PATCH only succeeds while
+    the row is still 'requested', so two workers booting at the same time never take the same one.
+    """
     global OWNER
-    rows = sb.rest("GET", "worker_sessions", params={
-        "status": "in.(requested,starting)", "order": "started_at.desc", "limit": "1", "select": "*"})
-    if rows and rows[0].get("owner"):
-        OWNER = rows[0]["owner"]
-    body = {"status": "starting", "heartbeat_at": now_iso(),
-            "kaggle_kernel": os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "local")}
-    if rows:
-        return sb.rest("PATCH", "worker_sessions", params={"id": f"eq.{rows[0]['id']}"},
-                       body=body, prefer="return=representation")[0]
-    return sb.rest("POST", "worker_sessions", body={"owner": OWNER, **body},
+    # kaggle_kernel stays what the session function wrote ("owner/notebook vN"): it tells which
+    # account's notebook this run is on.
+    body = {"status": "starting", "heartbeat_at": now_iso()}
+    want = INJECTED_SESSION_ID or os.environ.get("PANDA_SESSION_ID", "")
+    if want:
+        ids = [want]
+    else:
+        since = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+        rows = sb.rest("GET", "worker_sessions", params={
+            "status": "eq.requested", "started_at": f"gte.{since}", "order": "started_at.asc", "limit": "10",
+            "select": "id"}) or []
+        ids = [r["id"] for r in rows]
+    for sid in ids:
+        params = {"id": f"eq.{sid}"} if want else {"id": f"eq.{sid}", "status": "eq.requested"}
+        got = sb.rest("PATCH", "worker_sessions", params=params, body=body, prefer="return=representation")
+        if got:
+            if got[0].get("owner"):
+                OWNER = got[0]["owner"]
+            log(f"serving session {sid}" + ("" if OWNER == PRIMARY_OWNER else " (own state folder)"))
+            return got[0]
+    return sb.rest("POST", "worker_sessions", body={"owner": OWNER, **body,
+                                                    "kaggle_kernel": os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "local")},
                    prefer="return=representation")[0]
 
 

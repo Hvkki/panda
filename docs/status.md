@@ -3,6 +3,19 @@
 Each line says how it was checked. "Not verified" means nobody has seen it work on a device yet.
 Several earlier claims were wrong. This page lists only what was checked.
 
+## 25 October (4): a Kaggle notebook per account
+
+- Notebook `vladraf/panda-worker-tetiana` created (private, CPU, internet, worker dataset) and mapped
+  to tetiana.h.t@gmail.com in `config/kernels.json`. Checked with Kaggle's GetKernel.
+- The worker serves exactly the Start press it was pushed for (`INJECTED_SESSION_ID`, written by the
+  session function), or else the oldest unclaimed press, claimed atomically. Accounts other than the
+  one in `worker.json` keep snapshots and browser logins under `users/<id>/` and don't get its Google
+  Drive. Checked with a fake Supabase (claim, paths, Drive). Deployed to Storage.
+- **The `session` function change is not deployed** (needs the dashboard or a Supabase access
+  token). Until it is, every Start pushes to `vladraf/kirocrew-worker`; Kaggle runs a second batch
+  session of the same notebook on its own machine, and the worker's claim keeps the accounts apart.
+- Shared on purpose: the Kiro API key (one Kiro account's credits) and the Kaggle account's quota.
+
 ## 25 October (3): mobile browser, keyboard button, uptime and context, Developer tab
 
 From the owner's phone screenshots. Checked locally (engine against live Supabase Realtime with

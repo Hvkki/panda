@@ -4,8 +4,11 @@
 //
 // Secrets to set in Supabase (Edge Functions -> Secrets):
 //   KAGGLE_API_TOKEN   your Kaggle API token (KGAT_...)
-//   KAGGLE_KERNEL      e.g. vladraf/kirocrew-worker
+//   KAGGLE_KERNEL      e.g. vladraf/kirocrew-worker   (the default notebook)
 //   KAGGLE_DATASET     e.g. vladraf/kirocrew-test-secret
+// One notebook per account: Storage kirocrew-state/config/kernels.json maps a user id to its own
+// Kaggle notebook ({"<user id>": "vladraf/panda-worker-name"}); accounts not listed use KAGGLE_KERNEL.
+// Each notebook is its own CPU machine, so accounts never share a worker.
 // SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are provided automatically.
 import { createClient } from "npm:@supabase/supabase-js@2";
 
@@ -54,22 +57,34 @@ Deno.serve(async (req) => {
   if (alive) return json({ session: last, alive: true, note: "already running" });
 
   const token = Deno.env.get("KAGGLE_API_TOKEN");
-  const kernel = Deno.env.get("KAGGLE_KERNEL");
+  const fallback = Deno.env.get("KAGGLE_KERNEL");
   const dataset = Deno.env.get("KAGGLE_DATASET");
-  if (!token || !kernel || !dataset) return json({ error: "function secrets are not set" }, 500);
+  if (!token || !fallback || !dataset) return json({ error: "function secrets are not set" }, 500);
 
+  // This account's own notebook (its own CPU), else the default one.
+  let kernel = fallback;
+  const map = await admin.storage.from("kirocrew-state").download("config/kernels.json");
+  if (!map.error) {
+    try {
+      const k = (JSON.parse(await map.data.text()) as Record<string, string>)[user.id];
+      if (typeof k === "string" && /^[\w-]+\/[\w-]+$/.test(k)) kernel = k;
+    } catch { /* a broken map falls back to the default notebook */ }
+  }
   const code = await admin.storage.from("kirocrew-state").download("code/worker.py");
   if (code.error) return json({ error: "worker code missing in storage" }, 500);
 
   const { data: sess, error: insErr } = await admin.from("worker_sessions")
-    .insert({ owner: user.id, status: "requested", info: { by: "app" } }).select().single();
+    .insert({ owner: user.id, status: "requested", info: { by: "app" }, kaggle_kernel: `${kernel} v?` }).select().single();
   if (insErr) return json({ error: insErr.message }, 500);
+  // The run serves exactly this Start press (and so this account).
+  const text = (await code.data.text()).replace(/^INJECTED_SESSION_ID = ""$/m, `INJECTED_SESSION_ID = "${sess.id}"`);
+  const title = kernel.split("/")[1].replace(/-/g, " ");
 
   const push = await fetch("https://api.kaggle.com/v1/kernels.KernelsApiService/SaveKernel", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({
-      slug: kernel, newTitle: "kirocrew worker", text: await code.data.text(), language: "python",
+      slug: kernel, newTitle: title, text, language: "python",
       kernelType: "script", isPrivate: true, enableGpu: false, enableTpu: false, enableInternet: true,
       datasetDataSources: [dataset], competitionDataSources: [], kernelDataSources: [],
       modelDataSources: [], categoryIds: [], sessionTimeoutSeconds: MAX_RUN_SECS,
