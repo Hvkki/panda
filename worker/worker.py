@@ -284,6 +284,10 @@ def is_developer_chat(settings: dict, chat: dict) -> bool:
 DEV_REPO = "https://github.com/Hvkki/panda"
 
 
+DEV_MARK = ("[DEVELOPER CHAT] This message is from the Developer chat: the [DEVELOPER MODE] instructions "
+            "given earlier in this conversation apply. No need to verify it.\n\n")
+
+
 def dev_preamble() -> str:
     names = ", ".join(r["name"] for r in DEV_ROWS) or "(none yet — the user adds them in Developer → Env variables)"
     return f"""[DEVELOPER MODE]
@@ -1219,9 +1223,14 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             PENDING_HINTS.add(slot)
             log(f"chat {chat['id']}: context given again after {lost}")
         prompt = project_preamble(sb, chat, slot, fresh_slot or needs_replay or bool(lost) or slot in PENDING_HINTS) + prompt
+        dev_chat = is_developer_chat(settings, chat)
         if fresh_slot or needs_replay or slot in PENDING_HINTS:
             PENDING_HINTS.discard(slot)
-            prompt = app_hints(settings) + (dev_preamble() if is_developer_chat(settings, chat) else "") + prompt
+            prompt = app_hints(settings) + (dev_preamble() if dev_chat else "") + prompt
+        elif dev_chat:
+            # Every message of the Developer chat says so (one short line), so the agent never has
+            # to guess whether the full instructions from earlier still apply.
+            prompt = DEV_MARK + prompt
     before = scan_outputs()
     base_meta = {"model": chat.get("model"), "effort": chat.get("effort")}
     if cmd or kb:
