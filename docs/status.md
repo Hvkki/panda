@@ -5,7 +5,9 @@ Several earlier claims were wrong. This page lists only what was checked.
 
 ## 25 October: credits, commands, Kiro Crew settings, browser, motion
 
-Checked locally, **not yet on Kaggle or a phone** (the worker and app are not deployed yet):
+Deployed on 25 October: the app to Vercel production and the worker (commit `fa38554`) to Storage.
+The mocked UI checks also pass against the live site. **Not yet run on Kaggle or seen on a phone**:
+the next Start is the first run of this worker.
 
 - **Credit usage.** The worker copies Kiro Crew's per-turn `meta.turn_stats.credits` onto each reply
   (`meta.credits`) and keeps the Kiro account's month (`GET /api/sessions/usage`) plus the gateway's
