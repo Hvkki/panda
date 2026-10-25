@@ -25,6 +25,9 @@ from playwright.async_api import async_playwright
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DIST = os.path.join(ROOT, "app", "dist")
+# PANDA_APP_URL=https://panda-app-gamma.vercel.app checks the deployed build instead of app/dist
+# (Supabase is still fully mocked, so no real account or data is touched).
+APP = os.environ.get("PANDA_APP_URL", "http://127.0.0.1:4179").rstrip("/")
 OUT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/panda-shots"
 FIX = sys.argv[2] if len(sys.argv) > 2 else ""
 CHROME = os.environ.get("PANDA_CHROMIUM") or None
@@ -307,7 +310,7 @@ async def main():
 
         # 1. Home, phone: animated panda + starters; then the "/" menu.
         page = await new_page(390, 844)
-        await page.goto("http://127.0.0.1:4179/index.html")
+        await page.goto(f"{APP}/")
         await page.wait_for_selector(".greeting", timeout=20000)
         await asyncio.sleep(1.2)
         REPORT["home_panda"] = await anims(page, ".home-mark")
@@ -324,7 +327,7 @@ async def main():
 
         # 2. Chat, phone: command card, credits, live browser card with the agent pointer.
         page = await new_page(390, 844)
-        await page.goto(f"http://127.0.0.1:4179/index.html?c={CHAT_A}")
+        await page.goto(f"{APP}/?c={CHAT_A}")
         await page.wait_for_selector(".msg.assistant", timeout=20000)
         await asyncio.sleep(1.0)
         for _ in range(3):
@@ -367,7 +370,7 @@ async def main():
 
         # 4. Desktop: docked browser next to the chat; settings tabs.
         page = await new_page(1440, 900)
-        await page.goto(f"http://127.0.0.1:4179/index.html?c={CHAT_A}")
+        await page.goto(f"{APP}/?c={CHAT_A}")
         await page.wait_for_selector(".msg.assistant", timeout=20000)
         for _ in range(2):
             push_live("desktop")
@@ -403,7 +406,7 @@ async def main():
         # 4b. Other pages keep working with the new styles.
         page = await new_page(1280, 820)
         for name, q in (("projects", "v=projects"), ("files", "v=files"), ("customize", "v=customize&tab=keys")):
-            await page.goto(f"http://127.0.0.1:4179/index.html?{q}")
+            await page.goto(f"{APP}/?{q}")
             await page.wait_for_selector(".page-head", timeout=20000)
             await asyncio.sleep(0.6)
             await page.screenshot(path=f"{OUT}/13-page-{name}.png")
@@ -411,7 +414,7 @@ async def main():
         ctx = await b.new_context(viewport={"width": 390, "height": 844}, device_scale_factor=2, service_workers="block")
         await ctx.route(f"{SB}/**", handle_route)
         login = await ctx.new_page()
-        await login.goto("http://127.0.0.1:4179/index.html")
+        await login.goto(f"{APP}/")
         await login.wait_for_selector(".login-card", timeout=20000)
         await asyncio.sleep(0.5)
         await login.screenshot(path=f"{OUT}/14-login.png")
@@ -419,7 +422,7 @@ async def main():
 
         # 5. Dark home + reduced motion (the working ring must still turn).
         page = await new_page(390, 844, theme="dark", reduced=True)
-        await page.goto(f"http://127.0.0.1:4179/index.html?c={CHAT_A}")
+        await page.goto(f"{APP}/?c={CHAT_A}")
         await page.wait_for_selector(".msg.assistant", timeout=20000)
         await asyncio.sleep(0.8)
         a1 = await anims(page, "svg.panda-working")
@@ -427,7 +430,7 @@ async def main():
         a2 = await anims(page, "svg.panda-working")
         REPORT["reduced_motion"] = {"names": (a1 or {}).get("names"), "ring_turns": bool(a1 and a2 and a1["ringTransform"] != a2["ringTransform"])}
         await page.screenshot(path=f"{OUT}/11-chat-dark-phone.png")
-        await page.goto("http://127.0.0.1:4179/index.html")
+        await page.goto(f"{APP}/")
         await page.wait_for_selector(".greeting", timeout=20000)
         await page.fill(".composer textarea", "/")
         await asyncio.sleep(0.5)

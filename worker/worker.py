@@ -731,10 +731,12 @@ def browser_snapshot(sb: "Supabase", chat: dict, reply_id: int, since: float) ->
     The live view ends with the worker; the saved frame lets the chat show what Panda's browser
     looked like at the end of that answer (the GPT-style card), even days later.
     """
-    if not (_browser_proc["p"] and _browser_proc["p"].poll() is None):
-        return None
     try:
+        # Ask the engine itself: `pb` can start it too, so the worker's own process handle may be stale.
         st = engine_call({"op": "status"}, timeout=4)
+    except Exception:
+        return None  # no browser running
+    try:
         if not st.get("ok") or float(st.get("last_agent_ts") or 0) < since:
             return None
         fr = engine_call({"op": "frame", "quality": 72}, timeout=15)
