@@ -1143,6 +1143,41 @@ def finish_without_model(sb: Supabase, chat: dict, msg: dict, text: str, meta: d
     sb.rest("PATCH", "messages", params={"id": f"eq.{msg['id']}"}, body={"status": "done"})
 
 
+# Commands after which the conversation no longer carries what Panda put in front of it (the app
+# context, the Developer instructions, the project): the next message brings it again.
+RESET_COMMANDS = {"/clear", "/compact"}
+
+
+def context_lost(sb: Supabase, chat_id: str, before_id: int) -> str:
+    """Why this chat's context must be given again, or "" if it still has it.
+
+    Read from the chat's own rows, so it also holds after a worker restart: a /clear or /compact
+    since the last normal message, or Crew compacting by itself (the context reading dropped a lot
+    during the last answer).
+    """
+    try:
+        rows = sb.rest("GET", "messages", params={
+            "chat_id": f"eq.{chat_id}", "id": f"lt.{before_id}", "role": "in.(user,assistant)",
+            "order": "id.desc", "limit": "24", "select": "role,content,meta"}) or []
+    except Exception as exc:
+        log("context check:", type(exc).__name__)
+        return ""
+    for r in rows:  # newest first, back to the last normal message
+        if r["role"] != "user":
+            continue
+        word = command_word(r.get("content") or "")
+        if word in RESET_COMMANDS:
+            return word
+        if not word:
+            break
+    pcts = [((r.get("meta") or {}).get("usage") or {}).get("pct") for r in rows
+            if r["role"] == "assistant" and not (r.get("meta") or {}).get("command")]
+    pcts = [p for p in pcts if isinstance(p, (int, float))][:2]
+    if len(pcts) == 2 and pcts[1] >= 35 and pcts[0] < pcts[1] * 0.55:
+        return "auto-compaction"
+    return ""
+
+
 def handle(sb: Supabase, gw: Gateway, msg: dict):
     chat = sb.rest("GET", "chats", params={"id": f"eq.{msg['chat_id']}", "select": "*"})[0]
     settings = user_settings(sb, chat["owner"])
@@ -1154,8 +1189,10 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
     if cmd:
         # Sent as typed (Crew matches the first word). Context the app would add waits for the next message.
         prompt = _ANSI.sub("", raw.strip())
-        if fresh_slot or needs_replay:
+        if fresh_slot or needs_replay or cmd in RESET_COMMANDS:
             PENDING_HINTS.add(slot)
+        if cmd in RESET_COMMANDS:
+            PROJECT_APPLIED.pop(slot, None)
         if needs_replay:
             PENDING_REPLAY.add(slot)
         log(f"chat {chat['id']}: command {cmd}")
@@ -1177,7 +1214,11 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             PENDING_REPLAY.discard(slot)
             prompt = replay_prefix(sb, chat["id"], msg["id"]) + prompt
             log(f"chat {chat['id']}: Crew lost the slot, replayed history from Supabase")
-        prompt = project_preamble(sb, chat, slot, fresh_slot or needs_replay) + prompt
+        lost = "" if (fresh_slot or needs_replay or slot in PENDING_HINTS) else context_lost(sb, chat["id"], msg["id"])
+        if lost:
+            PENDING_HINTS.add(slot)
+            log(f"chat {chat['id']}: context given again after {lost}")
+        prompt = project_preamble(sb, chat, slot, fresh_slot or needs_replay or bool(lost) or slot in PENDING_HINTS) + prompt
         if fresh_slot or needs_replay or slot in PENDING_HINTS:
             PENDING_HINTS.discard(slot)
             prompt = app_hints(settings) + (dev_preamble() if is_developer_chat(settings, chat) else "") + prompt
