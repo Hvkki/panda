@@ -3,6 +3,37 @@
 Each line says how it was checked. "Not verified" means nobody has seen it work on a device yet.
 Several earlier claims were wrong. This page lists only what was checked.
 
+## 25 October (3): mobile browser, keyboard button, uptime and context, Developer tab
+
+From the owner's phone screenshots. Checked locally (engine against live Supabase Realtime with
+`tools/test_browser_mobile.py` and `tools/test_browser_local.py`; the app with Supabase mocked,
+`tools/screenshots/mock_ui.py`), **not yet on a phone or on Kaggle**:
+
+- **Searches go to Google, not DuckDuckGo** (DuckDuckGo answered the headless browser with
+  "Unexpected error"). `google com` (the phone keyboard dropped the dot) opens google.com, words
+  search Google, a new tab and an empty browser open Google.
+- **Real mobile pages, sharp.** A phone viewer now gets the site's mobile version (400 CSS px wide,
+  mobile user agent and client hints, touch) and frames captured at 1.5× device pixels (600 px wide,
+  ~45 KB), so text is no longer blurry when scaled to the screen. Taps are real touch events. Big
+  pages step quality, then density, down to stay under the Realtime size limit. Desktop viewers keep
+  1024×720. A chat card alone no longer flips the page shape.
+- **Keyboard only when asked.** The type bar is hidden until the ⌨ button (or "Type into …" after
+  tapping a field). While the keyboard is up the page keeps its size, shows at full width and scrolls
+  to the field (the engine now reports the field's position). Phones show the page edge to edge.
+- **Uptime on phones** ("25m" in the chip; the word "Running" and "Stop" collapse to the dot and
+  the power icon). **Context meter** in the chat bar shows its percentage: the app hid it whenever
+  Crew sent no token counts (`reset: true`, normal for kiro-cli), and the worker never got the reading
+  because Crew sends it after the chat stream closes. The worker now takes it from Crew's websocket
+  (or the slot detail) after each turn.
+- **Developer tab** (sidebar → Developer): one Developer chat where Panda may change Panda itself
+  (clone this repo, build, deploy the app with `scripts/deploy-app.py`, the worker with
+  `scripts/deploy-worker.sh`), and **Env variables** for that chat only (single or "Import .env").
+  They are vault rows named `DEV__<NAME>`; the worker keeps them out of `secrets.env` and Crew's
+  `.env` and writes `~/.panda/dev.env` only while a Developer turn runs. The chat id is
+  `user_settings.developerChatId`; the chat is hidden from the normal list. Limit: every chat runs on
+  the same unsandboxed machine, so a turn running in another chat at the same moment could read the
+  file; the prompt forbids it and replies are scrubbed of every vault value.
+
 ## 25 October (2): mobile fixes, a terminal + disk browser, credits, fewer stray files
 
 Second pass on owner-reported issues. Checked locally (worker against a live Kiro Crew gateway, the

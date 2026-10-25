@@ -96,8 +96,16 @@ says hello. At the end of a turn that used the browser, the worker saves the scr
 `panda-files/<owner>/browser/<chat>/<reply>.jpg` (`meta.browser`). Cookies are saved encrypted with
 Fernet to `browser/state.enc` in the `kirocrew-state` bucket.
 
+A viewer's hello carries `mode` and its size. For `mobile` the engine emulates a phone over CDP
+(400 CSS px wide, mobile user agent, touch) and sends `Page.captureScreenshot` frames clipped to the
+visual viewport at scale 1.5; the screencast is then only the "page changed" signal.
+
 ## Key vault
 
 The owner stores keys through RPC functions (set, delete, list names). Values cannot be read back
 through the app. Only the worker reads values, and it writes them to `~/.panda/secrets.env` for the
 agent to source.
+
+Names starting with `DEV__` belong to the Developer tab. They are left out of `secrets.env` and
+Crew's `.env`; while a turn of the Developer chat (`user_settings.developerChatId`) runs, the worker
+writes them without the prefix to `~/.panda/dev.env` and deletes the file afterwards.

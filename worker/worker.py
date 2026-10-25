@@ -195,12 +195,30 @@ PANDA_SECRETS = os.path.expanduser("~/.panda/secrets.env")
 SECRET_NAMES: list = []
 
 
+DEV_PREFIX = "DEV__"          # vault names of the Developer tab's env variables (stored without it in dev.env)
+DEV_ENV = os.path.expanduser("~/.panda/dev.env")
+DEV_ROWS: list = []           # [{name, value}] with the prefix removed
+DEV_LOCK = threading.Lock()
+DEV_TURNS = {"n": 0}          # developer turns running now; dev.env exists only while > 0
+
+
 def sync_secrets(sb: "Supabase") -> list:
-    """API keys from the app's vault -> env files the agent and MCP servers read."""
+    """API keys from the app's vault -> env files the agent and MCP servers read.
+
+    Developer variables (vault names starting with DEV__) are kept apart: they never go into
+    secrets.env or Crew's .env, and are written to ~/.panda/dev.env only while a turn of the
+    Developer chat runs.
+    """
     rows = sb.rest("GET", "secrets", params={"owner": f"eq.{OWNER}", "select": "name,value"}) or []
     for r in rows:
         if r["value"] not in SECRETS:
             SECRETS.append(r["value"])  # never let a key appear in logs or replies
+    with DEV_LOCK:
+        DEV_ROWS[:] = [{"name": r["name"][len(DEV_PREFIX):], "value": r["value"]} for r in rows
+                       if r["name"].startswith(DEV_PREFIX) and len(r["name"]) > len(DEV_PREFIX)]
+        if DEV_TURNS["n"] > 0:
+            _write_dev_env()
+    rows = [r for r in rows if not r["name"].startswith(DEV_PREFIX)]
     os.makedirs(os.path.dirname(PANDA_SECRETS), exist_ok=True)
     lines = [f"export {r['name']}={json.dumps(r['value'])}" for r in rows]
     with open(os.open(PANDA_SECRETS, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
@@ -221,8 +239,68 @@ def sync_secrets(sb: "Supabase") -> list:
     with open(os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         f.write("\n".join(keep + block) + "\n")
     SECRET_NAMES[:] = [r["name"] for r in rows]
-    log(f"vault: {len(rows)} key(s) available")
+    log(f"vault: {len(rows)} key(s) available, {len(DEV_ROWS)} developer variable(s)")
     return SECRET_NAMES
+
+
+def _write_dev_env():
+    os.makedirs(os.path.dirname(DEV_ENV), exist_ok=True)
+    lines = [f"export {r['name']}={shlex.quote(r['value'])}" for r in DEV_ROWS]
+    with open(os.open(DEV_ENV, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def dev_begin():
+    with DEV_LOCK:
+        DEV_TURNS["n"] += 1
+        _write_dev_env()
+
+
+def dev_end():
+    with DEV_LOCK:
+        DEV_TURNS["n"] = max(0, DEV_TURNS["n"] - 1)
+        if DEV_TURNS["n"] == 0:
+            with contextlib.suppress(OSError):
+                os.remove(DEV_ENV)
+
+
+def is_developer_chat(settings: dict, chat: dict) -> bool:
+    return bool(settings.get("developerChatId")) and settings.get("developerChatId") == chat.get("id")
+
+
+DEV_REPO = "https://github.com/Hvkki/panda"
+
+
+def dev_preamble() -> str:
+    names = ", ".join(r["name"] for r in DEV_ROWS) or "(none yet — the user adds them in Developer → Env variables)"
+    return f"""[DEVELOPER MODE]
+This is the Developer chat. Here, and only here, the user may ask you to change Panda itself: its
+web app (UI), the worker, its skills or its prompt. Elsewhere you never touch Panda's own code.
+
+- Source: {DEV_REPO} (public). Work in ~/dev/panda: clone it the first time, otherwise `git fetch`.
+  Use branch $PANDA_DEV_BRANCH if it is set, else the branch the user names, else the default branch.
+  Read README.md, docs/architecture.md and docs/runbook.md before the first change.
+- Developer env variables, for this chat only: {names}.
+  Load them inside a bash command with `set -a; . ~/.panda/dev.env; set +a`. The file exists only
+  while a Developer turn runs. Never print, echo, log, commit or paste their values.
+- Web app (app/, Vite + React + TypeScript): `cd app && npm ci && npm run build` must pass before any
+  deploy. Deploy to production with `python3 scripts/deploy-app.py` (needs VERCEL_TOKEN).
+  If node/npm is missing, install Node 22 under ~/.local first.
+- Worker, skills, prompt (worker/): `bash scripts/deploy-worker.sh` (needs SUPABASE_URL and
+  SUPABASE_SECRET_KEY) uploads them; a running worker keeps its old code until the user presses Stop
+  and Start. To try a skill change right away, also copy it into ~/.kiro/crew/skills/.
+- Save every change in git: commit on a branch with a clear message and push it
+  (`git push https://x-access-token:$GITHUB_TOKEN@github.com/Hvkki/panda.git HEAD:<branch>` needs GITHUB_TOKEN).
+  If there is no GITHUB_TOKEN, say so and keep the commit locally.
+- Do exactly what the user asked, no more. For a bigger change, say the plan in two or three lines
+  first. Deploy only when the user asked for it (or clearly wants it live). Afterwards tell them what
+  changed, where, and how to undo it (git revert, or redeploy the previous commit).
+- Never weaken security: the owner-only checks, row-level security, the relay allow-list
+  (GW_ALLOWED in worker/worker.py) and the browser's private-address block stay as they are unless
+  the user explicitly asks and understands the risk.
+[END DEVELOPER MODE]
+
+"""
 
 
 # State the Crew snapshot does not carry: Crew's chat transcripts (crew/sessions) and
@@ -349,6 +427,39 @@ THINK = {}          # slot -> accumulated thinking text of the running turn
 THINK_REPLY = {}    # slot -> assistant message id being streamed
 THINK_SENT = {}     # slot -> length already written to Supabase
 THINK_LOCK = threading.Lock()
+CTX = {}            # slot -> latest context_usage reading from Crew's websocket
+
+
+def context_usage(gw: "Gateway", slot: str, since: float, streamed: dict | None) -> dict | None:
+    """The chat's context window use after this turn: {pct, used_tokens?, window_tokens?, reset?}.
+
+    Crew broadcasts it on the websocket right after the turn (after the SSE closed); when that
+    didn't arrive, the slot detail carries the same reading as context_pct.
+    """
+    def clean(d: dict) -> dict:
+        out = {"pct": round(float(d["pct"]), 1)}
+        if d.get("used_tokens") and d.get("window_tokens"):
+            out.update(used_tokens=int(d["used_tokens"]), window_tokens=int(d["window_tokens"]))
+        else:
+            out["reset"] = True
+        return out
+
+    for _ in range(12):  # up to ~3 s for the websocket reading
+        with THINK_LOCK:
+            d = CTX.get(slot)
+        if d and d.get("at", 0) >= since:
+            return clean(d)
+        time.sleep(0.25)
+    if streamed and isinstance(streamed.get("pct"), (int, float)):
+        return clean(streamed)
+    try:
+        s = gw.call("GET", f"/api/chat/slots/{slot}?limit=1", timeout=20)
+        if isinstance(s, dict) and isinstance(s.get("context_pct"), (int, float)):
+            return clean({"pct": s["context_pct"], "used_tokens": s.get("context_used_tokens"),
+                          "window_tokens": s.get("context_window_tokens")})
+    except Exception as exc:
+        log("context reading:", type(exc).__name__)
+    return streamed
 
 
 def thinking_listener(gw: "Gateway", stop: threading.Event):
@@ -376,6 +487,12 @@ def thinking_listener(gw: "Gateway", stop: threading.Event):
                     with THINK_LOCK:
                         if slot in THINK_REPLY:
                             THINK[slot] = THINK.get(slot, "") + str(d.get("content") or "")
+                elif msg.get("type") == "context_usage":
+                    # Crew measures the context after the turn, when the chat stream has already ended.
+                    d = msg.get("data") or {}
+                    if d.get("slot") and isinstance(d.get("pct"), (int, float)):
+                        with THINK_LOCK:
+                            CTX[d["slot"]] = {**d, "at": time.time()}
             ws.close()
         except Exception as exc:
             log("thinking stream:", type(exc).__name__, str(exc)[:100])
@@ -1047,7 +1164,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
         prompt = project_preamble(sb, chat, slot, fresh_slot or needs_replay) + prompt
         if fresh_slot or needs_replay or slot in PENDING_HINTS:
             PENDING_HINTS.discard(slot)
-            prompt = app_hints(settings) + prompt
+            prompt = app_hints(settings) + (dev_preamble() if is_developer_chat(settings, chat) else "") + prompt
     before = scan_outputs()
     base_meta = {"model": chat.get("model"), "effort": chat.get("effort")}
     if cmd or kb:
@@ -1106,6 +1223,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             thinking = THINK.get(slot, thinking)
             THINK_REPLY.pop(slot, None)
         res = turn_result(gw, slot, want_stats=not cmd)
+        usage = context_usage(gw, slot, t0, usage)
         final = res["text"] or text
         if cmd:
             final = _ANSI.sub("", final)
@@ -1187,11 +1305,21 @@ def claim_next(sb: Supabase):
 
 
 def run_message(sb: Supabase, gw: Gateway, msg: dict):
+    dev = False
+    try:
+        chat = sb.rest("GET", "chats", params={"id": f"eq.{msg['chat_id']}", "select": "id,owner"})[0]
+        dev = is_developer_chat(user_settings(sb, chat["owner"]), chat)
+    except Exception:
+        pass
+    if dev:  # developer env variables exist on disk only while the Developer chat is answering
+        dev_begin()
     try:
         handle(sb, gw, msg)
     except Exception as exc:  # handle() records its own errors; this guards the thread
         log("turn crashed:", exc)
     finally:
+        if dev:
+            dev_end()
         with BUSY_LOCK:
             BUSY_CHATS.discard(msg["chat_id"])
 
