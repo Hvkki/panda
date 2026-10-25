@@ -55,3 +55,15 @@ export const usageNow = (refresh = false) => runCommand<UsageInfo>("usage", { re
 /** Side chat (/btw): a quick question that doesn't interrupt the running answer. */
 export const sideAsk = (chatId: string, question: string) =>
   runCommand<{ answer: string; error?: boolean; note?: string }>("side", { chat_id: chatId, question }, 200000);
+
+/** Terminal: run one command in the worker's persistent shell. */
+export type TermResult = { output: string; rc: number | null; cwd: string; home?: string; timeout?: boolean; reset?: boolean };
+export const termRun = (input: string, timeout = 60) =>
+  runCommand<TermResult>("term", { input, timeout }, (timeout + 25) * 1000);
+
+/** Disk browser: list a folder / read a file, under the worker's home only. */
+export type FsEntry = { name: string; dir: boolean; size: number; mtime: number; sensitive?: boolean };
+export type FsList = { path: string; rel: string; home: string; parent: string | null; quick: string[]; entries: FsEntry[] };
+export const fsList = (path?: string) => runCommand<FsList>("fs.list", { path }, 30000);
+export type FsFile = { path: string; rel: string; name: string; size?: number; text?: string; binary?: boolean; too_big?: boolean; denied?: string };
+export const fsRead = (path: string) => runCommand<FsFile>("fs.read", { path }, 30000);

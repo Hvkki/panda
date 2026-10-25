@@ -11,9 +11,13 @@ python3 ~/.kiro/crew/skills/image-search/find_images.py "red panda eating bamboo
 ```
 
 - Prints a Markdown gallery: `![title](image_url)` plus source page and license.
-  Paste the lines you want into your answer — the app shows them as images.
-- `--download` also saves them to `~/outputs/images/<query>/` (use for docs/slides,
-  then reference the local path in the Markdown you convert).
+  **To show the user photos, paste the `![title](image_url)` lines into your answer** — they render
+  as inline images straight from the web. You do NOT need to download them and you do NOT create a
+  file for each one.
+- `--download` saves them to `~/work/images/<query>/` — a working folder that is NOT turned into a
+  download card. Use it only when you will build them into a document (reference the saved paths in
+  the Markdown you pass to `panda-docs`), so the user gets the document, not dozens of photo cards.
+  `--out ~/outputs/...` only if the user explicitly asked for the image files themselves.
 - Sources: Openverse (Creative Commons, 700M+ images) and Wikimedia Commons.
   Always keep the credit line when the user will publish the image.
 - For logos, products or people the free sources lack, use web search and only

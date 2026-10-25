@@ -3,6 +3,28 @@
 Each line says how it was checked. "Not verified" means nobody has seen it work on a device yet.
 Several earlier claims were wrong. This page lists only what was checked.
 
+## 25 October (2): mobile fixes, a terminal + disk browser, credits, fewer stray files
+
+Second pass on owner-reported issues. Checked locally (worker against a live Kiro Crew gateway, the
+app with Supabase mocked), **not yet on a phone**:
+
+- **Mobile.** The settings sheet no longer overflows its width on a phone (the modal is capped to
+  `100vw`; `backdrop-filter` on the backdrop had let `width: min(900px, 100%)` resolve wider than the
+  screen under mobile emulation). Each settings row stacks with full-width controls. The `/` command
+  menu was reworked for small screens (name + args on one line, description below).
+- **Terminal + disk browser.** Customize → Terminal: a read-only file view of the worker's home and a
+  real shell you can type into, both through the relay (owner-only; output scrubbed of known secrets).
+  New worker ops `term`, `fs.list`, `fs.read`; a hung command resets the shell; secret-looking files
+  can be listed but not opened.
+- **Credits showing 0.** The worker now forces a usage refresh at startup (a background scrape can
+  take ~a minute), so the account total is ready when the app opens instead of after Kiro Crew's
+  10-minute cache fills. When the total still isn't available the app shows "—" and why (and a
+  Refresh), never a misleading 0.
+- **Too many output files.** Working files now go to `~/work` (image downloads included) and only
+  `~/outputs` becomes cards; the worker publishes only the files a reply actually names, and an image
+  embedded with `![](…)` renders inline instead of also becoming a download card. So a deck built from
+  photos produces one card (the deck), and "show me photos" shows images, not a pile of files.
+
 ## 25 October: credits, commands, Kiro Crew settings, browser, motion
 
 Deployed on 25 October: the app to Vercel production and the worker (commit `fa38554`) to Storage.

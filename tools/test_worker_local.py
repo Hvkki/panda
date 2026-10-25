@@ -190,6 +190,60 @@ def main():
     check("side chat returns an answer or a clear note", bool(s.get("answer") or s.get("note")), str(s))
     print(f"  side: {json.dumps(s)[:160]} ({time.time() - t0:.0f}s)")
 
+    print("terminal")
+    r = W.terminal_run({"input": "echo hello-$((1+1))"})
+    check("terminal runs a command", r.get("output", "").strip() == "hello-2" and r.get("rc") == 0, str(r)[:200])
+    W.terminal_run({"input": "cd /tmp"})
+    r = W.terminal_run({"input": "pwd"})
+    check("terminal keeps the working directory", r.get("output", "").strip() == "/tmp" and r.get("cwd") == "/tmp", str(r)[:200])
+    r = W.terminal_run({"input": "echo $((6*7)); false"})
+    check("terminal reports the exit code", r.get("output", "").strip() == "42" and r.get("rc") == 1, str(r)[:200])
+    r = W.terminal_run({"input": "sleep 5", "timeout": 2})
+    check("terminal stops a hung command", r.get("timeout") is True, str(r)[:200])
+    r = W.terminal_run({"input": "pwd"})
+    check("terminal recovers after a reset", r.get("rc") == 0, str(r)[:200])
+
+    print("disk browser")
+    lst = W.fs_list("~")
+    check("fs.list lists the home folder", lst.get("rel") == "~" and isinstance(lst.get("entries"), list), str(lst)[:160])
+    check("fs.list offers quick folders", isinstance(lst.get("quick"), list))
+    try:
+        W.fs_list("/etc")
+        check("fs.list refuses paths outside home", False, "allowed /etc")
+    except ValueError:
+        check("fs.list refuses paths outside home", True)
+    os.makedirs(os.path.expanduser("~/work"), exist_ok=True)
+    open(os.path.expanduser("~/work/note.txt"), "w").write("plain text here")
+    rd = W.fs_read("~/work/note.txt")
+    check("fs.read returns text", rd.get("text") == "plain text here", str(rd)[:160])
+    open(os.path.expanduser("~/work/keys.env"), "w").write("SECRET=abc")
+    rd = W.fs_read("~/work/keys.env")
+    check("fs.read refuses a secrets file", bool(rd.get("denied")), str(rd)[:160])
+
+    print("output files")
+    import tempfile
+    W.OUTPUTS = tempfile.mkdtemp(prefix="out-")
+    W.WORKDIR = tempfile.mkdtemp(prefix="work-")
+    os.makedirs(W.WORKDIR + "/images", exist_ok=True)
+    chat2 = {"id": chat_id, "owner": "owner-1", "project_id": None}
+    open(W.OUTPUTS + "/Red-Pandas.pptx", "w").write("deck")
+    for i in range(3):
+        open(f"{W.WORKDIR}/images/{i}.jpg", "w").write("jpg")
+    pub = W.publish_outputs(sb, chat2, 1, {}, "Done — **Red-Pandas.pptx** is ready.")
+    names = sorted(os.path.basename(p) for p, _, _ in pub)
+    check("deck publishes only the deck, not its photos", names == ["Red-Pandas.pptx"], str(names))
+    check("deck is a card (not inline)", pub and not pub[0][2])
+    open(W.OUTPUTS + "/trend.png", "w").write("png")
+    pub = W.publish_outputs(sb, chat2, 2, {os.path.join(W.OUTPUTS, "Red-Pandas.pptx"): (0, 4)},
+                            "Here is the chart:\n\n![trend](~/outputs/trend.png)")
+    check("an inline chart is published inline, no card",
+          [os.path.basename(p) for p, _, _ in pub] == ["trend.png"] and pub[0][2] is True, str(pub)[:200])
+    open(W.WORKDIR + "/images/hero.jpg", "w").write("jpg")
+    pub = W.publish_outputs(sb, chat2, 3, {}, f"![hero]({W.WORKDIR}/images/hero.jpg)\n\nFound it.")
+    names = sorted(os.path.basename(p) for p, _, _ in pub)
+    check("an inline photo kept in ~/work is published inline, and nothing else",
+          names == ["hero.jpg"] and pub[0][2] is True, str(pub)[:200])
+
     bad = [k for k, v in RESULTS.items() if v != "ok"]
     print(f"\n{len(RESULTS) - len(bad)}/{len(RESULTS)} passed" + (f"; failed: {bad}" if bad else ""))
     return 1 if bad else 0

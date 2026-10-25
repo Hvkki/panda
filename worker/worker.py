@@ -18,12 +18,14 @@ import glob
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 import threading
 import time
+import uuid
 import contextlib
 import traceback
 import mimetypes
@@ -42,7 +44,8 @@ OWNER = CFG["owner_id"]  # replaced by whoever pressed Start (claim_session)
 SECRETS = [CFG["kiro_api_key"], CFG["worker_password"], CFG.get("vapid_private", ""),
            (CFG.get("drive") or {}).get("refresh_token", ""), (CFG.get("drive") or {}).get("client_secret", "")]
 FILES_BUCKET = "panda-files"
-OUTPUTS = os.path.expanduser("~/outputs")
+OUTPUTS = os.path.expanduser("~/outputs")          # deliverables -> app file cards
+WORKDIR = os.path.expanduser("~/work")             # working files (images for a deck, scratch) -> not published
 MAX_PARALLEL_CHATS = 3
 
 WORK = "/kaggle/working" if os.path.isdir("/kaggle/working") else os.path.abspath("work")
@@ -820,49 +823,98 @@ def safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip()[:120] or "file"
 
 
-def publish_outputs(sb: Supabase, chat: dict, message_id: int, before: dict) -> list:
-    """Upload files the turn created or changed in ~/outputs; return [(local_path, file_row)]."""
-    published = []
-    for path, (mtime, size) in sorted(scan_outputs().items()):
-        if before.get(path) == (mtime, size) or size == 0:
-            continue
-        rel = os.path.relpath(path, OUTPUTS)
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp")
+_MD_TARGET = re.compile(r"\]\(\s*<?([^)>\s]+)")     # the target of ](…) or ![…](…)
+_MD_IMG = re.compile(r"!\[[^\]]*\]\(\s*<?([^)>\s]+)")  # only ![…](…) image embeds
+_MD_CODE = re.compile(r"`([^`\n]+)`")
+
+
+def _reply_refs(text: str) -> tuple[set, set]:
+    """(all referenced targets, image-embedded targets) from the reply's Markdown."""
+    text = text or ""
+    targets = {t.strip() for t in _MD_TARGET.findall(text)} | {t.strip() for t in _MD_CODE.findall(text)}
+    return targets, {t.strip() for t in _MD_IMG.findall(text)}
+
+
+def _resolve_local(target: str) -> str | None:
+    """A referenced path that points to a real file under ~/outputs or ~/work (nothing else)."""
+    t = (target or "").strip().strip("<>")
+    if not t or t.startswith("panda-file:") or re.match(r"^[a-z][a-z0-9+.-]*://", t, re.I):
+        return None
+    p = os.path.abspath(os.path.expanduser(t))
+    roots = (OUTPUTS, WORKDIR)
+    if not any(p == r or p.startswith(r + os.sep) for r in roots):
+        return None
+    return p if os.path.isfile(p) else None
+
+
+def _referenced(path: str, targets: set) -> bool:
+    base = os.path.basename(path)
+    forms = {path, path.replace(HOME, "~", 1), os.path.relpath(path, OUTPUTS) if path.startswith(OUTPUTS) else path}
+    for t in targets:
+        t = t.strip().strip("<>")
+        if t in forms or os.path.basename(t.rstrip("/")) == base:
+            return True
+    return False
+
+
+def _publish_one(sb: Supabase, chat: dict, message_id: int, path: str, size: int) -> dict | None:
+    name = os.path.basename(path)
+    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    body = {"owner": chat["owner"], "chat_id": chat["id"], "message_id": message_id,
+            "project_id": chat.get("project_id"), "kind": "output", "name": name, "mime": mime, "size": size}
+    try:
         if size > DRIVE_MIN:
             d = drive_put(path)
-            if d:
-                try:
-                    row = sb.rest("POST", "files", prefer="return=representation", body={
-                        "owner": chat["owner"], "chat_id": chat["id"], "message_id": message_id,
-                        "project_id": chat.get("project_id"), "kind": "output", "name": os.path.basename(rel),
-                        "path": f"drive:{d['id']}", "mime": mimetypes.guess_type(path)[0] or "application/octet-stream",
-                        "size": size})[0]
-                    published.append((path, row))
-                except Exception as exc:
-                    log("drive file row failed:", exc)
-            else:
-                log(f"skipped {rel}: over 45 MB and Drive is not connected")
-            continue
-        obj = f"{chat['owner']}/chats/{chat['id']}/{int(time.time())}-{safe_name(os.path.basename(rel))}"
-        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
-        try:
+            if not d:
+                log(f"skipped {name}: over 45 MB and Drive is not connected")
+                return None
+            body["path"] = f"drive:{d['id']}"
+        else:
+            obj = f"{chat['owner']}/chats/{chat['id']}/{int(time.time()*1000)}-{safe_name(name)}"
             sb.upload(obj, path, bucket=FILES_BUCKET, mime=mime)
-            row = sb.rest("POST", "files", prefer="return=representation", body={
-                "owner": chat["owner"], "chat_id": chat["id"], "message_id": message_id,
-                "project_id": chat.get("project_id"), "kind": "output", "name": os.path.basename(rel),
-                "path": obj, "mime": mime, "size": size})[0]
-            published.append((path, row))
-        except Exception as exc:
-            log("file publish failed:", exc)
+            body["path"] = obj
+        return sb.rest("POST", "files", prefer="return=representation", body=body)[0]
+    except Exception as exc:
+        log("file publish failed:", exc)
+        return None
+
+
+def publish_outputs(sb: Supabase, chat: dict, message_id: int, before: dict, reply: str = "") -> list:
+    """Upload the turn's deliverables; return [(local_path, file_row, inline)].
+
+    What counts as a deliverable:
+      - files the reply names (a link, an image embed, or a backtick path), so a deck built from
+        photos publishes only the deck, not every photo it used;
+      - if the reply names none, every new file in ~/outputs (a one-file answer that wasn't named).
+    Working files in ~/work are published only when the reply points at them (e.g. an inline image).
+    `inline` is set for images embedded with ![](…): the app shows them in the text, not as a card.
+    """
+    targets, img_targets = _reply_refs(reply)
+    new = {p: sz for p, (mt, sz) in scan_outputs().items() if before.get(p) != (mt, sz) and sz > 0}
+    for t in targets | img_targets:  # inline images etc. the agent kept in ~/work
+        p = _resolve_local(t)
+        if p and p not in new:
+            new[p] = os.path.getsize(p)
+    referenced = {p for p in new if _referenced(p, targets | img_targets)}
+    chosen = referenced or {p for p in new if p.startswith(OUTPUTS + os.sep)}
+    published = []
+    for path in sorted(chosen):
+        row = _publish_one(sb, chat, message_id, path, new[path])
+        if not row:
+            continue
+        inline = path.lower().endswith(IMAGE_EXT) and _referenced(path, img_targets)
+        published.append((path, row, inline))
         if len(published) >= 20:
             break
     if published:
-        log(f"published {len(published)} file(s)")
+        log(f"published {len(published)} file(s)" + (f", {sum(i for _, _, i in published)} inline" if any(i for _, _, i in published) else ""))
     return published
 
 
 def link_files(text: str, published: list) -> str:
     """Point the reply's local paths at the uploaded copies (the app resolves panda-file:)."""
-    for local, row in published:
+    for local, row, _inline in published:
         for form in (local, local.replace(HOME, "~", 1)):
             text = text.replace(f"]({form})", f"](panda-file:{row['id']})")
             text = text.replace(f"`{form}`", f"`{os.path.basename(local)}`")
@@ -1059,9 +1111,10 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             final = _ANSI.sub("", final)
         if not final.strip() and res["errors"]:
             raise RuntimeError(res["errors"][-1][:400])
-        published = publish_outputs(sb, chat, reply["id"], before)
+        published = publish_outputs(sb, chat, reply["id"], before, final)
         final = scrub(link_files(final, published))
-        done_meta = {**meta(), "files": [r["id"] for _, r in published]}
+        # Inline images show in the text; only the rest become download cards.
+        done_meta = {**meta(), "files": [row["id"] for _, row, inline in published if not inline]}
         stats = res["stats"] or {}
         if isinstance(stats.get("credits"), (int, float)):
             done_meta["credits"] = round(float(stats["credits"]), 4)
@@ -1470,6 +1523,161 @@ def side_ask(sb: Supabase, gw: Gateway, chat_id: str, question: str, timeout: fl
     return {"answer": "", "error": True, "note": "No answer yet. Try again in a moment."}
 
 
+def _safe(fn, *a):
+    try:
+        return fn(*a)
+    except Exception as exc:
+        log(f"{getattr(fn, '__name__', 'task')} failed:", _reason(exc))
+        return None
+
+
+# ── terminal: a persistent shell on the worker the owner can type into ───────
+# Owner-only (run_command checks the row's owner). It is the owner's own Kaggle machine, the same
+# shell the agent already uses; every line is scrubbed of known secrets. One shell, kept across
+# commands so cwd and variables persist. A command that runs past its timeout resets the shell.
+class Terminal:
+    MARK = "\x1e__panda_end_"
+
+    def __init__(self):
+        self.proc = None
+        self.lock = threading.Lock()
+        self.buf = bytearray()
+        self.buf_lock = threading.Lock()
+        self.cwd = os.path.expanduser("~")
+
+    def _spawn(self):
+        env = dict(ENV, PS1="", PS2="", TERM="dumb", PAGER="cat", GIT_PAGER="cat", DEBIAN_FRONTEND="noninteractive",
+                   HOME=HOME)
+        self.proc = subprocess.Popen(["bash", "--noprofile", "--norc"], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     cwd=os.path.expanduser("~"), env=env, bufsize=0)
+        self.cwd = os.path.expanduser("~")
+        with self.buf_lock:
+            self.buf = bytearray()
+        threading.Thread(target=self._drain, args=(self.proc,), daemon=True).start()
+
+    def _drain(self, proc):
+        try:
+            while True:
+                chunk = proc.stdout.read(4096)
+                if not chunk:
+                    break
+                with self.buf_lock:
+                    self.buf.extend(chunk)
+        except Exception:
+            pass
+
+    def run(self, command: str, timeout: int = 60) -> dict:
+        command = str(command)
+        if len(command) > 20000:
+            raise ValueError("command too long")
+        with self.lock:
+            if not (self.proc and self.proc.poll() is None):
+                self._spawn()
+            mark = f"{self.MARK}{uuid.uuid4().hex}"
+            mb = mark.encode()
+            script = f"{command}\nprintf '%s%s:%s\\n' {shlex.quote(mark)} \"$?\" \"$PWD\"\n"
+            try:
+                self.proc.stdin.write(script.encode())
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self._spawn()
+                return {"output": "(the terminal was reset)", "rc": None, "cwd": self.cwd, "reset": True}
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                with self.buf_lock:
+                    data = bytes(self.buf)
+                idx = data.find(mb)
+                if idx != -1:
+                    nl = data.find(b"\n", idx)
+                    if nl != -1:
+                        tail = data[idx + len(mb):nl].decode(errors="replace")
+                        rc, _, cwd = tail.partition(":")
+                        self.cwd = cwd or self.cwd
+                        with self.buf_lock:
+                            del self.buf[:]
+                        return {"output": scrub(data[:idx].decode(errors="replace"))[-40000:],
+                                "rc": int(rc) if rc.lstrip("-").isdigit() else None, "cwd": self.cwd}
+                if self.proc.poll() is not None:
+                    return {"output": scrub(data.decode(errors="replace"))[-40000:], "rc": None, "cwd": self.cwd, "reset": True}
+                time.sleep(0.1)
+            with self.buf_lock:
+                data = bytes(self.buf)
+            with contextlib.suppress(Exception):
+                self.proc.kill()
+            self._spawn()
+            return {"output": scrub(data.decode(errors="replace"))[-40000:] + f"\n⏱ stopped after {timeout}s — the terminal was reset.",
+                    "rc": None, "cwd": self.cwd, "timeout": True}
+
+
+TERMINAL = Terminal()
+
+
+def terminal_run(args: dict) -> dict:
+    out = TERMINAL.run(args.get("input", ""), timeout=max(2, min(120, int(args.get("timeout") or 60))))
+    out["home"] = HOME
+    return out
+
+
+# ── disk browser: read-only look at the worker's files (like Kiro Crew's) ────
+# Everything stays under the home folder; files that may hold secrets can be listed but not opened,
+# and all output is scrubbed.
+_FS_DENY = re.compile(r"(\.env|secrets\.env|\.enc|\.key|\.pem|id_rsa|drive\.json|browser\.json|\.sqlite\d?|\.db)$", re.I)
+_FS_HIDE_DIRS = {".git", "node_modules", "__pycache__", ".cache"}
+
+
+def _fs_safe(path) -> str:
+    p = os.path.abspath(os.path.expanduser(str(path or HOME)))
+    if p != HOME and not p.startswith(HOME + os.sep):
+        raise ValueError("outside the home folder")
+    return p
+
+
+def _fs_rel(p: str) -> str:
+    rel = os.path.relpath(p, HOME)
+    return "~" if rel == "." else "~/" + rel
+
+
+def fs_list(path) -> dict:
+    p = _fs_safe(path)
+    if not os.path.isdir(p):
+        raise ValueError("not a folder")
+    entries = []
+    for name in os.listdir(p):
+        full = os.path.join(p, name)
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        is_dir = os.path.isdir(full)
+        entries.append({"name": name, "dir": is_dir, "size": 0 if is_dir else st.st_size, "mtime": st.st_mtime,
+                        "sensitive": bool(_FS_DENY.search(name))})
+    entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
+    quick = [d for d in ("outputs", "work", "projects", "uploads", ".kiro/crew") if os.path.isdir(os.path.join(HOME, d))]
+    return {"path": p, "rel": _fs_rel(p), "home": HOME,
+            "parent": os.path.dirname(p) if (p != HOME and p.startswith(HOME + os.sep)) else None,
+            "quick": quick, "entries": entries[:2000]}
+
+
+def fs_read(path) -> dict:
+    p = _fs_safe(path)
+    if not os.path.isfile(p):
+        raise ValueError("not a file")
+    base = {"path": p, "rel": _fs_rel(p), "name": os.path.basename(p)}
+    if _FS_DENY.search(os.path.basename(p)):
+        return {**base, "denied": "This file may hold secrets, so it can't be opened here."}
+    size = os.path.getsize(p)
+    base["size"] = size
+    if size > 512 * 1024:
+        return {**base, "too_big": True}
+    with open(p, "rb") as f:
+        raw = f.read()
+    try:
+        return {**base, "text": scrub(raw.decode("utf-8"))}
+    except UnicodeDecodeError:
+        return {**base, "binary": True}
+
+
 # ── commands relay: the app talks to Crew through here ───────────────────────
 # A security boundary. The app may only reach these gateway routes. Reads are broad; writes are
 # limited to what the app's pages use, and setting changes go through the rules above.
@@ -1527,6 +1735,12 @@ def run_command(sb: Supabase, gw: Gateway, cmd: dict):
             result = usage_now(sb, gw, bool(args.get("refresh")))
         elif op == "side":
             result = side_ask(sb, gw, str(args.get("chat_id", "")), str(args.get("question", "")))
+        elif op == "term":
+            result = terminal_run(args)
+        elif op == "fs.list":
+            result = fs_list(args.get("path"))
+        elif op == "fs.read":
+            result = fs_read(args.get("path"))
         elif op == "secrets.sync":
             result = {"names": sync_secrets(sb)}
         elif op == "browser.forget":
@@ -1637,6 +1851,7 @@ def main():
         if sb.download("config/prompt.md", f"{HOME}/.kiro/crew/prompt.md"):
             log("system prompt: custom (from storage)")
         os.makedirs(OUTPUTS, exist_ok=True)
+        os.makedirs(WORKDIR, exist_ok=True)
         install_skills(sb)
         setup_drive()
         try:
@@ -1659,6 +1874,9 @@ def main():
         SESSION_INFO.update(restored=restored, startup_secs=round(time.time() - T0), crew=CREW_VERSION["v"])
         set_sess(status="running", heartbeat_at=now_iso(), info=SESSION_INFO)
         USAGE_STATE["sid"] = sid
+        # Warm the Kiro account total now (a forced scrape can take ~a minute), so the app shows a
+        # real number instead of 0 as soon as it opens, not after Crew's 10-minute cache fills.
+        threading.Thread(target=lambda: _safe(usage_now, sb, gw, True), daemon=True).start()
         log("running; waiting for messages")
 
         seen: set = set()

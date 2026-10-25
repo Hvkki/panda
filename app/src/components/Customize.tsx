@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { sessionAction, supabase } from "../lib/supabase";
 import { gw, runCommand } from "../lib/commands";
+import { TerminalTab } from "./Terminal";
 import { IconAlert, IconClock, IconMoon, IconPlus, IconPower, IconTrash } from "./Icons";
 
-type Tab = "skills" | "connectors" | "scheduled" | "keys";
-const TABS: [Tab, string][] = [["skills", "Skills"], ["connectors", "Connectors"], ["scheduled", "Scheduled"], ["keys", "API keys"]];
+type Tab = "skills" | "connectors" | "scheduled" | "terminal" | "keys";
+const TABS: [Tab, string][] = [["skills", "Skills"], ["connectors", "Connectors"], ["scheduled", "Scheduled"],
+  ["terminal", "Terminal"], ["keys", "API keys"]];
 
 type AnyRec = Record<string, unknown>;
 const str = (v: unknown) => (typeof v === "string" ? v : v == null ? "" : String(v));
@@ -27,7 +29,8 @@ export function CustomizePage({ online, onAsk }: { online: boolean; onAsk: (text
       ))}</div>
       {tab === "keys" ? <KeysTab online={online} /> : !online ? <OfflineNote /> :
         tab === "skills" ? <SkillsTab onAsk={onAsk} /> :
-        tab === "connectors" ? <ConnectorsTab /> : <ScheduledTab onAsk={onAsk} />}
+        tab === "connectors" ? <ConnectorsTab /> :
+        tab === "terminal" ? <TerminalTab /> : <ScheduledTab onAsk={onAsk} />}
     </div>
   );
 }

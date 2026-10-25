@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import type { Worker } from "./SessionChip";
 import type { UsageInfo } from "../lib/supabase";
 import { usageNow } from "../lib/commands";
@@ -62,11 +62,18 @@ export function UsagePanel({ userId, worker, online }: { userId: string; worker:
             ))}
           </>
         ) : (
-          <p className="small usage-unavailable">
-            {a?.reason ? <>Kiro's account total isn't available: <span className="muted">{a.reason}</span></> :
-              online ? "Kiro Crew is reading your account total — it appears here within a few minutes." :
-              "Your Kiro account total appears here once Panda has been online. Below is what Panda's own replies used."}
-          </p>
+          <div className="usage-unavailable">
+            <div className="usage-big muted">—</div>
+            <p className="small">
+              {!online ? "Start Panda to read your Kiro plan total — it's read from Kiro while Panda is online."
+                : busy ? "Reading your Kiro plan total from Kiro…"
+                : a?.reason ? <>Couldn't read your Kiro plan total: <span className="muted">{a.reason}</span></>
+                : usage ? "Your Kiro plan total isn't in yet. Press Refresh — Panda reads it from Kiro, which can take a minute."
+                : "Your Kiro plan total will appear here once Panda has read it from Kiro."}
+            </p>
+            {online && <button className="btn small-btn" onClick={refresh} disabled={busy}>{busy ? "Refreshing…" : "Refresh now"}</button>}
+            <p className="muted tiny">This is the plan usage Kiro counts (the IDE too), not only Panda. The numbers below are what Panda's own replies used.</p>
+          </div>
         )}
         {usage?.at && <div className="muted tiny">Updated {new Date(usage.at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}{a?.stale ? " · may be out of date" : ""}</div>}
         {err && <div className="error-note small">{err}</div>}
@@ -124,23 +131,21 @@ export function UsagePanel({ userId, worker, online }: { userId: string; worker:
 /** The small credits meter at the bottom of the sidebar. */
 export function UsageMeter({ userId, worker, onOpen }: { userId: string; worker: Worker; onOpen: () => void }) {
   const t = useT();
-  const [tick, setTick] = useState(0);
-  useEffect(() => {
-    const id = window.setInterval(() => setTick((n) => n + 1), 120000);
-    return () => window.clearInterval(id);
-  }, []);
+  const online = worker.alive && worker.session?.status === "running";
   const usage = useAccountUsage(userId, worker.session);
-  const ledger = useLedger(userId, tick + (worker.session?.info?.usage?.at ? 1 : 0));
   const a = usage?.account;
   const plan = hasPlan(a) ? a : null;
+  // Only the Kiro plan gauge goes in the sidebar. When it isn't available, show a quiet state
+  // (not a "0" that looks like the plan is empty) — the full picture is one tap away.
+  const right = plan ? <b>{fmtCredits(plan.credits_used)}<span className="muted"> / {fmtCredits(plan.credits_plan)}</span></b>
+    : <b className="muted usage-meter-hint">{!online ? "offline" : usage ? "see usage" : "…"}</b>;
   return (
     <button className="usage-meter" onClick={onOpen} title="Credit usage">
       <span className="usage-meter-top">
         <IconCoins size={14} />
         <span>{t("credits")}</span>
         <span className="grow" />
-        {plan ? <b>{fmtCredits(plan.credits_used)}<span className="muted"> / {fmtCredits(plan.credits_plan)}</span></b>
-          : <b>{fmtCredits(ledger?.month ?? 0)}<span className="muted"> {t("thisMonth")}</span></b>}
+        {right}
       </span>
       {plan && <span className={`meter thin ${pctOf(plan.credits_used, plan.credits_plan) > 85 ? "hot" : ""}`}><span style={{ width: `${pctOf(plan.credits_used, plan.credits_plan)}%` }} /></span>}
     </button>

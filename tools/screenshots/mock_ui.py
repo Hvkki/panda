@@ -168,11 +168,26 @@ async def handle_route(route):
             row = {"id": cid, **body, "status": "pending"}
             return await ok(row if single else [row])
         cid = int(pg_filter(qs, "id") or 0)
-        op = ST.commands.get(cid, {}).get("op", "")
+        cmd = ST.commands.get(cid, {})
+        op, cargs = cmd.get("op", ""), cmd.get("args", {}) or {}
         result = COMMAND_RESULTS.get(op, {"ok": True})
         if op == "crew.set":
-            a = ST.commands[cid].get("args", {})
-            result = {"ok": True, "path": a.get("path"), "value": a.get("value")}
+            result = {"ok": True, "path": cargs.get("path"), "value": cargs.get("value")}
+        elif op == "term":
+            inp = str(cargs.get("input", ""))
+            out = {"ls": "README.md  work/  outputs/  projects/", "pwd": "/root", "df -h": "Filesystem  Size  Used  Avail\n/dev/sda1   20G   7.2G   13G"}.get(inp, f"$ {inp}\n(ran on the worker)")
+            result = {"output": out, "rc": 0, "cwd": "/root/outputs", "home": "/root"}
+        elif op == "fs.list":
+            p = cargs.get("path") or "/root"
+            result = {"path": p, "rel": "~" if p in ("/root", None) else "~/" + p.split("/root/")[-1], "home": "/root",
+                      "parent": None if p in ("/root", None) else "/root", "quick": ["outputs", "work", "projects"],
+                      "entries": [{"name": "outputs", "dir": True, "size": 0, "mtime": NOW}, {"name": "work", "dir": True, "size": 0, "mtime": NOW},
+                                  {"name": "README.md", "dir": False, "size": 2048, "mtime": NOW},
+                                  {"name": "Red-Pandas.pptx", "dir": False, "size": 184320, "mtime": NOW},
+                                  {"name": "secrets.env", "dir": False, "size": 96, "mtime": NOW, "sensitive": True}]}
+        elif op == "fs.read":
+            result = {"path": cargs.get("path"), "rel": "~/README.md", "name": "README.md", "size": 2048,
+                      "text": "# Panda\n\nYour calm, creative assistant.\n"}
         row = {"status": "done", "result": result}
         return await ok(row if single else [row])
     return await ok([] if not single else {})
@@ -401,6 +416,72 @@ async def main():
         await asyncio.sleep(0.6)
         REPORT["usage_big"] = await page.locator(".usage-big").inner_text()
         await page.screenshot(path=f"{OUT}/10-settings-credits.png")
+        await page.close()
+
+        # 4a. Terminal tab (file browser + console) on desktop.
+        page = await new_page(1280, 860)
+        await page.goto(f"{APP}/?v=customize")
+        await page.wait_for_selector(".tabs", timeout=20000)
+        await page.get_by_role("button", name="Terminal", exact=True).click()
+        await page.wait_for_selector(".cons", timeout=10000)
+        await page.wait_for_selector(".fb-row", timeout=10000)
+        REPORT["fb_rows"] = await page.locator(".fb-row").count()
+        REPORT["fb_has_sensitive_lock"] = await page.locator(".fb-row .fb-name").filter(has_text="secrets.env").count()
+        await page.locator(".cons-input input").fill("df -h")
+        await page.locator(".cons-input input").press("Enter")
+        await page.wait_for_selector(".cons-out", timeout=10000)
+        await asyncio.sleep(0.4)
+        REPORT["console_ran"] = await page.locator(".cons-out").count()
+        await page.screenshot(path=f"{OUT}/15-terminal-desktop.png")
+        await page.locator(".fb-row").filter(has_text="README.md").click()
+        await page.wait_for_selector(".file-text", timeout=10000)
+        await asyncio.sleep(0.3)
+        await page.screenshot(path=f"{OUT}/16-file-preview.png")
+        await page.close()
+        # 4a-mobile. Terminal tab on a phone (segmented Files | Terminal).
+        page = await new_page(390, 844)
+        await page.goto(f"{APP}/?v=customize")
+        await page.wait_for_selector(".tabs", timeout=20000)
+        await page.get_by_role("button", name="Terminal", exact=True).click()
+        await page.wait_for_selector(".seg", timeout=10000)
+        await asyncio.sleep(0.4)
+        REPORT["mobile_seg"] = await page.locator(".seg button").count()
+        await page.screenshot(path=f"{OUT}/17-terminal-phone.png")
+        await page.get_by_role("button", name="Files").click()
+        await asyncio.sleep(0.4)
+        await page.screenshot(path=f"{OUT}/18-files-phone.png")
+        await page.close()
+        # 4a-settings-mobile. Settings on a phone: General, Kiro Crew, Credits.
+        page = await new_page(390, 844)
+        await page.goto(f"{APP}/?c={CHAT_A}")
+        await page.wait_for_selector(".msg.assistant", timeout=20000)
+        # open the sidebar (hidden on mobile), then settings from its footer
+        await page.locator(".topbar .icon-btn").first.click()
+        await page.wait_for_selector(".sidebar .side-foot", timeout=10000)
+        await page.locator(".sidebar .side-foot .icon-btn").click()
+        await page.wait_for_selector(".settings", timeout=10000)
+        await asyncio.sleep(0.4)
+        await page.screenshot(path=f"{OUT}/19-settings-general-phone.png")
+        await page.get_by_role("tab", name="Kiro Crew").dispatch_event("click")
+        await page.wait_for_selector(".crew-row", timeout=10000)
+        await asyncio.sleep(0.4)
+        REPORT["crew_overflow"] = await page.evaluate("() => { const b=document.querySelector('.modal-body'); return b ? b.scrollWidth - b.clientWidth : -1; }")
+        REPORT["diag"] = await page.evaluate("""() => {
+          const iw = window.innerWidth;
+          const r = (e) => e.getBoundingClientRect();
+          const m = document.querySelector('.modal'), b = document.querySelector('.modal-body');
+          const over = [...document.querySelectorAll('.modal *')].filter(e => r(e).right > iw + 1)
+            .map(e => ({ c: (e.className||'').toString().slice(0,40), r: Math.round(r(e).right), w: Math.round(r(e).width) }));
+          return { iw, docW: document.documentElement.scrollWidth, modalW: Math.round(r(m).width),
+                   modalRight: Math.round(r(m).right), bodyW: Math.round(r(b).width), over: over.slice(0, 8) };
+        }""")
+        await page.screenshot(path=f"{OUT}/20-settings-crew-phone.png")
+        await page.get_by_role("tab", name="Credits").dispatch_event("click")
+        await page.wait_for_selector(".usage-hero", timeout=10000)
+        await asyncio.sleep(0.4)
+        REPORT["mobile_credits_plan"] = await page.locator(".usage-big").first.inner_text()
+        REPORT["settings_overflow"] = await page.evaluate("() => { const b=document.querySelector('.modal-body'); return b ? b.scrollWidth - b.clientWidth : -1; }")
+        await page.screenshot(path=f"{OUT}/21-settings-credits-phone.png")
         await page.close()
 
         # 4b. Other pages keep working with the new styles.

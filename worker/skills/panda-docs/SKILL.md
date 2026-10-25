@@ -25,6 +25,9 @@ and images `![caption](path-or-url)`.
   a paragraph becomes the subtitle/body; one image per slide is placed on the right.
 - Add speaker notes with a line starting `Notes:`.
 
+For a deck or document built from photos, download the photos to `~/work/` (not `~/outputs/`) and
+reference those paths in your Markdown — the user then gets the one finished file, not every photo.
+
 ## Quality bar
 - Give the file a human name (`Minnie-dog-sitter-guide.pptx`, not `output.pptx`).
 - Lead with a clear title, keep paragraphs short, use tables for comparisons.
