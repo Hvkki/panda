@@ -255,6 +255,11 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
         {cmd && m.meta.command ? (
           <div className="bubble command"><IconSlash size={15} /><span>{m.content}</span></div>
         ) : <div className="bubble">{m.content}</div>}
+        {m.meta.steer && (
+          <div className="steer-tag muted">{m.status === "done"
+            ? (m.meta.steered === "queued" ? "Panda answers this next" : "Steered into the answer")
+            : <><IconSpinner size={11} /> Steering…</>}</div>
+        )}
       </div>
     );
   }

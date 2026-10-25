@@ -50,6 +50,9 @@ export type Message = {
     timed_out?: boolean;
     files?: string[];
     attachments?: import("./files").Attachment[];
+    /** Sent while Panda was answering; the worker steers it into the running turn. */
+    steer?: boolean;
+    steered?: "steered" | "queued";
     /** Kiro credits this reply used (Kiro Crew's meteringUsage for the turn). */
     credits?: number;
     turn_stats?: TurnStats;

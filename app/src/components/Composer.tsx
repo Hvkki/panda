@@ -9,7 +9,8 @@ import { ALL_MODELS, EFFORTS } from "../lib/models";
 import { buildCatalog, matchCommands, parseCommand, useCrewCommands, type SlashCmd } from "../lib/slash";
 import { fmtTokens } from "../lib/usage";
 
-export type SendMeta = { command?: string };
+/** `steer`: sent while Panda is answering, so it goes into the running reply instead of waiting. */
+export type SendMeta = { command?: string; steer?: boolean };
 
 type Props = {
   model: string;
@@ -156,8 +157,15 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
       }
     }
     const v = raw || (ready.length ? "Please look at the attached file(s)." : "");
-    if (busy && v) { setNotice("Panda is still answering. Wait a moment, or ask on the side with /btw."); return; }
     if (!v || uploading) return;
+    if (busy) {
+      // Steer: the words go into the reply that is running now (files wait for the next turn).
+      if (ready.length) { setNotice("Files can be sent when the answer finishes. Text steers the answer now."); return; }
+      onSend(v, [], { steer: true });
+      setNotice("Sent to Panda while it works.");
+      clear();
+      return;
+    }
     onSend(v, ready.map(({ path, name, mime, size, file_id }) => ({ path, name, mime, size, file_id })));
     clear();
   };

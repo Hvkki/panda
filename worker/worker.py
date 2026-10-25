@@ -1231,6 +1231,9 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
 
     seg_break = False  # a tool ran since the last text: the next text starts a new paragraph
     threading.Thread(target=flusher, daemon=True).start()
+    if not cmd:
+        with BUSY_LOCK:
+            BUSY_SLOTS[chat["id"]] = {"slot": slot, "since": time.time()}
     try:
         for c in gw.stream_chat(slot, prompt):
             if not isinstance(c, dict):
@@ -1272,6 +1275,8 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                 tools.append("stopped by you")
                 break
         stream_done.set()
+        with BUSY_LOCK:
+            BUSY_SLOTS.pop(chat["id"], None)
         with push_lock:  # wait out a push still in flight, so it cannot land after the final write
             pass
         time.sleep(0.3)  # let the last thinking frames land
@@ -1281,9 +1286,11 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
         res = turn_result(gw, slot, want_stats=not cmd)
         usage = context_usage(gw, slot, t0, usage)
         final = res["text"] or text
-        # Crew's history joins the segments of a turn with no separator; keep the streamed copy,
-        # which has the paragraph breaks, whenever it holds the same words.
-        if text and final != text and re.sub(r"\s+", "", final) == re.sub(r"\s+", "", text):
+        # Crew's history joins the segments of a turn with no separator, and after a steer it keeps
+        # only the part after the steered message. Keep the streamed copy (paragraph breaks, the
+        # whole turn) whenever it holds every word of the history text.
+        squash = lambda v: re.sub(r"\s+", "", v or "")
+        if text and final != text and squash(final) and squash(final) in squash(text):
             final = text
         if cmd:
             final = _ANSI.sub("", final)
@@ -1313,6 +1320,8 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                  re.sub(r"[#*_`>\[\]]", "", final)[:180], f"./?c={chat['id']}")
     except Exception as exc:
         stream_done.set()
+        with BUSY_LOCK:
+            BUSY_SLOTS.pop(chat["id"], None)
         with push_lock:
             pass
         with THINK_LOCK:
@@ -1344,6 +1353,43 @@ def approve_background(gw: Gateway, sb: Supabase):
 
 BUSY_CHATS: set = set()
 BUSY_LOCK = threading.Lock()
+BUSY_SLOTS: dict = {}  # chat id -> {"slot", "since"} while that chat's turn is streaming (for steering)
+
+
+def steer_pending(sb: Supabase, gw: Gateway):
+    """Messages sent with "steer" while their chat is answering go INTO the running turn.
+
+    Kiro Crew injects them mid-turn (POST /api/chat with steer=true answers JSON instead of a new
+    stream). When the turn cannot take a steer, Crew queues it and the running stream answers it
+    next, so either way the reply keeps flowing into the assistant row already on screen. A steer
+    for a chat that is no longer busy is left alone: claim_next runs it as an ordinary turn.
+    """
+    with BUSY_LOCK:
+        live = {c: dict(v) for c, v in BUSY_SLOTS.items() if time.time() - v["since"] > 1.5}
+    if not live:
+        return
+    rows = sb.rest("GET", "messages", params={"status": "eq.pending", "role": "eq.user", "owner": f"eq.{OWNER}",
+                                              "meta->>steer": "eq.true", "order": "id.asc", "limit": "10",
+                                              "select": "id,chat_id,content,meta"})
+    for r in rows or []:
+        info = live.get(r["chat_id"])
+        if not info or not (r.get("content") or "").strip():
+            continue
+        got = sb.rest("PATCH", "messages", prefer="return=representation",
+                      params={"id": f"eq.{r['id']}", "status": "eq.pending"}, body={"status": "processing"})
+        if not got:
+            continue
+        meta = dict(r.get("meta") or {})
+        try:
+            res = gw.call("POST", "/api/chat", {"message": r["content"], "slot": info["slot"], "steer": True}, timeout=30)
+            meta["steered"] = "steered" if res.get("steered") else "queued"
+            sb.rest("PATCH", "messages", params={"id": f"eq.{r['id']}"}, body={"status": "done", "meta": meta})
+            log(f"chat {r['chat_id']}: message {r['id']} {meta['steered']} into the running turn")
+        except Exception as exc:
+            # Not delivered: run it as a normal turn once the current one ends.
+            meta.pop("steer", None)
+            sb.rest("PATCH", "messages", params={"id": f"eq.{r['id']}"}, body={"status": "pending", "meta": meta})
+            log("steer failed, will run next:", type(exc).__name__)
 
 
 def claim_next(sb: Supabase):
@@ -1353,13 +1399,16 @@ def claim_next(sb: Supabase):
     even though the worker account can read every row.
     """
     rows = sb.rest("GET", "messages", params={"status": "eq.pending", "role": "eq.user", "owner": f"eq.{OWNER}",
-                                               "order": "id.asc", "limit": "20", "select": "id,chat_id"})
+                                               "order": "id.asc", "limit": "20", "select": "id,chat_id,meta"})
     for r in rows or []:
         with BUSY_LOCK:
             if r["chat_id"] in BUSY_CHATS or len(BUSY_CHATS) >= MAX_PARALLEL_CHATS:
                 continue
+        body = {"status": "processing"}
+        if (r.get("meta") or {}).get("steer"):  # its turn ended before the steer: run it as a normal turn
+            body["meta"] = {k: v for k, v in r["meta"].items() if k != "steer"}
         got = sb.rest("PATCH", "messages", prefer="return=representation",
-                      params={"id": f"eq.{r['id']}", "status": "eq.pending"}, body={"status": "processing"})
+                      params={"id": f"eq.{r['id']}", "status": "eq.pending"}, body=body)
         if got:
             with BUSY_LOCK:
                 BUSY_CHATS.add(r["chat_id"])
@@ -2120,6 +2169,10 @@ def main():
             if time.time() - last_snap > SNAPSHOT_EVERY:
                 set_sess(last_snapshot=snapshot(sb, "periodic"))
                 last_snap = time.time()
+            try:
+                steer_pending(sb, gw)
+            except Exception as exc:
+                log("steer check:", type(exc).__name__)
             msg = claim_next(sb)
             if msg:
                 pool.submit(run_message, sb, gw, msg)

@@ -99,7 +99,7 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
 
   const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
   // A sent message that no reply has picked up yet: show Panda getting ready (or queued).
-  const waiting = [...messages].reverse().find((m) => m.role === "user" && (m.status === "pending" || m.status === "processing")
+  const waiting = [...messages].reverse().find((m) => m.role === "user" && !m.meta?.steer && (m.status === "pending" || m.status === "processing")
     && !messages.some((r) => r.role === "assistant" && r.reply_to === m.id));
   const commandFor = useMemo(() => {
     const map = new Map<number, string>();

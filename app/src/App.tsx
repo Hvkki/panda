@@ -146,6 +146,7 @@ function Shell({ userId, email }: { userId: string; email: string }) {
     const m: Record<string, unknown> = {};
     if (attachments.length) m.attachments = attachments;
     if (meta?.command) m.command = meta.command;
+    if (meta?.steer) m.steer = true;
     const { error } = await supabase.from("messages").insert({ chat_id: chat.id, owner: userId, role: "user", content: text,
       status: "pending", meta: m });
     if (error) { alert(error.message); return; }
