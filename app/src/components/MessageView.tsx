@@ -6,12 +6,38 @@ import { useSettings } from "../lib/settings";
 import { useT } from "../lib/i18n";
 import { modelName } from "../lib/models";
 import { describeStep, summarize } from "../lib/steps";
+import { fmtCredits } from "../lib/usage";
 import { Logo } from "./Logo";
 import { MessageFiles, PandaImage, PandaLink } from "./Files";
 import { fileKind, type Attachment } from "../lib/files";
 import { useBrowser, usedBrowser } from "../lib/browser";
-import { BrowserInline } from "./BrowserInline";
-import { IconAlert, IconBrain, IconCheck, IconChevron, IconCopy, IconRetry, IconShield, IconSpinner } from "./Icons";
+import { BrowserCard } from "./BrowserCard";
+import { IconAlert, IconBrain, IconCheck, IconChevron, IconCoins, IconCopy, IconRetry, IconShield, IconSlash, IconSpinner } from "./Icons";
+
+/** "/compact focus on the plan" → "/compact" when the message is a command. */
+export const commandOf = (m: Pick<Message, "content" | "meta">) =>
+  m.meta?.command || ((m.content || "").match(/^\s*(\/[a-z][\w-]*)/i)?.[1]?.toLowerCase() ?? "");
+
+const COMMAND_NOTE: Record<string, string> = {
+  "/clear": "Panda's memory of this chat was cleared. Messages above stay visible.",
+  "/compact": "Earlier messages were summarised to free up context.",
+};
+
+/** A short hop of the panda when a reply has just finished (not for replies already on screen). */
+function useJustFinished(live: boolean, ok: boolean) {
+  const [hop, setHop] = useState(false);
+  const was = useRef(live);
+  useEffect(() => {
+    if (was.current && !live && ok) {
+      setHop(true);
+      const id = window.setTimeout(() => setHop(false), 1600);
+      was.current = live;
+      return () => window.clearTimeout(id);
+    }
+    was.current = live;
+  }, [live, ok]);
+  return hop;
+}
 
 const OPTIONS_RE = /\[OPTIONS:\s*([^\]]+)\]\s*$/;
 
@@ -178,17 +204,20 @@ export function PendingReply({ queued }: { queued: boolean }) {
   );
 }
 
-type Props = { m: Message; onRetry?: (m: Message) => void; onOption?: (text: string) => void; isLast: boolean };
+type Props = { m: Message; onRetry?: (m: Message) => void; onOption?: (text: string) => void; isLast: boolean; command?: string };
 
-export const MessageView = memo(function MessageView({ m, onRetry, onOption, isLast }: Props) {
+export const MessageView = memo(function MessageView({ m, onRetry, onOption, isLast, command }: Props) {
   const { settings } = useSettings();
   const t = useT();
   const [copied, setCopied] = useState(false);
+  const live = m.status === "streaming" || m.status === "waiting";
+  const hop = useJustFinished(live, m.status === "done");
 
   const { online } = useBrowser();
   if (m.role === "tool") return m.meta.kind === "approval" ? <ApprovalCard m={m} /> : null;
 
   if (m.role === "user") {
+    const cmd = commandOf(m);
     return (
       <div className="msg user">
         {(m.meta.attachments || []).length > 0 && (
@@ -199,33 +228,43 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
             })}
           </div>
         )}
-        <div className="bubble">{m.content}</div>
+        {cmd && m.meta.command ? (
+          <div className="bubble command"><IconSlash size={15} /><span>{m.content}</span></div>
+        ) : <div className="bubble">{m.content}</div>}
       </div>
     );
   }
 
-  const live = m.status === "streaming" || m.status === "waiting";
+  const cmd = m.meta.command || command || "";
   const [body, options] = splitOptions(m.content || "");
   const tools = (m.meta.tools || []).filter(Boolean);
   const showThinking = settings.showThinking && !!m.thinking;
+  const credits = typeof m.meta.credits === "number" ? m.meta.credits : m.meta.turn_stats?.credits;
+  const showBrowser = !!m.meta.browser || (isLast && online && usedBrowser(tools));
   return (
-    <div className="msg assistant">
-      <div className="avatar"><Logo size={28} animated working={live} /></div>
+    <div className={`msg assistant ${cmd ? "is-command" : ""}`}>
+      <div className="avatar"><Logo size={28} animated working={live} happy={hop} /></div>
       <div className="msg-body">
         {showThinking && <Thinking text={m.thinking} live={live && !m.content} />}
         <Activity tools={tools} live={live} hasText={!!body} />
-        {body ? <div className="prose"><Markdown text={body} /></div> :
+        {cmd && (body || live) ? (
+          <div className="command-out">
+            <div className="command-head"><IconSlash size={14} /> {cmd}{live && <IconSpinner size={13} />}</div>
+            {body && <div className="prose"><Markdown text={body} /></div>}
+          </div>
+        ) : body ? <div className="prose"><Markdown text={body} /></div> :
           live && !tools.length && !showThinking ? (
             <div className="activity live"><div className="step current">
               <span className="step-icon"><IconSpinner size={15} /></span>
               <span className="step-label shimmer">{m.status === "waiting" ? "Waiting for your approval" : t("thinking")}</span>
             </div></div>
           ) : null}
-        {isLast && online && usedBrowser(tools) && <BrowserInline live={live} />}
+        {showBrowser && <BrowserCard latest={isLast} shot={m.meta.browser} />}
         {!live && <MessageFiles messageId={m.id} ids={m.meta.files} />}
         {m.status === "error" && (
           <div className="error-note"><IconAlert size={15} /> {m.meta.error || "Something went wrong."}</div>
         )}
+        {!live && m.status === "done" && COMMAND_NOTE[cmd] && <div className="command-divider"><span>{COMMAND_NOTE[cmd]}</span></div>}
         {!live && options.length > 0 && isLast && (
           <div className="options">
             {options.map((o) => <button key={o} className="chip" onClick={() => onOption?.(o)}>{o}</button>)}
@@ -235,10 +274,15 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
           <div className="msg-actions">
             <button className="tap" onClick={() => { navigator.clipboard.writeText(body); setCopied(true); setTimeout(() => setCopied(false), 1500); }}
               title={t("copy")} aria-label={t("copy")}>{copied ? <IconCheck size={16} /> : <IconCopy size={16} />}</button>
-            {onRetry && <button className="tap" onClick={() => onRetry(m)} title={t("retry")} aria-label={t("retry")}><IconRetry size={16} /></button>}
+            {onRetry && !cmd && <button className="tap" onClick={() => onRetry(m)} title={t("retry")} aria-label={t("retry")}><IconRetry size={16} /></button>}
             <span className="muted meta-line">
-              {m.meta.model ? modelName(m.meta.model) : ""}{m.meta.secs ? ` · ${m.meta.secs}s` : ""}
+              {m.meta.model && !cmd ? modelName(m.meta.model) : ""}{m.meta.secs ? `${m.meta.model && !cmd ? " · " : ""}${m.meta.secs}s` : ""}
             </span>
+            {typeof credits === "number" && credits > 0 && (
+              <span className="credit-chip" title={`This reply used ${credits} Kiro credits`}>
+                <IconCoins size={12} /> {fmtCredits(credits)}
+              </span>
+            )}
           </div>
         )}
       </div>

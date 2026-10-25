@@ -43,6 +43,8 @@ def main():
     ap.add_argument("query")
     ap.add_argument("-n", type=int, default=6)
     ap.add_argument("--download", action="store_true")
+    ap.add_argument("--out", default="", help="where downloads go (default ~/work/images/<query>, a working folder "
+                                              "that does NOT become a download card)")
     a = ap.parse_args()
     results, errors = [], []
     for fn in (openverse, wikimedia):
@@ -53,7 +55,8 @@ def main():
         if len(results) >= a.n:
             break
     results = results[: a.n]
-    folder = os.path.expanduser(f"~/outputs/images/{re.sub(r'[^a-z0-9]+', '-', a.query.lower()).strip('-')[:40]}")
+    slug = re.sub(r"[^a-z0-9]+", "-", a.query.lower()).strip("-")[:40] or "images"
+    folder = os.path.expanduser(a.out) if a.out else os.path.expanduser(f"~/work/images/{slug}")
     for i, r in enumerate(results, 1):
         local = ""
         if a.download:

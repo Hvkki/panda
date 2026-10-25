@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { sessionAction, supabase, type Chat, type Notification } from "./lib/supabase";
 import { SettingsProvider, useSettings } from "./lib/settings";
@@ -6,14 +6,14 @@ import { greetingKey, useT } from "./lib/i18n";
 import { Login } from "./components/Login";
 import { Sidebar } from "./components/Sidebar";
 import { ChatView } from "./components/ChatView";
-import { Composer } from "./components/Composer";
+import { Composer, type SendMeta } from "./components/Composer";
 import { SessionChip, useWorker } from "./components/SessionChip";
-import { NotificationsModal, SearchModal, SettingsModal } from "./components/Panels";
+import { NotificationsModal, SearchModal, SettingsModal, type SettingsTab } from "./components/Panels";
 import { Logo } from "./components/Logo";
-import { IconGlobe, IconPlus, IconSidebar } from "./components/Icons";
+import { IconClock, IconDoc, IconGlobe, IconImage, IconPen, IconPlus, IconSidebar } from "./components/Icons";
 import { FilesPage } from "./components/Files";
 import { BrowserPanel } from "./components/BrowserPanel";
-import { BrowserContext, useBrowserLink } from "./lib/browser";
+import { BrowserContext, isAlive, useBrowserLink, useBrowserSelect } from "./lib/browser";
 import { ProjectsPage } from "./components/Projects";
 import { CustomizePage } from "./components/Customize";
 import type { Attachment } from "./lib/files";
@@ -36,7 +36,7 @@ export default function App() {
     return () => sub.subscription.unsubscribe();
   }, []);
 
-  if (!ready) return <div className="splash"><Logo size={64} working /></div>;
+  if (!ready) return <div className="splash"><Logo size={72} working /></div>;
   if (!session) return <Login />;
   if (recovery) return <Login recovery onDone={() => { setRecovery(false); history.replaceState(null, "", location.pathname); }} />;
   return (
@@ -46,10 +46,28 @@ export default function App() {
   );
 }
 
+const STARTERS = [
+  { icon: <IconPen size={17} />, title: "Write a LinkedIn post", text: "Write a LinkedIn post about my project" },
+  { icon: <IconDoc size={17} />, title: "Make a 6-slide deck", text: "Make a 6-slide deck about red pandas" },
+  { icon: <IconImage size={17} />, title: "Find photos", text: "Find 4 photos of Tuscany for a blog post" },
+  { icon: <IconClock size={17} />, title: "Schedule a reminder", text: "Every Monday at 9, send me my week's goals" },
+];
+
+function useWide(px: number) {
+  const [wide, setWide] = useState(() => window.innerWidth >= px);
+  useEffect(() => {
+    const on = () => setWide(window.innerWidth >= px);
+    window.addEventListener("resize", on);
+    return () => window.removeEventListener("resize", on);
+  }, [px]);
+  return wide;
+}
+
 function Shell({ userId, email }: { userId: string; email: string }) {
   const { settings } = useSettings();
   const t = useT();
   const worker = useWorker(userId);
+  const online = worker.alive && worker.session?.status === "running";
   const [chats, setChats] = useState<Chat[]>([]);
   const params = new URLSearchParams(location.search);
   const [activeId, setActiveId] = useState<string | null>(() => params.get("c"));
@@ -58,11 +76,15 @@ function Shell({ userId, email }: { userId: string; email: string }) {
   const [sideOpen, setSideOpen] = useState(() => window.innerWidth > 900);
   const [panel, setPanel] = useState<null | "settings" | "search" | "notifications">(
     () => (params.get("panel") === "notifications" ? "notifications" : null));
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
   const [notifs, setNotifs] = useState<Notification[]>([]);
+  const [typing, setTyping] = useState(false);
   const browser = useBrowserLink(settings.browserTopic || undefined);
   const [browserOpen, setBrowserOpen] = useState(false);
-  const browserLive = Date.now() - browser.lastSeen < 25000;
-  const needsYou = browserLive && browser.status?.control === "needs_user";
+  const browserLive = useBrowserSelect(browser, isAlive);
+  const browserBusy = useBrowserSelect(browser, (s) => !!s.status?.busy);
+  const needsYou = useBrowserSelect(browser, (s) => isAlive(s) && s.status?.control === "needs_user");
+  const docked = useWide(1100);
   // Panda asks for help (login, captcha): open the live view automatically.
   useEffect(() => { if (needsYou) setBrowserOpen(true); }, [needsYou]);
   const [draft, setDraft] = useState({ model: settings.defaultModel, effort: settings.defaultEffort });
@@ -116,15 +138,19 @@ function Shell({ userId, email }: { userId: string; email: string }) {
     }
   }, [worker.alive, settings.autoStart]);
 
-  const sendMessage = useCallback(async (chat: Chat, text: string, attachments: Attachment[] = []) => {
-    await supabase.from("messages").insert({ chat_id: chat.id, owner: userId, role: "user", content: text,
-      status: "pending", meta: attachments.length ? { attachments } : {} });
+  const sendMessage = useCallback(async (chat: Chat, text: string, attachments: Attachment[] = [], meta?: SendMeta) => {
+    const m: Record<string, unknown> = {};
+    if (attachments.length) m.attachments = attachments;
+    if (meta?.command) m.command = meta.command;
+    const { error } = await supabase.from("messages").insert({ chat_id: chat.id, owner: userId, role: "user", content: text,
+      status: "pending", meta: m });
+    if (error) { alert(error.message); return; }
     const ids = attachments.map((a) => a.file_id).filter(Boolean) as string[];
     if (ids.length) supabase.from("files").update({ chat_id: chat.id }).in("id", ids).then(() => {});
     ensureWorker();
   }, [userId, ensureWorker]);
 
-  const startChat = async (text: string, attachments: Attachment[] = [], inProject: string | null = null) => {
+  const startChat = async (text: string, attachments: Attachment[] = [], inProject: string | null = null, meta?: SendMeta) => {
     const title = text.replace(/\s+/g, " ").slice(0, 48) + (text.length > 48 ? "…" : "");
     const { data, error } = await supabase.from("chats")
       .insert({ owner: userId, title, model: draft.model, effort: draft.effort, project_id: inProject }).select().single();
@@ -132,7 +158,7 @@ function Shell({ userId, email }: { userId: string; email: string }) {
     setChats((prev) => [data as Chat, ...prev]);
     setActiveId(data.id);
     setView("chat");
-    await sendMessage(data as Chat, text, attachments);
+    await sendMessage(data as Chat, text, attachments, meta);
   };
 
   // "Ask Panda" from other pages: open a fresh chat with the composer pre-filled.
@@ -148,25 +174,40 @@ function Shell({ userId, email }: { userId: string; email: string }) {
   const closeSideOnMobile = () => { if (window.innerWidth <= 900) setSideOpen(false); };
   const open = (id: string) => { setActiveId(id); setView("chat"); closeSideOnMobile(); };
   const go = (v: View) => { setView(v); if (v === "projects") setProjectId(null); closeSideOnMobile(); };
+  const openSettings = (tab: SettingsTab = "general") => { setSettingsTab(tab); setPanel("settings"); closeSideOnMobile(); };
   const unread = notifs.filter((n) => !n.read).length;
   const name = settings.name || email.split("@")[0].replace(/[._\d]+/g, " ").trim().split(" ")[0] || "";
 
+  // Panda's app-wide "/" commands. Chat-only ones (/stop, /btw, /title) are handled in ChatView.
+  const appCommand = (cmd: string): boolean => {
+    if (cmd === "/new") { setActiveId(null); setView("chat"); return true; }
+    if (cmd === "/credits") { openSettings("usage"); return true; }
+    if (cmd === "/settings") { openSettings("general"); return true; }
+    if (cmd === "/browser") { setBrowserOpen(true); return true; }
+    return false;
+  };
+
+  const browserCtx = useMemo(() => ({ link: browser, openFull: () => setBrowserOpen(true), online }), [browser, online]);
+  const panelOpen = browserOpen && !!browser;
+
   return (
-    <BrowserContext.Provider value={{ link: browser, openFull: () => setBrowserOpen(true), online: worker.alive && worker.session?.status === "running" }}>
-    <div className={`app ${sideOpen ? "side-open" : ""}`}>
+    <BrowserContext.Provider value={browserCtx}>
+    <div className={`app ${sideOpen ? "side-open" : ""} ${panelOpen && docked ? "with-dock" : ""}`}>
       {sideOpen && <div className="side-scrim" onClick={() => setSideOpen(false)} />}
-      <Sidebar chats={chats} activeId={view === "chat" ? activeId : null} email={email} unread={unread} view={view} onGo={go}
+      <Sidebar chats={chats} activeId={view === "chat" ? activeId : null} email={email} userId={userId} worker={worker}
+        unread={unread} view={view} onGo={go}
         onNew={() => { setActiveId(null); setView("chat"); closeSideOnMobile(); }}
-        onOpen={open} onSearch={() => setPanel("search")} onSettings={() => setPanel("settings")}
+        onOpen={open} onSearch={() => setPanel("search")} onSettings={() => openSettings("general")}
+        onUsage={() => openSettings("usage")}
         onNotifications={() => setPanel("notifications")}
         onDeleted={(id) => { setChats((p) => p.filter((c) => c.id !== id)); if (id === activeId) setActiveId(null); }} />
       <main className="main">
         <header className="topbar">
           <button className="icon-btn" onClick={() => setSideOpen((v) => !v)} aria-label="Sidebar"><IconSidebar /></button>
           <div className="topbar-title">{view === "chat" ? active?.title || "" : ""}</div>
-          {(browserLive || browserOpen) && (
-            <button className={`icon-btn browser-btn ${browser.status?.busy ? "busy" : ""} ${needsYou ? "needs" : ""}`}
-              onClick={() => setBrowserOpen(true)} aria-label="Open Panda's browser" title="Panda's browser"><IconGlobe /></button>
+          {(browserLive || browserOpen) && browser && (
+            <button className={`icon-btn browser-btn ${browserBusy ? "busy" : ""} ${needsYou ? "needs" : ""}`}
+              onClick={() => setBrowserOpen((v) => !v)} aria-label="Panda's browser" title="Panda's browser"><IconGlobe /></button>
           )}
           <SessionChip worker={worker} />
           {(active || view !== "chat") && <button className="icon-btn" onClick={() => { setActiveId(null); setView("chat"); }} aria-label={t("newChat")}><IconPlus /></button>}
@@ -177,27 +218,36 @@ function Shell({ userId, email }: { userId: string; email: string }) {
         ) : view === "files" ? (
           <FilesPage onOpenChat={open} />
         ) : view === "customize" ? (
-          <CustomizePage online={worker.alive && worker.session?.status === "running"} onAsk={askPanda} />
+          <CustomizePage online={online} onAsk={askPanda} />
         ) : active ? (
-          <ChatView key={active.id} chat={active} onModel={setModel} onSendMessage={sendMessage} />
+          <ChatView key={active.id} chat={active} onModel={setModel} onSendMessage={sendMessage} online={online}
+            onCommand={(n) => appCommand(n)} />
         ) : (
-          <div className="home">
-            <h1 className="greeting serif"><Logo size={40} animated /> {t(greetingKey())}{name ? `, ${capitalize(name)}` : ""}</h1>
+          <div className={`home ${typing ? "typing" : ""}`}>
+            <div className="home-hero">
+              <div className="home-mark"><Logo size={64} animated look={typing ? "down" : null} /></div>
+              <h1 className="greeting serif">{t(greetingKey())}{name ? `, ${capitalize(name)}` : ""}</h1>
+            </div>
             <div className="home-composer">
-              <Composer key={prefill} initialText={prefill} model={draft.model} effort={draft.effort} onModel={(model, effort) => setDraft({ model, effort })}
-                onSend={(text, att) => { setPrefill(""); startChat(text, att); }} autoFocus />
+              <Composer key={prefill} initialText={prefill} model={draft.model} effort={draft.effort} online={online}
+                onModel={(model, effort) => setDraft({ model, effort })} onTyping={setTyping}
+                onCommand={(n) => appCommand(n)}
+                onSend={(text, att, meta) => { setPrefill(""); startChat(text, att, null, meta); }} autoFocus />
             </div>
             <div className="starters">
-              {["Write a LinkedIn post about my project", "Make a 6-slide deck about red pandas",
-                "Find 4 photos of Tuscany for a blog post", "Every Monday at 9, send me my week's goals"].map((s) => (
-                <button key={s} className="chip" onClick={() => startChat(s)}>{s}</button>
+              {STARTERS.map((s) => (
+                <button key={s.text} className="starter" onClick={() => startChat(s.text)}>
+                  <span className="starter-icon">{s.icon}</span>
+                  <span className="starter-text"><b>{s.title}</b><span className="muted">{s.text}</span></span>
+                </button>
               ))}
             </div>
           </div>
         )}
       </main>
-      {browserOpen && <BrowserPanel link={browser} online={worker.alive && worker.session?.status === "running"} onClose={() => setBrowserOpen(false)} />}
-      {panel === "settings" && <SettingsModal email={email} userId={userId} onClose={() => setPanel(null)} />}
+      {panelOpen && <BrowserPanel link={browser!} online={online} docked={docked} onClose={() => setBrowserOpen(false)} />}
+      {panel === "settings" && <SettingsModal email={email} userId={userId} worker={worker} online={online}
+        initialTab={settingsTab} onClose={() => setPanel(null)} />}
       {panel === "search" && <SearchModal chats={chats} onOpen={open} onClose={() => setPanel(null)} />}
       {panel === "notifications" && <NotificationsModal items={notifs} onClose={() => setPanel(null)} />}
     </div>

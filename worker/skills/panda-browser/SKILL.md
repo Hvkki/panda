@@ -14,6 +14,8 @@ pb() { python3 ~/.kiro/crew/skills/panda-browser/pb.py "$@"; }
 pb open github.com/login        # prints the page as an outline; interactive items carry refs like [ref=e12]
 pb click e12                    # click by ref
 pb type e7 "my search" --submit # fill a field, press Enter
+pb select e9 "Italy"            # pick an option in a dropdown
+pb hover e4                     # open a menu that appears on hover
 pb scroll down 800
 pb text                         # readable article text (cheaper than the outline)
 pb shot report.png              # save a screenshot to ~/outputs (appears as a file card)
@@ -21,6 +23,8 @@ pb shot report.png              # save a screenshot to ~/outputs (appears as a f
 
 Every action prints the updated outline, so you rarely need `pb snap`.
 Refs are only valid for the page you just read — after a click that changes the page, use the new refs.
+The user watches each step live (a cursor shows where you click and a caption says what you do),
+so act deliberately: one clear action at a time, no random clicking.
 
 ## Rules
 - **Logins, captchas, 2-step codes, payments:** never type the user's passwords yourself.

@@ -3,8 +3,11 @@ import { supabase, type Chat, type Notification } from "../lib/supabase";
 import { useSettings, type Settings } from "../lib/settings";
 import { useT } from "../lib/i18n";
 import { ALL_MODELS, EFFORTS } from "../lib/models";
-import { IconX } from "./Icons";
+import { IconBell, IconCoins, IconCrew, IconGear, IconSliders, IconSparkle, IconUsers, IconX } from "./Icons";
 import { disablePush, enablePush, pushState } from "../lib/push";
+import { CrewSettingsPanel } from "./CrewSettings";
+import { UsagePanel } from "./Usage";
+import type { Worker } from "./SessionChip";
 
 function Modal({ title, onClose, children, wide }: { title: string; onClose: () => void; children: ReactNode; wide?: boolean }) {
   useEffect(() => {
@@ -27,8 +30,12 @@ function Modal({ title, onClose, children, wide }: { title: string; onClose: () 
 
 /* ── Settings ─────────────────────────────────────────────────────────────── */
 
-type Tab = "general" | "chat" | "notifications" | "memory" | "account";
-const TAB_LABEL: Record<Tab, string> = { general: "General", chat: "Chat & tools", notifications: "Notifications", memory: "Memory", account: "Account" };
+export type SettingsTab = "general" | "chat" | "crew" | "usage" | "notifications" | "memory" | "account";
+type Tab = SettingsTab;
+const TAB_LABEL: Record<Tab, string> = { general: "General", chat: "Chat & tools", crew: "Kiro Crew", usage: "Credits",
+  notifications: "Notifications", memory: "Memory", account: "Account" };
+const TAB_ICON: Record<Tab, ReactNode> = { general: <IconGear size={16} />, chat: <IconSliders size={16} />, crew: <IconCrew size={16} />,
+  usage: <IconCoins size={16} />, notifications: <IconBell size={16} />, memory: <IconSparkle size={16} />, account: <IconUsers size={16} /> };
 
 function Row({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return (
@@ -101,21 +108,25 @@ function PushRow({ userId }: { userId: string }) {
   );
 }
 
-export function SettingsModal({ email, userId, onClose }: { email: string; userId: string; onClose: () => void }) {
+export function SettingsModal({ email, userId, onClose, worker, online, initialTab = "general" }:
+  { email: string; userId: string; onClose: () => void; worker: Worker; online: boolean; initialTab?: Tab }) {
   const { settings, update } = useSettings();
   const t = useT();
-  const [tab, setTab] = useState<Tab>("general");
+  const [tab, setTab] = useState<Tab>(initialTab);
   const [pwMsg, setPwMsg] = useState("");
 
   return (
     <Modal title={t("settings")} onClose={onClose} wide>
       <div className="settings">
-        <div className="set-tabs">
+        <div className="set-tabs" role="tablist">
           {(Object.keys(TAB_LABEL) as Tab[]).map((x) => (
-            <button key={x} className={tab === x ? "active" : ""} onClick={() => setTab(x)}>{TAB_LABEL[x]}</button>
+            <button key={x} role="tab" aria-selected={tab === x} className={tab === x ? "active" : ""} onClick={() => setTab(x)}>
+              {TAB_ICON[x]}<span>{TAB_LABEL[x]}</span></button>
           ))}
         </div>
         <div className="set-panel">
+          {tab === "crew" && <CrewSettingsPanel online={online} />}
+          {tab === "usage" && <UsagePanel userId={userId} worker={worker} online={online} />}
           {tab === "general" && <>
             <h3>Appearance</h3>
             <Pick k="theme" label="Theme" options={[["system", "System"], ["light", "Light"], ["dark", "Dark"]]} />

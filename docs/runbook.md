@@ -82,8 +82,19 @@ Use the tester user id that appears in `tools/*.py`. Lock the account again afte
 | `tools/probe_stream.py` | Step-by-step timing of one reply |
 | `tools/probe_think.py` | The thinking stream |
 | `tools/test_browser_kaggle.py start \| run \| check \| stop` | Browser on Kaggle, take-over, cookies after restart |
-| `tools/test_browser_local.py` | Browser engine on your machine, against live Realtime |
+| `tools/test_browser_local.py` | Browser engine on your machine, against live Realtime: frames, actions, focus, take-over, cookies |
+| `tools/test_browser_app.sh` | The app's own supabase-js client drives the engine (protocol 2.0 ↔ 1.0) |
 | `tools/test_client.py` | Phone stand-in: request, wait, chat, stop |
+
+## Local tests (no Kaggle, no credits)
+
+- **Worker ↔ Kiro Crew:** install Kiro Crew from `vendor/KiroCrew` into a Python 3.12 venv, run
+  `kirocrew setup --agent-only` and `kirocrew gateway --no-open --no-tunnel` with a throwaway `HOME`,
+  then `python tools/test_worker_local.py`. It checks the relay rules, slash commands, every setting,
+  saving one, usage, side chat and command turns with Supabase faked.
+- **UI:** `cd app && npm run build`, then `python tools/screenshots/mock_ui.py <out-dir> [fixtures]`.
+  Supabase (auth, REST, Storage, Realtime) is mocked; it saves screenshots and checks the panda
+  animations. Both browser tests need `PANDA_CHROMIUM` where Playwright's own download is missing.
 
 ## Local setup
 

@@ -5,6 +5,8 @@
   pb snap [--full]              re-read the current page
   pb click <ref>                click an element by its ref (e.g. e12)   | pb click --xy 400 300
   pb type <ref> "text" [--submit]
+  pb select <ref> "value" ["value2" …]   choose option(s) in a dropdown
+  pb hover <ref>                point at an element (menus that open on hover)
   pb press <Key>                Enter, Tab, Escape, ArrowDown, Control+a …
   pb scroll [down|up] [pixels]
   pb back | forward | reload
@@ -99,6 +101,12 @@ def parse(argv: list[str]) -> dict:
         return {"op": "click", "ref": rest[0], **base}
     if op == "type":
         return {"op": "type", "ref": rest[0], "text": " ".join(rest[1:]), "submit": "--submit" in flags, **base}
+    if op == "select":
+        if len(rest) < 2:
+            sys.exit("usage: pb select <ref> \"value\" [\"value2\" …]")
+        return {"op": "select", "ref": rest[0], "values": rest[1:], **base}
+    if op == "hover":
+        return {"op": "hover", "ref": rest[0], **base}
     if op == "press":
         return {"op": "press", "key": rest[0], **base}
     if op == "scroll":

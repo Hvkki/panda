@@ -13,21 +13,24 @@ Config comes from worker.json in an attached private dataset. No secret is print
 """
 from __future__ import annotations
 
+import base64
 import glob
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
 import threading
 import time
+import uuid
 import contextlib
 import traceback
 import mimetypes
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import requests
@@ -41,7 +44,8 @@ OWNER = CFG["owner_id"]  # replaced by whoever pressed Start (claim_session)
 SECRETS = [CFG["kiro_api_key"], CFG["worker_password"], CFG.get("vapid_private", ""),
            (CFG.get("drive") or {}).get("refresh_token", ""), (CFG.get("drive") or {}).get("client_secret", "")]
 FILES_BUCKET = "panda-files"
-OUTPUTS = os.path.expanduser("~/outputs")
+OUTPUTS = os.path.expanduser("~/outputs")          # deliverables -> app file cards
+WORKDIR = os.path.expanduser("~/work")             # working files (images for a deck, scratch) -> not published
 MAX_PARALLEL_CHATS = 3
 
 WORK = "/kaggle/working" if os.path.isdir("/kaggle/working") else os.path.abspath("work")
@@ -152,10 +156,15 @@ class Supabase:
 
 
 # ── Kiro Crew lifecycle ──────────────────────────────────────────────────────
+CREW_VERSION = {"v": ""}
+
+
 def install():
     sh("curl -fsSL https://cli.kiro.dev/install | bash", check=True)
     sh("curl -fsSL https://download.crew.kiro.dev/cli.sh | sh", timeout=1500, check=True)
-    sh("kiro-cli --version; kirocrew --version")
+    r = sh("kiro-cli --version; kirocrew --version")
+    m = re.search(r"kirocrew\s+v?([0-9][\w.\-]*)", r.stdout or "")
+    CREW_VERSION["v"] = m.group(1) if m else ""
     # Lean agent: drop desktop-only tool servers (computer use, dashboard guide, crew mate).
     # Their definitions were sent with EVERY message and cost tokens for nothing here.
     os.makedirs(f"{HOME}/.kiro/crew", exist_ok=True)
@@ -285,6 +294,15 @@ def mint_token() -> str:
     return m.group(1)
 
 
+class GatewayError(RuntimeError):
+    """A gateway answer >= 400. `str()` is Crew's own message, which the app shows as is."""
+
+    def __init__(self, method: str, path: str, status: int, data):
+        self.status, self.data = status, data
+        msg = data.get("error") if isinstance(data, dict) else None
+        super().__init__(str(msg or f"gateway {method} {path.split('?')[0]}: {status} {str(data)[:200]}"))
+
+
 class Gateway:
     def __init__(self):
         self.token = mint_token()
@@ -294,12 +312,17 @@ class Gateway:
 
     def call(self, method: str, path: str, body=None, timeout: int = 60):
         r = requests.request(method, f"{GW}{path}", json=body, headers=self.h(), timeout=timeout)
-        if r.status_code in (401, 403):
+        if r.status_code in (401, 403):  # an expired token; one retry with a fresh one
             self.token = mint_token()
             r = requests.request(method, f"{GW}{path}", json=body, headers=self.h(), timeout=timeout)
+        json_body = "json" in r.headers.get("content-type", "")
         if r.status_code >= 400:
-            raise RuntimeError(f"gateway {method} {path}: {r.status_code} {r.text[:300]}")
-        return r.json() if "json" in r.headers.get("content-type", "") else {}
+            try:
+                data = r.json() if json_body else r.text[:300]
+            except ValueError:
+                data = r.text[:300]
+            raise GatewayError(method, path, r.status_code, data)
+        return r.json() if json_body else {}
 
     def stream_chat(self, slot: str, message: str):
         with requests.post(f"{GW}/api/chat", json={"message": message, "slot": slot},
@@ -394,19 +417,77 @@ def chunk_text(c: dict) -> str:
     return ""
 
 
-def final_reply(gw: Gateway, slot: str) -> str:
-    """Authoritative final text: the slot's last assistant row in history."""
+def _row_text(m: dict) -> str:
+    v = m.get("content") or m.get("text") or ""
+    return v if isinstance(v, str) else json.dumps(v)
+
+
+def turn_result(gw: Gateway, slot: str, want_stats: bool = True) -> dict:
+    """What the turn that just ended left in the slot history.
+
+    Only rows after the last user row count, so a turn that wrote no answer can never pick up
+    the previous turn's text. Returns the last assistant text, Crew's per-turn stats
+    (`meta.turn_stats`: credits, elapsed_ms, ttft_ms, model) and any error rows.
+    """
+    out = {"text": "", "stats": None, "errors": []}
+    for attempt in range(3 if want_stats else 1):
+        try:
+            hist = gw.call("GET", f"/api/chat/slots/{slot}?limit=40")
+        except Exception as exc:
+            log("history read failed:", exc)
+            return out
+        msgs = [m for m in (hist.get("messages") or hist.get("history") or []) if isinstance(m, dict)]
+        last_user = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=-1)
+        text, stats, errors = "", None, []
+        for m in msgs[last_user + 1:]:
+            role = m.get("role")
+            if role in ("assistant", "agent", "bot"):
+                text = _row_text(m) or text
+                st = (m.get("meta") or {}).get("turn_stats")
+                if isinstance(st, dict):
+                    stats = st
+            elif role == "error":
+                errors.append(_row_text(m))
+        out = {"text": text, "stats": stats, "errors": errors}
+        # Crew attaches the stats just before the stream ends; give a late write one more look.
+        if stats or not text or attempt == 2:
+            return out
+        time.sleep(0.8)
+    return out
+
+
+# ── slash commands ──────────────────────────────────────────────────────────
+# Kiro Crew's chat commands (GET /api/slash-commands) plus its /plain macro. Crew only treats a
+# message as a command when the command is the FIRST word, so these are sent exactly as typed:
+# no attachments, history replay, project or app context in front of them.
+CREW_COMMANDS = {"/agent", "/changelog", "/clear", "/code", "/compact", "/context", "/experiment", "/goal",
+                 "/help", "/hooks", "/issue", "/logdump", "/mcp", "/model", "/prompts", "/todos", "/tools",
+                 "/usage", "/workflow", "/plain"}
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[=>]")
+
+
+def command_word(text: str) -> str:
+    parts = (text or "").strip().split(None, 1)
+    word = parts[0].lower() if parts else ""
+    return word if word in CREW_COMMANDS else ""
+
+
+def knowledge_block(gw: Gateway, query: str) -> str:
+    """`/kb <query>`: the knowledge-library matches as the context block Crew's dashboard injects."""
     try:
-        hist = gw.call("GET", f"/api/chat/slots/{slot}?limit=10")
+        d = gw.call("GET", f"/api/knowledge/search-for-context?q={quote(query)}&limit=6", timeout=90)
     except Exception as exc:
-        log("history read failed:", exc)
+        log("knowledge search failed:", exc)
         return ""
-    msgs = hist.get("messages") or hist.get("history") or []
-    for m in reversed(msgs):
-        if isinstance(m, dict) and m.get("role") in ("assistant", "agent", "bot"):
-            v = m.get("content") or m.get("text") or ""
-            return v if isinstance(v, str) else json.dumps(v)
-    return ""
+    items = [i for i in (d.get("results") or []) if isinstance(i, dict) and i.get("content")]
+    if not items:
+        return ""
+    parts = ["[KNOWLEDGE CONTEXT — injected by user from knowledge library]\n"]
+    for it in items:
+        src = f" ({it['source']})" if it.get("source") else ""
+        parts.append(f"## {it.get('title') or 'Untitled'}{src}\n{it['content']}\n")
+    parts.append("[END KNOWLEDGE CONTEXT]\n")
+    return "\n".join(parts)
 
 
 READY_SLOTS: set = set()  # slots verified + put in trust mode during this run
@@ -473,7 +554,8 @@ def ensure_slot(sb: Supabase, gw: Gateway, chat: dict, settings: dict) -> tuple[
 def replay_prefix(sb: Supabase, chat_id: str, before_id: int, limit: int = 30) -> str:
     rows = sb.rest("GET", "messages", params={
         "chat_id": f"eq.{chat_id}", "id": f"lt.{before_id}", "role": "in.(user,assistant)",
-        "status": "eq.done", "order": "id.desc", "limit": str(limit), "select": "role,content"})
+        "status": "eq.done", "order": "id.desc", "limit": str(limit), "select": "role,content,meta"})
+    rows = [r for r in rows or [] if not (r.get("meta") or {}).get("command")]  # commands are not conversation
     if not rows:
         return ""
     lines = [f"{'User' if r['role'] == 'user' else 'You'}: {r['content'][:2000]}" for r in reversed(rows)]
@@ -638,6 +720,47 @@ def stop_browser(sb: "Supabase"):
         log("final browser backup failed:", exc)
 
 
+ENGINE = f"http://127.0.0.1:{os.environ.get('PANDA_BROWSER_PORT', '5480')}"
+
+
+def engine_call(req: dict, timeout: float = 10) -> dict:
+    r = requests.post(f"{ENGINE}/do", json=req, timeout=timeout)
+    return r.json()
+
+
+def browser_snapshot(sb: "Supabase", chat: dict, reply_id: int, since: float) -> dict | None:
+    """If the browser was used during this turn, keep its final screen with the reply.
+
+    The live view ends with the worker; the saved frame lets the chat show what Panda's browser
+    looked like at the end of that answer (the GPT-style card), even days later.
+    """
+    try:
+        # Ask the engine itself: `pb` can start it too, so the worker's own process handle may be stale.
+        st = engine_call({"op": "status"}, timeout=4)
+    except Exception:
+        return None  # no browser running
+    try:
+        if not st.get("ok") or float(st.get("last_agent_ts") or 0) < since:
+            return None
+        fr = engine_call({"op": "frame", "quality": 72}, timeout=15)
+        if not fr.get("ok") or not fr.get("jpeg"):
+            return None
+        tmp = f"{WORK}/browser-frame-{reply_id}.jpg"
+        with open(tmp, "wb") as f:
+            f.write(base64.b64decode(fr["jpeg"]))
+        obj = f"{chat['owner']}/browser/{chat['id']}/{reply_id}.jpg"
+        try:
+            sb.upload(obj, tmp, bucket=FILES_BUCKET, mime="image/jpeg")
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+        return {"url": scrub(fr.get("url", ""))[:500], "title": scrub(fr.get("title", ""))[:200], "shot": obj,
+                "w": fr.get("w"), "h": fr.get("h"), "at": now_iso()}
+    except Exception as exc:
+        log("browser snapshot skipped:", type(exc).__name__, str(exc)[:80])
+        return None
+
+
 def browser_forget(sb: "Supabase") -> dict:
     """Delete every saved login: running engine, local file and the encrypted copy."""
     note = ""
@@ -700,49 +823,98 @@ def safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip()[:120] or "file"
 
 
-def publish_outputs(sb: Supabase, chat: dict, message_id: int, before: dict) -> list:
-    """Upload files the turn created or changed in ~/outputs; return [(local_path, file_row)]."""
-    published = []
-    for path, (mtime, size) in sorted(scan_outputs().items()):
-        if before.get(path) == (mtime, size) or size == 0:
-            continue
-        rel = os.path.relpath(path, OUTPUTS)
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp")
+_MD_TARGET = re.compile(r"\]\(\s*<?([^)>\s]+)")     # the target of ](…) or ![…](…)
+_MD_IMG = re.compile(r"!\[[^\]]*\]\(\s*<?([^)>\s]+)")  # only ![…](…) image embeds
+_MD_CODE = re.compile(r"`([^`\n]+)`")
+
+
+def _reply_refs(text: str) -> tuple[set, set]:
+    """(all referenced targets, image-embedded targets) from the reply's Markdown."""
+    text = text or ""
+    targets = {t.strip() for t in _MD_TARGET.findall(text)} | {t.strip() for t in _MD_CODE.findall(text)}
+    return targets, {t.strip() for t in _MD_IMG.findall(text)}
+
+
+def _resolve_local(target: str) -> str | None:
+    """A referenced path that points to a real file under ~/outputs or ~/work (nothing else)."""
+    t = (target or "").strip().strip("<>")
+    if not t or t.startswith("panda-file:") or re.match(r"^[a-z][a-z0-9+.-]*://", t, re.I):
+        return None
+    p = os.path.abspath(os.path.expanduser(t))
+    roots = (OUTPUTS, WORKDIR)
+    if not any(p == r or p.startswith(r + os.sep) for r in roots):
+        return None
+    return p if os.path.isfile(p) else None
+
+
+def _referenced(path: str, targets: set) -> bool:
+    base = os.path.basename(path)
+    forms = {path, path.replace(HOME, "~", 1), os.path.relpath(path, OUTPUTS) if path.startswith(OUTPUTS) else path}
+    for t in targets:
+        t = t.strip().strip("<>")
+        if t in forms or os.path.basename(t.rstrip("/")) == base:
+            return True
+    return False
+
+
+def _publish_one(sb: Supabase, chat: dict, message_id: int, path: str, size: int) -> dict | None:
+    name = os.path.basename(path)
+    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    body = {"owner": chat["owner"], "chat_id": chat["id"], "message_id": message_id,
+            "project_id": chat.get("project_id"), "kind": "output", "name": name, "mime": mime, "size": size}
+    try:
         if size > DRIVE_MIN:
             d = drive_put(path)
-            if d:
-                try:
-                    row = sb.rest("POST", "files", prefer="return=representation", body={
-                        "owner": chat["owner"], "chat_id": chat["id"], "message_id": message_id,
-                        "project_id": chat.get("project_id"), "kind": "output", "name": os.path.basename(rel),
-                        "path": f"drive:{d['id']}", "mime": mimetypes.guess_type(path)[0] or "application/octet-stream",
-                        "size": size})[0]
-                    published.append((path, row))
-                except Exception as exc:
-                    log("drive file row failed:", exc)
-            else:
-                log(f"skipped {rel}: over 45 MB and Drive is not connected")
-            continue
-        obj = f"{chat['owner']}/chats/{chat['id']}/{int(time.time())}-{safe_name(os.path.basename(rel))}"
-        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
-        try:
+            if not d:
+                log(f"skipped {name}: over 45 MB and Drive is not connected")
+                return None
+            body["path"] = f"drive:{d['id']}"
+        else:
+            obj = f"{chat['owner']}/chats/{chat['id']}/{int(time.time()*1000)}-{safe_name(name)}"
             sb.upload(obj, path, bucket=FILES_BUCKET, mime=mime)
-            row = sb.rest("POST", "files", prefer="return=representation", body={
-                "owner": chat["owner"], "chat_id": chat["id"], "message_id": message_id,
-                "project_id": chat.get("project_id"), "kind": "output", "name": os.path.basename(rel),
-                "path": obj, "mime": mime, "size": size})[0]
-            published.append((path, row))
-        except Exception as exc:
-            log("file publish failed:", exc)
+            body["path"] = obj
+        return sb.rest("POST", "files", prefer="return=representation", body=body)[0]
+    except Exception as exc:
+        log("file publish failed:", exc)
+        return None
+
+
+def publish_outputs(sb: Supabase, chat: dict, message_id: int, before: dict, reply: str = "") -> list:
+    """Upload the turn's deliverables; return [(local_path, file_row, inline)].
+
+    What counts as a deliverable:
+      - files the reply names (a link, an image embed, or a backtick path), so a deck built from
+        photos publishes only the deck, not every photo it used;
+      - if the reply names none, every new file in ~/outputs (a one-file answer that wasn't named).
+    Working files in ~/work are published only when the reply points at them (e.g. an inline image).
+    `inline` is set for images embedded with ![](…): the app shows them in the text, not as a card.
+    """
+    targets, img_targets = _reply_refs(reply)
+    new = {p: sz for p, (mt, sz) in scan_outputs().items() if before.get(p) != (mt, sz) and sz > 0}
+    for t in targets | img_targets:  # inline images etc. the agent kept in ~/work
+        p = _resolve_local(t)
+        if p and p not in new:
+            new[p] = os.path.getsize(p)
+    referenced = {p for p in new if _referenced(p, targets | img_targets)}
+    chosen = referenced or {p for p in new if p.startswith(OUTPUTS + os.sep)}
+    published = []
+    for path in sorted(chosen):
+        row = _publish_one(sb, chat, message_id, path, new[path])
+        if not row:
+            continue
+        inline = path.lower().endswith(IMAGE_EXT) and _referenced(path, img_targets)
+        published.append((path, row, inline))
         if len(published) >= 20:
             break
     if published:
-        log(f"published {len(published)} file(s)")
+        log(f"published {len(published)} file(s)" + (f", {sum(i for _, _, i in published)} inline" if any(i for _, _, i in published) else ""))
     return published
 
 
 def link_files(text: str, published: list) -> str:
     """Point the reply's local paths at the uploaded copies (the app resolves panda-file:)."""
-    for local, row in published:
+    for local, row, _inline in published:
         for form in (local, local.replace(HOME, "~", 1)):
             text = text.replace(f"]({form})", f"](panda-file:{row['id']})")
             text = text.replace(f"`{form}`", f"`{os.path.basename(local)}`")
@@ -817,39 +989,76 @@ def push(sb: Supabase, owner: str, title: str, body: str, url: str = "./"):
             log("push failed:", type(exc).__name__)
 
 
+PENDING_HINTS: set = set()   # slots that still need the app context (a command came first)
+PENDING_REPLAY: set = set()  # slots Crew lost whose history replay waits for the next normal message
+
+
+def app_hints(settings: dict) -> str:
+    hints = []
+    if settings.get("name"):
+        hints.append(f"The user's name is {settings['name']}.")
+    if SECRET_NAMES:
+        hints.append("API keys stored in the user's vault (load with `source ~/.panda/secrets.env` "
+                     "inside a bash command, never print them): " + ", ".join(SECRET_NAMES) + ".")
+    return ("[APP CONTEXT] " + " ".join(hints) + "\n\n") if hints else ""
+
+
+def finish_without_model(sb: Supabase, chat: dict, msg: dict, text: str, meta: dict):
+    """Answer in the app without a model turn (e.g. `/kb` with nothing found)."""
+    sb.rest("POST", "messages", body={"chat_id": chat["id"], "owner": chat["owner"], "role": "assistant",
+                                      "status": "done", "reply_to": msg["id"], "content": text, "meta": meta})
+    sb.rest("PATCH", "messages", params={"id": f"eq.{msg['id']}"}, body={"status": "done"})
+
+
 def handle(sb: Supabase, gw: Gateway, msg: dict):
     chat = sb.rest("GET", "chats", params={"id": f"eq.{msg['chat_id']}", "select": "*"})[0]
     settings = user_settings(sb, chat["owner"])
     fresh_slot = not chat.get("slot_id")
     slot, needs_replay = ensure_slot(sb, gw, chat, settings)
-    prompt = msg["content"]
-    attached = fetch_attachments(sb, chat, msg)
-    if attached:
-        prompt = ("[Files the user attached (read them):\n" + "\n".join(f"- `{p}`" for p in attached) +
-                  "]\n\n" + prompt)
-    if needs_replay:
-        prompt = replay_prefix(sb, chat["id"], msg["id"]) + prompt
-        log(f"chat {chat['id']}: Crew lost the slot, replayed history from Supabase")
-    prompt = project_preamble(sb, chat, slot, fresh_slot or needs_replay) + prompt
-    if fresh_slot or needs_replay:
-        name = settings.get("name")
-        hints = []
-        if name:
-            hints.append(f"The user's name is {name}.")
-        if SECRET_NAMES:
-            hints.append("API keys stored in the user's vault (load with `source ~/.panda/secrets.env` "
-                         "inside a bash command, never print them): " + ", ".join(SECRET_NAMES) + ".")
-        if hints:
-            prompt = "[APP CONTEXT] " + " ".join(hints) + "\n\n" + prompt
+    raw = msg["content"] or ""
+    cmd = command_word(raw)
+    kb = None if cmd else re.match(r"^\s*/kb\s+(.+)$", raw, re.S | re.I)
+    if cmd:
+        # Sent as typed (Crew matches the first word). Context the app would add waits for the next message.
+        prompt = _ANSI.sub("", raw.strip())
+        if fresh_slot or needs_replay:
+            PENDING_HINTS.add(slot)
+        if needs_replay:
+            PENDING_REPLAY.add(slot)
+        log(f"chat {chat['id']}: command {cmd}")
+    else:
+        prompt = raw
+        if kb:
+            query = kb.group(1).strip()
+            block = knowledge_block(gw, query)
+            if not block:
+                finish_without_model(sb, chat, msg, f"Nothing in your knowledge library matches “{query[:200]}”.",
+                                     {"command": "/kb"})
+                return
+            prompt = block + "\n" + query
+        attached = fetch_attachments(sb, chat, msg)
+        if attached:
+            prompt = ("[Files the user attached (read them):\n" + "\n".join(f"- `{p}`" for p in attached) +
+                      "]\n\n" + prompt)
+        if needs_replay or slot in PENDING_REPLAY:
+            PENDING_REPLAY.discard(slot)
+            prompt = replay_prefix(sb, chat["id"], msg["id"]) + prompt
+            log(f"chat {chat['id']}: Crew lost the slot, replayed history from Supabase")
+        prompt = project_preamble(sb, chat, slot, fresh_slot or needs_replay) + prompt
+        if fresh_slot or needs_replay or slot in PENDING_HINTS:
+            PENDING_HINTS.discard(slot)
+            prompt = app_hints(settings) + prompt
     before = scan_outputs()
+    base_meta = {"model": chat.get("model"), "effort": chat.get("effort")}
+    if cmd or kb:
+        base_meta["command"] = cmd or "/kb"
     reply = sb.rest("POST", "messages", prefer="return=representation",
                     body={"chat_id": chat["id"], "owner": chat["owner"], "role": "assistant",
-                          "status": "streaming", "reply_to": msg["id"],
-                          "meta": {"model": chat.get("model"), "effort": chat.get("effort")}})[0]
+                          "status": "streaming", "reply_to": msg["id"], "meta": base_meta})[0]
     text, thinking, tools, usage, last_push, t0 = "", "", [], None, 0.0, time.time()
     with THINK_LOCK:
         THINK[slot], THINK_REPLY[slot], THINK_SENT[slot] = "", reply["id"], 0
-    meta = lambda: {"model": chat.get("model"), "effort": chat.get("effort"), "replayed": needs_replay,
+    meta = lambda: {**base_meta, "replayed": needs_replay,
                     "tools": tools[-30:], "usage": usage, "secs": round(time.time() - t0, 1)}
     try:
         for c in gw.stream_chat(slot, prompt):
@@ -896,14 +1105,31 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
         with THINK_LOCK:
             thinking = THINK.get(slot, thinking)
             THINK_REPLY.pop(slot, None)
-        final = final_reply(gw, slot) or text
-        published = publish_outputs(sb, chat, reply["id"], before)
+        res = turn_result(gw, slot, want_stats=not cmd)
+        final = res["text"] or text
+        if cmd:
+            final = _ANSI.sub("", final)
+        if not final.strip() and res["errors"]:
+            raise RuntimeError(res["errors"][-1][:400])
+        published = publish_outputs(sb, chat, reply["id"], before, final)
         final = scrub(link_files(final, published))
+        # Inline images show in the text; only the rest become download cards.
+        done_meta = {**meta(), "files": [row["id"] for _, row, inline in published if not inline]}
+        stats = res["stats"] or {}
+        if isinstance(stats.get("credits"), (int, float)):
+            done_meta["credits"] = round(float(stats["credits"]), 4)
+        if stats:
+            done_meta["turn_stats"] = {k: stats[k] for k in ("elapsed_ms", "ttft_ms", "model", "credits", "retries")
+                                       if k in stats}
+        shot = browser_snapshot(sb, chat, reply["id"], t0)
+        if shot:
+            done_meta["browser"] = shot
         sb.rest("PATCH", "messages", params={"id": f"eq.{reply['id']}"},
-                body={"content": final, "thinking": scrub(thinking), "status": "done",
-                      "meta": {**meta(), "files": [r["id"] for _, r in published]}})
+                body={"content": final, "thinking": scrub(thinking), "status": "done", "meta": done_meta})
         sb.rest("PATCH", "messages", params={"id": f"eq.{msg['id']}"}, body={"status": "done"})
-        log(f"answered message {msg['id']} ({len(final)} chars, {len(thinking)} thinking)")
+        USAGE_STATE["poke"] = True  # refresh the account total soon
+        log(f"answered message {msg['id']} ({len(final)} chars, {len(thinking)} thinking, "
+            f"{done_meta.get('credits', '?')} credits)")
         if settings.get("notifyReplies", True) and time.time() - t0 > 20:  # only long answers
             push(sb, chat["owner"], f"Panda replied · {chat.get('title') or 'chat'}"[:60],
                  re.sub(r"[#*_`>\[\]]", "", final)[:180], f"./?c={chat['id']}")
@@ -940,8 +1166,12 @@ BUSY_LOCK = threading.Lock()
 
 
 def claim_next(sb: Supabase):
-    """Oldest pending message whose chat is not already answering (chats run in parallel)."""
-    rows = sb.rest("GET", "messages", params={"status": "eq.pending", "role": "eq.user",
+    """Oldest pending message whose chat is not already answering (chats run in parallel).
+
+    Only the person who pressed Start is served: another account's message is never picked up,
+    even though the worker account can read every row.
+    """
+    rows = sb.rest("GET", "messages", params={"status": "eq.pending", "role": "eq.user", "owner": f"eq.{OWNER}",
                                                "order": "id.asc", "limit": "20", "select": "id,chat_id"})
     for r in rows or []:
         with BUSY_LOCK:
@@ -966,27 +1196,557 @@ def run_message(sb: Supabase, gw: Gateway, msg: dict):
             BUSY_CHATS.discard(msg["chat_id"])
 
 
-# ── commands relay: the app's Customize pages talk to Crew through here ────
-GW_ALLOWED = re.compile(
+# ── Kiro Crew settings the app may change ────────────────────────────────────
+# Crew's own PATCH /api/config/kirocrew allow-list decides what is editable at all. On top of it,
+# these stay locked from the phone: they move a security boundary, undo the worker's own setup, or
+# only matter in Crew's desktop dashboard. The app shows the reason next to the setting.
+LOCKED_SETTINGS = {
+    "agent.provider": "the worker depends on this agent runtime",
+    "agent.acp_backend": "the worker depends on this agent runtime",
+    "agent.member_acp_backend": "the worker depends on this agent runtime",
+    "agent.kas_bundle": "the worker depends on this agent runtime",
+    "agent.approval_mode": "tool approvals follow Panda's own setting (Settings → Chat & tools)",
+    "agent.yolo_duration": "auto-approve windows are a security setting",
+    "agent.sandbox": "the sandbox is a security boundary",
+    "agent.sandbox_allow_no_isolation": "the sandbox is a security boundary",
+    "agent.sandbox_allow_unsandboxed_exec": "the worker sets this itself on Kaggle",
+    "agent.dangerously_skip_permissions": "it would skip every approval",
+    "agent.jail": "the sandbox is a security boundary",
+    "auto_update": "the worker installs Kiro Crew fresh on every start",
+    "session.pool_agent": "the worker manages Kiro Crew's agents",
+    "skills.approval_required": "approving new skills is a security setting",
+    "skills.extra_paths": "it would load skills from other folders",
+    "memory.writes_enabled": "Panda sets it from Settings → Memory every time it starts",
+}
+LOCKED_PREFIXES = {
+    "dashboard.tailscale.": "it changes who can reach the gateway",
+    "dashboard.terminal.": "the terminal is part of the desktop dashboard",
+    "instances.": "it manages other machines over SSH",
+    "telemetry.": "telemetry stays as the worker sets it",
+    "decisions.": "it can send data to another service",
+    "computer_use.": "computer use needs a desktop",
+    "tunnel.": "it changes who can reach the gateway",
+    "mcp_gateway.": "the worker manages the tool gateway",
+}
+DESKTOP_ONLY = {"dashboard.sso_login_flags", "dashboard.prevent_sleep", "dashboard.update_nudge",
+                "dashboard.folder_sort", "dashboard.session_sort", "dashboard.recent_tint_count",
+                "dashboard.mcp_probe_timeout_secs", "dashboard.crewmate_threads", "dashboard.dynamic_dashboard_cards"}
+# Dashboard settings that change the agent itself (written with PUT /api/dashboard/config).
+DASH_KEYS = {"verbosity", "default_memory_mode", "merge_queued_messages"}
+_APP_MODEL_PATH = re.compile(r"^apps\.[a-z0-9]+(?:-[a-z0-9]+)*\.model$")
+_EFFORTS = ["", "low", "medium", "high", "xhigh", "max"]
+# Used when the installed Kiro Crew can't be asked for its own list (taken from Crew 0.11).
+FALLBACK_EDITABLE = {
+    "agent.model": {"type": "str", "max_len": 64}, "agent.role_models.background": {"type": "str", "max_len": 64},
+    "agent.role_models.subagent": {"type": "str", "max_len": 64}, "agent.fallback_model": {"type": "str", "max_len": 64},
+    "agent.refusal_fallback_model": {"type": "str", "max_len": 64},
+    "agent.reasoning_effort": {"type": "enum", "values": _EFFORTS},
+    "agent.role_efforts.background": {"type": "enum", "values": _EFFORTS},
+    "agent.role_efforts.subagent": {"type": "enum", "values": _EFFORTS},
+    "agent.tool_search": {"type": "bool"}, "agent.completion_keep": {"type": "enum", "values": ["head", "tail", "both"]},
+    "agent.completion_keep_chars": {"type": "int", "min": 0, "max": 512000},
+    "agent.soft_stop_budget_secs": {"type": "float", "min": 0.5, "max": 60.0},
+    "agent.chat_turn_timeout_secs": {"type": "int", "min": 300, "max": 86400},
+    "session.timeout_secs": {"type": "int", "min": 0, "max": 86400},
+    "session.autocompact_pct": {"type": "float", "min": 5.0, "max": 90.0},
+    "session.compact_wait_secs": {"type": "float", "min": 0.0, "max": 3600.0},
+    "session.pool_size": {"type": "int", "min": 0, "max": 10}, "session.pool_ttl_secs": {"type": "int", "min": 0, "max": 7200},
+    "session_summary.enabled": {"type": "bool"}, "monitoring.prefer_structured_arming": {"type": "bool"},
+    "dashboard.title_refresh_every_turns": {"type": "int", "min": 0, "max": 1000},
+    "dashboard.user_role": {"type": "enum", "values": ["", "developer", "designer", "product-manager", "data-ml",
+                                                       "it-ops", "other"]},
+    "dashboard.user_role_other": {"type": "str", "max_len": 60},
+    "dashboard.user_technical_level": {"type": "enum", "values": ["", "codes", "somewhat-technical", "non-technical"]},
+    "skills.auto_create_from_sessions": {"type": "bool"}, "knowledge.auto_add_documents": {"type": "bool"},
+    "knowledge.auto_ingest_artifacts": {"type": "bool"}, "knowledge.extraction_model": {"type": "str"},
+    "knowledge.extraction_effort": {"type": "enum", "values": _EFFORTS},
+}
+_SPEC_DUMP = r'''
+import json
+from kiro_crew.dashboard.handlers.core_config_schema import _EDITABLE_CONFIG
+out = {}
+for k, s in _EDITABLE_CONFIG.items():
+    d = {"type": s.get("type")}
+    for f in ("min", "max", "max_len"):
+        if isinstance(s.get(f), (int, float)) and not isinstance(s.get(f), bool):
+            d[f] = s[f]
+    vals = s.get("values")
+    if vals is None and callable(s.get("values_fn")):
+        try:
+            vals = list(s["values_fn"]())
+        except Exception:
+            vals = None
+    if vals is not None:
+        d["values"] = [v for v in vals if isinstance(v, (str, int, float, bool))]
+    out[k] = d
+print("PANDA_SPEC " + json.dumps(out))
+'''
+_SPEC = {"spec": None, "live": False}
+_MISSING = object()
+
+
+def locked_reason(path: str) -> str:
+    if path in LOCKED_SETTINGS:
+        return LOCKED_SETTINGS[path]
+    for prefix, why in LOCKED_PREFIXES.items():
+        if path.startswith(prefix):
+            return why
+    if path in DESKTOP_ONLY:
+        return "it only affects Kiro Crew's desktop dashboard"
+    return ""
+
+
+def dig(d, path: str):
+    cur = d
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return _MISSING
+        cur = cur[part]
+    return cur
+
+
+def _crew_pythons() -> list:
+    """Interpreters that may have kiro_crew installed (pipx venv, managed venv, the launcher's shebang)."""
+    cands = []
+    exe = shutil.which("kirocrew", path=ENV.get("PATH"))
+    if exe:
+        try:
+            first = open(exe, "rb").readline().decode(errors="replace").strip()
+        except OSError:
+            first = ""
+        if first.startswith("#!"):
+            parts = first[2:].split()
+            if parts and os.path.basename(parts[0]) == "env":
+                parts = parts[1:]
+            if parts and "python" in os.path.basename(parts[0]):
+                cands.append(parts[0])
+        cands += glob.glob(os.path.join(os.path.dirname(os.path.realpath(exe)), "python*"))
+    for pat in ("~/.kiro/crew-venv/bin/python3", "~/.local/pipx/venvs/kirocrew/bin/python3",
+                "~/.local/share/pipx/venvs/kirocrew/bin/python3"):
+        cands += glob.glob(os.path.expanduser(pat))
+    seen, out = set(), []
+    for c in cands:
+        if c not in seen and os.path.exists(c):
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def editable_spec() -> dict:
+    """Crew's own list of editable settings (with bounds), read from the installed package."""
+    if _SPEC["spec"] is not None:
+        return _SPEC["spec"]
+    for py in _crew_pythons():
+        try:
+            r = subprocess.run([py, "-c", _SPEC_DUMP], env=ENV, capture_output=True, text=True, timeout=90)
+            line = next((ln for ln in (r.stdout or "").splitlines() if ln.startswith("PANDA_SPEC ")), "")
+            if line:
+                _SPEC.update(spec=json.loads(line[11:]), live=True)
+                return _SPEC["spec"]
+        except Exception as exc:
+            log("settings spec read failed:", type(exc).__name__)
+    _SPEC.update(spec=dict(FALLBACK_EDITABLE), live=False)
+    return _SPEC["spec"]
+
+
+def crew_settings(gw: Gateway) -> dict:
+    """Every Kiro Crew setting (schema + current value), marked with how the app may change it."""
+    schema = gw.call("GET", "/api/config/schema", timeout=90)
+    entries = schema.get("entries") if isinstance(schema, dict) else schema
+    cfg = gw.call("GET", "/api/config/kirocrew", timeout=60)
+    spec = editable_spec()
+    items = []
+    for e in entries or []:
+        if not isinstance(e, dict) or e.get("hasChildren") or e.get("deprecated") or not e.get("path"):
+            continue
+        path = str(e["path"])
+        it = {"p": path, "t": e.get("type") or "", "l": str(e.get("label") or path)[:120]}
+        h = str(e.get("help") or "").strip()
+        if h:
+            it["h"] = h if len(h) <= 320 else h[:317].rstrip() + "…"
+        if e.get("enumValues"):
+            it["e"] = list(e["enumValues"])[:60]
+        if e.get("defaultValue") is not None and not e.get("sensitive"):
+            it["d"] = e["defaultValue"]
+        val = dig(cfg, path)
+        if val is not _MISSING:
+            it["v"] = val
+        if e.get("requiresRestart"):
+            it["r"] = 1
+        if e.get("sensitive"):
+            it["s"] = 1
+        why = locked_reason(path)
+        dash = path.startswith("dashboard.") and path[10:] in DASH_KEYS
+        if why:
+            it["k"] = why
+        elif path in spec or _APP_MODEL_PATH.match(path):
+            it["w"] = "patch"
+            it["x"] = spec.get(path) or {"type": "str", "max_len": 64}
+        elif dash:
+            it["w"] = "dash"
+        items.append(it)
+    backend = dig(cfg, "agent.acp_backend")
+    return {"items": items, "version": CREW_VERSION["v"], "backend": backend if isinstance(backend, str) else "",
+            "spec": "live" if _SPEC["live"] else "builtin", "at": now_iso()}
+
+
+def crew_set(gw: Gateway, path: str, value) -> dict:
+    """Change one Kiro Crew setting the way Crew's own Settings page does."""
+    why = locked_reason(path)
+    if why:
+        raise ValueError(f"This setting can't be changed from Panda: {why}.")
+    if path.startswith("dashboard.") and path[10:] in DASH_KEYS:
+        gw.call("PUT", "/api/dashboard/config", {path[10:]: value})
+        return {"ok": True, "path": path, "value": value}
+    r = gw.call("PATCH", "/api/config/kirocrew", {"path": path, "value": value})
+    stored = dig(r, path) if isinstance(r, dict) else _MISSING
+    out = {"ok": True, "path": path, "value": value if stored is _MISSING else stored}
+    if isinstance(r, dict) and r.get("clamp_notice"):
+        out["clamp"] = r["clamp_notice"]
+    return out
+
+
+def apply_overrides(gw: Gateway, overrides) -> None:
+    """Settings changed in the app are kept in Supabase too, so they survive a lost snapshot."""
+    if not isinstance(overrides, dict):
+        return
+    done = 0
+    for path, value in overrides.items():
+        try:
+            crew_set(gw, str(path), value)
+            done += 1
+        except Exception as exc:
+            log(f"setting {path} not re-applied:", str(exc)[:120])
+    if done:
+        log(f"re-applied {done} Kiro Crew setting(s) from the app")
+
+
+def crew_commands(gw: Gateway) -> dict:
+    cmds = []
+    try:
+        data = gw.call("GET", "/api/slash-commands")
+        cmds = [{"name": str(c["name"]), "description": str(c.get("description") or "")}
+                for c in (data if isinstance(data, list) else []) if isinstance(c, dict) and c.get("name")]
+    except Exception as exc:
+        log("slash commands read failed:", exc)
+    backend = ""
+    with contextlib.suppress(Exception):
+        b = dig(gw.call("GET", "/api/config/kirocrew"), "agent.acp_backend")
+        backend = b if isinstance(b, str) else ""
+    return {"commands": cmds, "backend": backend, "version": CREW_VERSION["v"]}
+
+
+# ── credit usage ─────────────────────────────────────────────────────────────
+SESSION_INFO: dict = {}      # worker_sessions.info of this run; always written whole
+USAGE_STATE = {"at": 0.0, "poke": False, "sid": ""}
+
+
+def _reason(exc) -> str:
+    return scrub(exc)[:200]
+
+
+def refresh_usage(sb: Supabase, gw: Gateway, force: bool = False) -> dict | None:
+    """Kiro account credits (used / plan / reset date) and this gateway's credits per day.
+
+    Stored in worker_sessions.info.usage, so the app can show the last known numbers even when
+    Panda is offline. Refreshed every 5 minutes, a minute after a reply, or when the app asks.
+    """
+    now = time.time()
+    gap = 60 if USAGE_STATE["poke"] else 300
+    if not force and now - USAGE_STATE["at"] < gap:
+        return None
+    USAGE_STATE.update(at=now, poke=False)
+    account: dict = {}
+    try:
+        d = gw.call("GET", "/api/sessions/usage", timeout=30)
+        account = (d.get("usage") if isinstance(d, dict) else None) or {}
+        if not account:
+            USAGE_STATE["at"] = now - 240  # Crew fills its cache in the background: look again in a minute
+    except Exception as exc:
+        account = {"available": False, "reason": _reason(exc)}
+    daily: list = []
+    try:
+        k = gw.call("GET", "/api/usage/kiro", timeout=45)
+        for row in ((k.get("sessions") or {}).get("daily_history") or [])[-35:]:
+            if isinstance(row, dict) and row.get("date"):
+                daily.append({"date": str(row["date"]), "credits": round(float(row.get("credits") or 0), 4),
+                              "messages": int(row.get("messages") or 0)})
+        billing = k.get("billing") or {}
+        if billing and not account.get("credits_plan"):
+            account = {**account, **billing}
+    except Exception:
+        pass
+    usage = {"account": account, "daily": daily, "at": now_iso()}
+    SESSION_INFO["usage"] = usage
+    if USAGE_STATE["sid"]:
+        try:
+            sb.rest("PATCH", "worker_sessions", params={"id": f"eq.{USAGE_STATE['sid']}"}, body={"info": SESSION_INFO})
+        except Exception as exc:
+            log("usage save failed:", type(exc).__name__)
+    return usage
+
+
+def usage_now(sb: Supabase, gw: Gateway, refresh: bool) -> dict:
+    if refresh:
+        with contextlib.suppress(Exception):  # 409 = Crew is already refreshing
+            gw.call("POST", "/api/sessions/usage/refresh", {}, timeout=90)
+    return refresh_usage(sb, gw, force=True) or SESSION_INFO.get("usage") or {}
+
+
+# ── side chat: a quick question that doesn't interrupt the running answer ────
+def side_ask(sb: Supabase, gw: Gateway, chat_id: str, question: str, timeout: float = 180) -> dict:
+    rows = sb.rest("GET", "chats", params={"id": f"eq.{chat_id}", "owner": f"eq.{OWNER}", "select": "*"})
+    if not rows:
+        raise ValueError("chat not found")
+    question = question.strip()[:4000]
+    if not question:
+        raise ValueError("ask a question after /btw")
+    slot, _ = ensure_slot(sb, gw, rows[0], user_settings(sb, OWNER))
+    gw.call("POST", f"/api/chat/slots/{slot}/side/open", {})
+    r = gw.call("POST", f"/api/chat/slots/{slot}/side/turn", {"question": question})
+    run_id = r.get("run_id") or ""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(1.2)
+        st = gw.call("GET", f"/api/chat/slots/{slot}/side")
+        msgs = [m for m in (st.get("messages") or []) if isinstance(m, dict)]
+        if not run_id:  # it was queued behind another side question: find the run it got
+            mine = [m for m in msgs if m.get("role") == "user" and (m.get("content") or "").strip() == question]
+            run_id = (mine[-1].get("run_id") or "") if mine else ""
+            continue
+        answer = [m for m in msgs if m.get("run_id") == run_id and m.get("role") == "assistant"]
+        if answer and not st.get("running"):
+            text = "\n\n".join(_row_text(m) for m in answer if _row_text(m))
+            return {"answer": scrub(_ANSI.sub("", text)), "error": any(m.get("is_error") for m in answer)}
+        if not st.get("running") and not answer and time.time() - t0 > 8:
+            return {"answer": "", "error": True, "note": "The side chat ended without an answer."}
+    return {"answer": "", "error": True, "note": "No answer yet. Try again in a moment."}
+
+
+def _safe(fn, *a):
+    try:
+        return fn(*a)
+    except Exception as exc:
+        log(f"{getattr(fn, '__name__', 'task')} failed:", _reason(exc))
+        return None
+
+
+# ── terminal: a persistent shell on the worker the owner can type into ───────
+# Owner-only (run_command checks the row's owner). It is the owner's own Kaggle machine, the same
+# shell the agent already uses; every line is scrubbed of known secrets. One shell, kept across
+# commands so cwd and variables persist. A command that runs past its timeout resets the shell.
+class Terminal:
+    MARK = "\x1e__panda_end_"
+
+    def __init__(self):
+        self.proc = None
+        self.lock = threading.Lock()
+        self.buf = bytearray()
+        self.buf_lock = threading.Lock()
+        self.cwd = os.path.expanduser("~")
+
+    def _spawn(self):
+        env = dict(ENV, PS1="", PS2="", TERM="dumb", PAGER="cat", GIT_PAGER="cat", DEBIAN_FRONTEND="noninteractive",
+                   HOME=HOME)
+        self.proc = subprocess.Popen(["bash", "--noprofile", "--norc"], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     cwd=os.path.expanduser("~"), env=env, bufsize=0)
+        self.cwd = os.path.expanduser("~")
+        with self.buf_lock:
+            self.buf = bytearray()
+        threading.Thread(target=self._drain, args=(self.proc,), daemon=True).start()
+
+    def _drain(self, proc):
+        try:
+            while True:
+                chunk = proc.stdout.read(4096)
+                if not chunk:
+                    break
+                with self.buf_lock:
+                    self.buf.extend(chunk)
+        except Exception:
+            pass
+
+    def run(self, command: str, timeout: int = 60) -> dict:
+        command = str(command)
+        if len(command) > 20000:
+            raise ValueError("command too long")
+        with self.lock:
+            if not (self.proc and self.proc.poll() is None):
+                self._spawn()
+            mark = f"{self.MARK}{uuid.uuid4().hex}"
+            mb = mark.encode()
+            script = f"{command}\nprintf '%s%s:%s\\n' {shlex.quote(mark)} \"$?\" \"$PWD\"\n"
+            try:
+                self.proc.stdin.write(script.encode())
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self._spawn()
+                return {"output": "(the terminal was reset)", "rc": None, "cwd": self.cwd, "reset": True}
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                with self.buf_lock:
+                    data = bytes(self.buf)
+                idx = data.find(mb)
+                if idx != -1:
+                    nl = data.find(b"\n", idx)
+                    if nl != -1:
+                        tail = data[idx + len(mb):nl].decode(errors="replace")
+                        rc, _, cwd = tail.partition(":")
+                        self.cwd = cwd or self.cwd
+                        with self.buf_lock:
+                            del self.buf[:]
+                        return {"output": scrub(data[:idx].decode(errors="replace"))[-40000:],
+                                "rc": int(rc) if rc.lstrip("-").isdigit() else None, "cwd": self.cwd}
+                if self.proc.poll() is not None:
+                    return {"output": scrub(data.decode(errors="replace"))[-40000:], "rc": None, "cwd": self.cwd, "reset": True}
+                time.sleep(0.1)
+            with self.buf_lock:
+                data = bytes(self.buf)
+            with contextlib.suppress(Exception):
+                self.proc.kill()
+            self._spawn()
+            return {"output": scrub(data.decode(errors="replace"))[-40000:] + f"\n⏱ stopped after {timeout}s — the terminal was reset.",
+                    "rc": None, "cwd": self.cwd, "timeout": True}
+
+
+TERMINAL = Terminal()
+
+
+def terminal_run(args: dict) -> dict:
+    out = TERMINAL.run(args.get("input", ""), timeout=max(2, min(120, int(args.get("timeout") or 60))))
+    out["home"] = HOME
+    return out
+
+
+# ── disk browser: read-only look at the worker's files (like Kiro Crew's) ────
+# Everything stays under the home folder; files that may hold secrets can be listed but not opened,
+# and all output is scrubbed.
+_FS_DENY = re.compile(r"(\.env|secrets\.env|\.enc|\.key|\.pem|id_rsa|drive\.json|browser\.json|\.sqlite\d?|\.db)$", re.I)
+_FS_HIDE_DIRS = {".git", "node_modules", "__pycache__", ".cache"}
+
+
+def _fs_safe(path) -> str:
+    p = os.path.abspath(os.path.expanduser(str(path or HOME)))
+    if p != HOME and not p.startswith(HOME + os.sep):
+        raise ValueError("outside the home folder")
+    return p
+
+
+def _fs_rel(p: str) -> str:
+    rel = os.path.relpath(p, HOME)
+    return "~" if rel == "." else "~/" + rel
+
+
+def fs_list(path) -> dict:
+    p = _fs_safe(path)
+    if not os.path.isdir(p):
+        raise ValueError("not a folder")
+    entries = []
+    for name in os.listdir(p):
+        full = os.path.join(p, name)
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        is_dir = os.path.isdir(full)
+        entries.append({"name": name, "dir": is_dir, "size": 0 if is_dir else st.st_size, "mtime": st.st_mtime,
+                        "sensitive": bool(_FS_DENY.search(name))})
+    entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
+    quick = [d for d in ("outputs", "work", "projects", "uploads", ".kiro/crew") if os.path.isdir(os.path.join(HOME, d))]
+    return {"path": p, "rel": _fs_rel(p), "home": HOME,
+            "parent": os.path.dirname(p) if (p != HOME and p.startswith(HOME + os.sep)) else None,
+            "quick": quick, "entries": entries[:2000]}
+
+
+def fs_read(path) -> dict:
+    p = _fs_safe(path)
+    if not os.path.isfile(p):
+        raise ValueError("not a file")
+    base = {"path": p, "rel": _fs_rel(p), "name": os.path.basename(p)}
+    if _FS_DENY.search(os.path.basename(p)):
+        return {**base, "denied": "This file may hold secrets, so it can't be opened here."}
+    size = os.path.getsize(p)
+    base["size"] = size
+    if size > 512 * 1024:
+        return {**base, "too_big": True}
+    with open(p, "rb") as f:
+        raw = f.read()
+    try:
+        return {**base, "text": scrub(raw.decode("utf-8"))}
+    except UnicodeDecodeError:
+        return {**base, "binary": True}
+
+
+# ── commands relay: the app talks to Crew through here ───────────────────────
+# A security boundary. The app may only reach these gateway routes. Reads are broad; writes are
+# limited to what the app's pages use, and setting changes go through the rules above.
+_RELAY_READ = re.compile(
     r"^/api/(skills|mcp|mcp-gateway|crons|lessons|models|effort-levels|notifications|memory|knowledge|"
-    r"artifacts|agents|workspaces|spawn|subagents|tasks|config|status|system)(/|\?|$)")
+    r"artifacts|agents|workspaces|spawn|subagents|tasks|config|status|system|slash-commands|sessions/usage|"
+    r"usage|acp-backends|dashboard/config|workflows|prompts)(/|\?|$)")
+_RELAY_WRITE = [
+    ({"POST", "PUT", "PATCH", "DELETE"}, re.compile(r"^/api/(skills|mcp|mcp-gateway|crons)(/|\?|$)")),
+    ({"POST"}, re.compile(r"^/api/notifications/ack$")),
+    ({"POST"}, re.compile(r"^/api/sessions/usage/refresh$")),
+    ({"PATCH"}, re.compile(r"^/api/config/kirocrew$")),
+    ({"PUT"}, re.compile(r"^/api/dashboard/config$")),
+]
+
+
+def relay_check(method: str, path: str, body) -> None:
+    """Raise unless the app may call this gateway route."""
+    if method not in ("GET", "POST", "PUT", "PATCH", "DELETE") or ".." in path or "\\" in path or "//" in path:
+        raise ValueError(f"not allowed: {method} {path}")
+    if method == "GET":
+        if not _RELAY_READ.match(path):
+            raise ValueError(f"not allowed: {method} {path}")
+        return
+    if not any(method in methods and rx.match(path) for methods, rx in _RELAY_WRITE):
+        raise ValueError(f"not allowed: {method} {path}")
+    if path == "/api/config/kirocrew":
+        target = str((body or {}).get("path", "")) if isinstance(body, dict) else ""
+        why = locked_reason(target)
+        if not target or why:
+            raise ValueError(f"not allowed from the app: {target or 'no path'}" + (f" ({why})" if why else ""))
+    if path == "/api/dashboard/config":
+        extra = set(body or {}) - DASH_KEYS if isinstance(body, dict) else {"body"}
+        if extra:
+            raise ValueError("not allowed from the app: " + ", ".join(sorted(map(str, extra))))
 
 
 def run_command(sb: Supabase, gw: Gateway, cmd: dict):
     op, args = cmd["op"], cmd.get("args") or {}
     try:
+        if cmd.get("owner") != OWNER:
+            raise PermissionError("this Panda is serving another account")
         if op == "gw":
             method = str(args.get("method", "GET")).upper()
             path = str(args.get("path", ""))
-            if method not in ("GET", "POST", "PUT", "PATCH", "DELETE") or not GW_ALLOWED.match(path) or ".." in path:
-                raise ValueError(f"not allowed: {method} {path}")
+            relay_check(method, path, args.get("body"))
             result = gw.call(method, path, args.get("body"), timeout=120)
+        elif op == "crew.commands":
+            result = crew_commands(gw)
+        elif op == "crew.settings":
+            result = crew_settings(gw)
+        elif op == "crew.set":
+            result = crew_set(gw, str(args.get("path", "")), args.get("value"))
+        elif op == "usage":
+            result = usage_now(sb, gw, bool(args.get("refresh")))
+        elif op == "side":
+            result = side_ask(sb, gw, str(args.get("chat_id", "")), str(args.get("question", "")))
+        elif op == "term":
+            result = terminal_run(args)
+        elif op == "fs.list":
+            result = fs_list(args.get("path"))
+        elif op == "fs.read":
+            result = fs_read(args.get("path"))
         elif op == "secrets.sync":
             result = {"names": sync_secrets(sb)}
         elif op == "browser.forget":
             result = browser_forget(sb)
         elif op == "ping":
-            result = {"ok": True, "uptime_secs": round(time.time() - T0)}
+            result = {"ok": True, "uptime_secs": round(time.time() - T0), "crew": CREW_VERSION["v"]}
         else:
             raise ValueError(f"unknown op {op}")
         sb.rest("PATCH", "commands", params={"id": f"eq.{cmd['id']}"},
@@ -996,19 +1756,37 @@ def run_command(sb: Supabase, gw: Gateway, cmd: dict):
                 body={"status": "error", "result": {"error": scrub(exc)[:500]}})
 
 
+# Requests the app makes while Panda is offline time out in the app after a minute; running them
+# hours later (on the next Start) would surprise the user, so they expire. These two are meant to
+# wait for the next start, and are safe to run late.
+RUN_LATE_OPS = ("browser.forget", "secrets.sync")
+CMD_POOL = ThreadPoolExecutor(max_workers=4)
+
+
 def command_loop(sb: Supabase, gw: Gateway, stop: threading.Event):
+    last_expire = 0.0
     while not stop.is_set():
+        if time.time() - last_expire > 30:
+            last_expire = time.time()
+            try:
+                cutoff = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat()
+                sb.rest("PATCH", "commands", params={
+                    "status": "eq.pending", "owner": f"eq.{OWNER}", "created_at": f"lt.{cutoff}",
+                    "op": "not.in.(" + ",".join(f'"{o}"' for o in RUN_LATE_OPS) + ")"},
+                    body={"status": "error", "result": {"error": "expired: Panda was offline"}})
+            except Exception as exc:
+                log("command expiry:", str(exc)[:160])
         try:
-            rows = sb.rest("GET", "commands", params={"status": "eq.pending", "order": "id.asc",
-                                                       "limit": "5", "select": "*"}) or []
+            rows = sb.rest("GET", "commands", params={"status": "eq.pending", "owner": f"eq.{OWNER}",
+                                                       "order": "id.asc", "limit": "8", "select": "*"}) or []
             for c in rows:
                 got = sb.rest("PATCH", "commands", prefer="return=representation",
                               params={"id": f"eq.{c['id']}", "status": "eq.pending"}, body={"status": "running"})
                 if got:
-                    run_command(sb, gw, got[0])
+                    CMD_POOL.submit(run_command, sb, gw, got[0])
         except Exception as exc:
             log("command loop:", exc)
-        stop.wait(1.5)
+        stop.wait(1.0)
 
 
 def mirror_notifications(sb: Supabase, gw: Gateway, seen: set):
@@ -1073,6 +1851,7 @@ def main():
         if sb.download("config/prompt.md", f"{HOME}/.kiro/crew/prompt.md"):
             log("system prompt: custom (from storage)")
         os.makedirs(OUTPUTS, exist_ok=True)
+        os.makedirs(WORKDIR, exist_ok=True)
         install_skills(sb)
         setup_drive()
         try:
@@ -1085,13 +1864,19 @@ def main():
         start_browser(sb)
         gw_proc = start_gateway()
         gw = Gateway()
+        # Kiro Crew settings changed in the app, re-applied in case the snapshot predates them.
+        apply_overrides(gw, user_settings(sb, OWNER).get("crewOverrides"))
         stop_evt = threading.Event()
         threading.Thread(target=command_loop, args=(sb, gw, stop_evt), daemon=True).start()
         threading.Thread(target=thinking_listener, args=(gw, stop_evt), daemon=True).start()
         threading.Thread(target=thinking_pusher, args=(sb, stop_evt), daemon=True).start()
         pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL_CHATS)
-        set_sess(status="running", heartbeat_at=now_iso(),
-                 info={"restored": restored, "startup_secs": round(time.time() - T0)})
+        SESSION_INFO.update(restored=restored, startup_secs=round(time.time() - T0), crew=CREW_VERSION["v"])
+        set_sess(status="running", heartbeat_at=now_iso(), info=SESSION_INFO)
+        USAGE_STATE["sid"] = sid
+        # Warm the Kiro account total now (a forced scrape can take ~a minute), so the app shows a
+        # real number instead of 0 as soon as it opens, not after Crew's 10-minute cache fills.
+        threading.Thread(target=lambda: _safe(usage_now, sb, gw, True), daemon=True).start()
         log("running; waiting for messages")
 
         seen: set = set()
@@ -1119,6 +1904,10 @@ def main():
                     browser_backup(sb)
                 except Exception as exc:
                     log("browser sync:", type(exc).__name__)
+                try:
+                    refresh_usage(sb, gw)
+                except Exception as exc:
+                    log("usage refresh:", type(exc).__name__)
                 last_nt = time.time()
             if time.time() - last_snap > SNAPSHOT_EVERY:
                 set_sess(last_snapshot=snapshot(sb, "periodic"))
@@ -1135,14 +1924,14 @@ def main():
         stop_browser(sb)
         set_sess(status="stopping")
         snap_at = snapshot(sb, reason)
-        set_sess(status="stopped", stopped_at=now_iso(), last_snapshot=snap_at,
-                 info={"restored": restored, "stop_reason": reason,
-                       "runtime_secs": round(time.time() - T0)})
+        SESSION_INFO.update(stop_reason=reason, runtime_secs=round(time.time() - T0))
+        set_sess(status="stopped", stopped_at=now_iso(), last_snapshot=snap_at, info=SESSION_INFO)
     except Exception as exc:
         log("FATAL:", exc)
         log(traceback.format_exc()[-1500:])
         try:
-            set_sess(status="error", stopped_at=now_iso(), info={"error": scrub(exc)[:500]})
+            SESSION_INFO["error"] = scrub(exc)[:500]
+            set_sess(status="error", stopped_at=now_iso(), info=SESSION_INFO)
         except Exception:
             pass
         raise

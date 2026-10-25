@@ -20,6 +20,14 @@ export type Chat = {
   updated_at: string;
 };
 
+/** Kiro Crew's per-turn numbers (`meta.turn_stats` on its reply row), copied by the worker. */
+export type TurnStats = { elapsed_ms?: number; ttft_ms?: number; model?: string; credits?: number; retries?: number };
+
+/** The browser's last screen of a turn, kept in Storage (panda-files) by the worker. */
+export type BrowserShot = { url?: string; title?: string; shot?: string; w?: number; h?: number; at?: string };
+
+export type ContextUsage = { pct?: number; used_tokens?: number; window_tokens?: number; reset?: boolean };
+
 export type Message = {
   id: number;
   chat_id: string;
@@ -35,15 +43,46 @@ export type Message = {
     model?: string;
     effort?: string;
     tools?: string[];
-    usage?: { pct?: number; used_tokens?: number; window_tokens?: number } | null;
+    usage?: ContextUsage | null;
     secs?: number;
     kind?: string;
     error?: string;
     timed_out?: boolean;
     files?: string[];
     attachments?: import("./files").Attachment[];
+    /** Kiro credits this reply used (Kiro Crew's meteringUsage for the turn). */
+    credits?: number;
+    turn_stats?: TurnStats;
+    /** The slash command this message is, or answers ("/compact"). */
+    command?: string;
+    browser?: BrowserShot;
+    replayed?: boolean;
   };
   created_at: string;
+};
+
+/** Kiro account usage as Kiro Crew reports it (GET /api/sessions/usage). */
+export type AccountUsage = {
+  credits_used?: number;
+  credits_plan?: number;
+  credits_overage?: number;
+  percentage?: number;
+  plan?: string;
+  resets?: string;
+  overage_rate?: number;
+  cost_usd?: number;
+  bonus_credits?: { name: string; used: number; total: number; days_left?: number }[];
+  available?: boolean;
+  reason?: string;
+  stale?: boolean;
+  source?: string;
+};
+
+export type UsageInfo = {
+  account?: AccountUsage;
+  /** Credits per day on the gateway (all activity, background work included). */
+  daily?: { date: string; credits: number; messages?: number }[];
+  at?: string;
 };
 
 export type WorkerSession = {
@@ -53,7 +92,7 @@ export type WorkerSession = {
   started_at: string;
   heartbeat_at: string | null;
   stopped_at: string | null;
-  info: Record<string, unknown>;
+  info: { usage?: UsageInfo; crew?: string; [k: string]: unknown };
 };
 
 export type Notification = {
