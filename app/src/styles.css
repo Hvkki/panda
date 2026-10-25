@@ -250,6 +250,11 @@ select { padding: 8px 30px 8px 11px; border-radius: 10px; border: 1px solid var(
   .panda .pd-speed path, .panda-haiku.panda-working .pd-float { animation: none !important; }
 }
 
+/* A quiet moment mid-reply (a tool running, the model thinking): a small live line under the text. */
+.live-status { display: inline-flex; align-items: center; gap: 7px; margin-top: 10px; padding: 5px 11px 5px 9px; border-radius: 999px;
+  font-size: .84em; color: var(--text-2); background: var(--bg-2); border: 1px solid var(--line); animation: rise .25s var(--ease); }
+.live-status svg { color: var(--accent); }
+
 /* Smooth streaming: a soft caret at the end of the text while the reply is still arriving. */
 .prose.streaming > :last-child::after { content: ""; display: inline-block; width: .5em; height: .5em; margin-left: .25em;
   border-radius: 50%; background: var(--accent); vertical-align: .05em; animation: stream-caret 1s ease-in-out infinite; }

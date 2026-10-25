@@ -40,6 +40,22 @@ function useJustFinished(live: boolean, ok: boolean) {
   return hop;
 }
 
+/** When `key` last changed (ms), plus a clock that ticks each second while `live`. */
+function useChangedAt(key: string | number, live: boolean): [number, number] {
+  const [at, setAt] = useState(() => Date.now());
+  const [prev, setPrev] = useState(key);
+  if (prev !== key) { setPrev(key); setAt(Date.now()); }
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!live) return;
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [live]);
+  return [at, Math.max(now, at)];
+}
+
+const secsLabel = (ms: number) => (ms >= 3000 ? ` · ${Math.round(ms / 1000)}s` : "");
+
 const OPTIONS_RE = /\[OPTIONS:\s*([^\]]+)\]\s*$/;
 
 function splitOptions(text: string): [string, string[]] {
@@ -215,6 +231,11 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
   const hop = useJustFinished(live, m.status === "done");
   // Smooth the half-second jumps of the stream into a steady flow (history renders at once).
   const smooth = useSmoothText(m.role === "assistant" ? m.content || "" : "", live);
+  // Quiet stretches (a long tool call, thinking before the first word) still show signs of life.
+  const toolCount = (m.meta?.tools || []).length;
+  const [textAt, now] = useChangedAt((m.content || "").length, live);
+  const [toolAt] = useChangedAt(toolCount, live);
+  const [startAt] = useChangedAt(m.id, live);
 
   const { online } = useBrowser();
   if (m.role === "tool") return m.meta.kind === "approval" ? <ApprovalCard m={m} /> : null;
@@ -246,6 +267,11 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
   const tools = (m.meta.tools || []).filter(Boolean);
   const showThinking = settings.showThinking && !!m.thinking;
   const credits = typeof m.meta.credits === "number" ? m.meta.credits : m.meta.turn_stats?.credits;
+  const caughtUp = smooth.text.length >= (m.content || "").length - 16;
+  const quietFor = now - Math.max(textAt, toolAt);
+  const lastStep = tools.length ? describeStep(tools[tools.length - 1]) : null;
+  const showStatus = live && !!body && caughtUp && quietFor >= 1500 && m.status !== "waiting";
+  const statusLabel = lastStep && toolAt > textAt ? lastStep.label : t("thinking");
   const showBrowser = !!m.meta.browser || (isLast && online && usedBrowser(tools));
   return (
     <div className={`msg assistant ${cmd ? "is-command" : ""}`}>
@@ -262,9 +288,16 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
           live && !tools.length && !showThinking ? (
             <div className="activity live"><div className="step current">
               <span className="step-icon"><IconSpinner size={15} /></span>
-              <span className="step-label shimmer">{m.status === "waiting" ? "Waiting for your approval" : t("thinking")}</span>
+              <span className="step-label shimmer">{m.status === "waiting" ? "Waiting for your approval" : t("thinking")}{secsLabel(now - startAt)}</span>
             </div></div>
           ) : null}
+        {showStatus && (
+          <div className="live-status" role="status">
+            <IconSpinner size={13} />
+            {lastStep && toolAt > textAt && <span className="step-glyph">{lastStep.icon}</span>}
+            <span className="shimmer">{statusLabel}{secsLabel(quietFor)}</span>
+          </div>
+        )}
         {showBrowser && <BrowserCard latest={isLast} shot={m.meta.browser} />}
         {!live && <MessageFiles messageId={m.id} ids={m.meta.files} />}
         {m.status === "error" && (

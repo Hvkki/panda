@@ -1188,11 +1188,49 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
     reply = sb.rest("POST", "messages", prefer="return=representation",
                     body={"chat_id": chat["id"], "owner": chat["owner"], "role": "assistant",
                           "status": "streaming", "reply_to": msg["id"], "meta": base_meta})[0]
-    text, thinking, tools, usage, last_push, t0 = "", "", [], None, 0.0, time.time()
+    text, thinking, tools, usage, t0 = "", "", [], None, time.time()
     with THINK_LOCK:
         THINK[slot], THINK_REPLY[slot], THINK_SENT[slot] = "", reply["id"], 0
     meta = lambda: {**base_meta, "replayed": needs_replay,
                     "tools": tools[-30:], "usage": usage, "secs": round(time.time() - t0, 1)}
+    # Pushes run on a small background thread too, so a quiet stretch (a long tool call, the model
+    # thinking before its first token) still delivers the last text and thinking instead of holding
+    # them until the next stream event. The main loop only marks the state dirty.
+    push_lock, stream_done, cancelled = threading.Lock(), threading.Event(), threading.Event()
+    state = {"dirty": False, "last": 0.0}
+
+    def push_now():
+        nonlocal thinking
+        with push_lock:
+            with THINK_LOCK:
+                thinking = THINK.get(slot, "")
+            if not (text or thinking or tools) or cancelled.is_set():
+                return
+            state["dirty"], state["last"] = False, time.time()
+            row = sb.rest("PATCH", "messages", params={"id": f"eq.{reply['id']}"}, prefer="return=representation",
+                          body={"content": scrub(text), "thinking": scrub(thinking), "meta": meta()})
+            if row and row[0].get("cancel") and not cancelled.is_set():  # "Stop generating" pressed in the app
+                cancelled.set()
+                try:
+                    gw.call("POST", f"/api/chat/slots/{slot}/stop")
+                except Exception as exc:
+                    log("stop call failed:", exc)
+
+    def flusher():
+        seen_think = 0
+        while not stream_done.wait(0.4):
+            with THINK_LOCK:
+                n = len(THINK.get(slot, ""))
+            if n != seen_think:
+                seen_think, state["dirty"] = n, True
+            if state["dirty"] and time.time() - state["last"] >= 0.4:
+                try:
+                    push_now()
+                except Exception as exc:
+                    log("stream push failed:", type(exc).__name__)
+
+    seg_break = False  # a tool ran since the last text: the next text starts a new paragraph
+    threading.Thread(target=flusher, daemon=True).start()
     try:
         for c in gw.stream_chat(slot, prompt):
             if not isinstance(c, dict):
@@ -1205,7 +1243,8 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                 step = clean_step(c.get("content"))
                 if step and (not tools or tools[-1] != step):
                     tools.append(step)
-                last_push = 0.0  # show the new step in the app right away
+                seg_break = bool(text)
+                state["last"] = 0.0  # show the new step in the app right away
             elif kind == "context_usage":
                 try:
                     usage = json.loads(c.get("content") or "{}")
@@ -1217,23 +1256,24 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                 with THINK_LOCK:
                     THINK[slot] = THINK.get(slot, "") + (c.get("content") or c.get("text") or "")
             elif kind == "chunk":
-                text += chunk_text(c)
+                piece = chunk_text(c)
+                if piece and seg_break:
+                    # Text before and after a tool call arrives with no separator ("I'll check.Done.").
+                    if not text.endswith(("\n", " ")) and not piece.startswith(("\n", " ")):
+                        piece = "\n\n" + piece
+                    seg_break = False
+                text += piece
             elif kind == "assistant" and c.get("content"):
                 text = c["content"] if len(c["content"]) >= len(text) else text
-            with THINK_LOCK:
-                thinking = THINK.get(slot, "")
-            if time.time() - last_push > 0.5 and (text or thinking or tools):
-                row = sb.rest("PATCH", "messages", params={"id": f"eq.{reply['id']}"},
-                              prefer="return=representation",
-                              body={"content": scrub(text), "thinking": scrub(thinking), "meta": meta()})
-                last_push = time.time()
-                if row and row[0].get("cancel"):  # "Stop generating" pressed in the app
-                    try:
-                        gw.call("POST", f"/api/chat/slots/{slot}/stop")
-                    except Exception as exc:
-                        log("stop call failed:", exc)
-                    tools.append("stopped by you")
-                    break
+            state["dirty"] = True
+            if time.time() - state["last"] > 0.4:
+                push_now()
+            if cancelled.is_set():
+                tools.append("stopped by you")
+                break
+        stream_done.set()
+        with push_lock:  # wait out a push still in flight, so it cannot land after the final write
+            pass
         time.sleep(0.3)  # let the last thinking frames land
         with THINK_LOCK:
             thinking = THINK.get(slot, thinking)
@@ -1241,6 +1281,10 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
         res = turn_result(gw, slot, want_stats=not cmd)
         usage = context_usage(gw, slot, t0, usage)
         final = res["text"] or text
+        # Crew's history joins the segments of a turn with no separator; keep the streamed copy,
+        # which has the paragraph breaks, whenever it holds the same words.
+        if text and final != text and re.sub(r"\s+", "", final) == re.sub(r"\s+", "", text):
+            final = text
         if cmd:
             final = _ANSI.sub("", final)
         if not final.strip() and res["errors"]:
@@ -1268,6 +1312,9 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             push(sb, chat["owner"], f"Panda replied · {chat.get('title') or 'chat'}"[:60],
                  re.sub(r"[#*_`>\[\]]", "", final)[:180], f"./?c={chat['id']}")
     except Exception as exc:
+        stream_done.set()
+        with push_lock:
+            pass
         with THINK_LOCK:
             THINK_REPLY.pop(slot, None)
         err = scrub(exc)[:500]

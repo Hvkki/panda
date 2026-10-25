@@ -114,7 +114,9 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
     }
     return { credits, replies };
   }, [messages]);
-  const context = [...messages].reverse().find((m) => m.role === "assistant" && m.meta?.usage && typeof m.meta.usage.pct === "number")?.meta.usage;
+  // Always show the meter in a chat (0% until the first reading arrives after a reply).
+  const context = [...messages].reverse().find((m) => m.role === "assistant" && m.meta?.usage && typeof m.meta.usage.pct === "number")?.meta.usage
+    ?? { pct: 0, reset: true };
 
   return (
     <div className="chat">

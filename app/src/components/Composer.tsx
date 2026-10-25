@@ -50,17 +50,23 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
   const catalog = useMemo(() => buildCatalog(live), [live]);
 
   const addFiles = async (list: FileList | File[]) => {
+    // Copy the files first: the picker's FileList is emptied as soon as its input is reset, and a
+    // drop or paste list dies with its event, both before the session read below resolves.
+    const picked = Array.from(list).slice(0, 10);
+    if (!picked.length) return;
     const { data } = await supabase.auth.getSession();
     const owner = data.session?.user.id;
-    if (!owner) return;
-    for (const f of Array.from(list).slice(0, 10)) {
+    if (!owner) { setNotice("Sign in again to attach files."); return; }
+    for (const f of picked) {
       const temp = { path: `temp-${f.name}-${Date.now()}`, name: f.name, mime: f.type, size: f.size, uploading: true };
       setFiles((prev) => [...prev, temp]);
       try {
         const row = await uploadFile(owner, f, { kind: "upload" });
         setFiles((prev) => prev.map((x) => x.path === temp.path ? { path: row.path, name: row.name, mime: row.mime, size: row.size, file_id: row.id } : x));
       } catch (e) {
-        setFiles((prev) => prev.map((x) => x.path === temp.path ? { ...x, uploading: false, error: (e as Error).message } : x));
+        const why = (e as Error).message || "upload failed";
+        setFiles((prev) => prev.map((x) => x.path === temp.path ? { ...x, uploading: false, error: why } : x));
+        setNotice(`${f.name} was not attached: ${why}`);
       }
     }
   };
