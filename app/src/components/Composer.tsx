@@ -179,7 +179,9 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
     setListening(true);
   };
 
-  const pct = context && !context.reset && typeof context.pct === "number" ? Math.max(0, Math.min(100, context.pct)) : null;
+  // kiro-cli often reports only the percentage (reset: no token counts); the meter still shows it.
+  const pct = context && typeof context.pct === "number" && Number.isFinite(context.pct) ? Math.max(0, Math.min(100, context.pct)) : null;
+  const tokens = context && !context.reset && context.used_tokens && context.window_tokens;
 
   return (
     <div className={`composer ${matches.length ? "menu-open" : ""}`}
@@ -255,11 +257,13 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
                 <circle cx="10" cy="10" r="7.5" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"
                   strokeDasharray={`${(pct / 100) * 47.1} 47.1`} transform="rotate(-90 10 10)" />
               </svg>
+              <span className="ctx-pct">{Math.round(pct)}%</span>
             </button>
             {ctxOpen && (
               <div className="ctx-pop" onMouseLeave={() => setCtxOpen(false)}>
                 <div className="ctx-title">{t("context")} · {Math.round(pct)}%</div>
-                <div className="muted small">{fmtTokens(context?.used_tokens)} of {fmtTokens(context?.window_tokens)} tokens used by this chat.
+                <div className="muted small">{tokens ? <>{fmtTokens(context?.used_tokens)} of {fmtTokens(context?.window_tokens)} tokens used by this chat. </>
+                  : <>About {Math.round(pct)}% of the model's context window is used by this chat. </>}
                   Kiro Crew compacts it automatically when it gets full.</div>
                 <button className="btn small-btn" disabled={busy} onClick={() => { setCtxOpen(false); sendCrew(catalog.find((c) => c.name === "/compact")!, ""); }}>
                   Compact now</button>

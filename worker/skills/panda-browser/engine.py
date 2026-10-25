@@ -43,6 +43,14 @@ MIN_FRAME_GAP = 0.12     # max ~8 fps
 MAX_FRAME_B64 = 190_000  # Realtime free tier payload limit is ~250 KB
 BEST_QUALITY = 60
 CURSOR_LEAD = 0.35       # while someone watches, show where Panda will click before it clicks
+# Phones: a real mobile page (mobile layout, touch, mobile user agent) rendered at more than 1 device
+# pixel per CSS pixel, so text stays sharp when the picture is scaled up to the phone's screen.
+MOBILE_W = 400
+MOBILE_DPR = 1.5
+MOBILE_FRAME_GAP = 0.2   # sharp frames are bigger: at most ~5 a second
+HOME_URL = "https://www.google.com/"
+SEARCH_URL = "https://www.google.com/search?q="
+TLDS = ("com", "it", "org", "net", "io", "dev", "app", "co", "uk", "de", "fr", "es", "eu", "ua", "ru", "info", "me", "ai")
 
 # The focused element, so the app can offer the keyboard when the user tapped a text field.
 FOCUS_JS = """() => {
@@ -54,8 +62,10 @@ FOCUS_JS = """() => {
   const editable = el.isContentEditable || tag === 'textarea' || (tag === 'input' && !nonText.includes(type));
   if (!editable) return null;
   const label = el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('name') || '';
+  const r = el.getBoundingClientRect();
   return {kind: el.isContentEditable ? 'content' : tag === 'textarea' ? 'textarea' : (type || 'text'),
-          label: String(label).slice(0, 60), secret: type === 'password'};
+          label: String(label).slice(0, 60), secret: type === 'password',
+          y: Math.round(Math.min(1, Math.max(0, (r.top + r.height / 2) / (innerHeight || 1))) * 1000) / 1000};
 }"""
 
 ROLE_WORDS = {"link": "link", "button": "button", "textbox": "text field", "searchbox": "search box",
@@ -86,11 +96,17 @@ def url_ok(url: str) -> tuple[bool, str]:
 
 
 def normalize(url: str) -> str:
+    """An address, or Google search words. `google com` (a phone keyboard ate the dot) is google.com."""
     url = url.strip()
+    if not url:
+        return HOME_URL
     if re.match(r"^[a-z][a-z0-9+.-]*://", url, re.I):
         return url
+    m = re.match(r"^(?:www\s*\.?\s*)?([a-z0-9-]+)\s*[ ,]\s*(" + "|".join(TLDS) + r")(/\S*)?$", url, re.I)
+    if m:
+        return f"https://{m.group(1)}.{m.group(2).lower()}{m.group(3) or ''}"
     if " " in url or "." not in url:
-        return "https://duckduckgo.com/?q=" + urllib.parse.quote_plus(url)
+        return SEARCH_URL + urllib.parse.quote_plus(url)
     return "https://" + url
 
 
@@ -207,6 +223,9 @@ class Engine:
         self.ua_major = "140"
         self.closing = False
         self.view = (VIEW_W, VIEW_H)       # current page size in CSS px (phone viewers get a tall, narrow page)
+        self.mobile = False                # a phone is watching: real mobile page, touch taps
+        self.dpr = 1.0                     # device pixels per CSS pixel of the live picture
+        self.emu = None                    # CDP session of the current page for emulation and sharp captures
 
     # lifecycle ----------------------------------------------------------------
     async def start(self):
@@ -261,8 +280,7 @@ class Engine:
     async def _adopt(self, page):
         self.page = page
         self.focus = None
-        with contextlib.suppress(Exception):
-            await page.set_viewport_size({"width": self.view[0], "height": self.view[1]})
+        await self._emulate()
         page.on("dialog", lambda d: asyncio.create_task(d.accept() if d.type in ("alert", "beforeunload") else d.dismiss()))
         page.on("download", lambda d: asyncio.create_task(self._download(d)))
         page.on("close", lambda: asyncio.create_task(self._page_closed(page)))
@@ -388,12 +406,21 @@ class Engine:
         while True:
             await self.frame_evt.wait()
             self.frame_evt.clear()
-            gap = MIN_FRAME_GAP - (time.time() - last)
+            sharp = self.dpr > 1
+            gap = (MOBILE_FRAME_GAP if sharp else MIN_FRAME_GAP) - (time.time() - last)
             if gap > 0:
                 await asyncio.sleep(gap)
             data, self.latest = self.latest, None
             if not data or not self.viewer_active():
                 continue
+            if sharp:
+                # The screencast only says "the page changed"; the picture sent is a device-pixel capture.
+                data = await self._capture(self.quality) or data
+                if len(data) > MAX_FRAME_B64 and self.quality <= 35 and self.dpr > 1:
+                    self.dpr = max(1.0, round(self.dpr - 0.25, 2))  # still too big: fewer pixels
+                    self.quality = 50
+                    await self._emulate()
+                    continue
             if len(data) > MAX_FRAME_B64 and self.quality > 25:  # page too detailed: compress harder
                 self.quality -= 10
                 small = 0
@@ -412,9 +439,9 @@ class Engine:
         """One immediate frame (used when a viewer opens, or the page is idle)."""
         if not self.viewer_active():
             return
-        with contextlib.suppress(Exception):
-            png = await self.page.screenshot(type="jpeg", quality=self.quality, timeout=5000)
-            self.latest = base64.b64encode(png).decode()
+        data = await self._capture(self.quality)
+        if data:
+            self.latest = data
             self.frame_evt.set()
 
     async def push_status(self, force=False):
@@ -438,19 +465,94 @@ class Engine:
             await self.link.broadcast("status", st)
 
     async def fit(self, mode: str, vw: float, vh: float):
-        """Phone viewers get a narrow, tall page that fills their screen; desktops get 1024x720."""
-        if mode == "mobile" and vw > 50 and vh > 50:
-            w = 480
-            h = int(max(560, min(1000, w * vh / vw)))
+        """Phone viewers get a real mobile page shaped like their screen; desktops get 1024x720."""
+        mobile = mode == "mobile" and vw > 50 and vh > 50
+        if mobile:
+            w = MOBILE_W
+            h = int(max(560, min(1100, w * vh / vw)))
         else:
             w, h = VIEW_W, VIEW_H
-        if (w, h) == self.view:
+        if (w, h) == self.view and mobile == self.mobile:
             return
-        self.view = (w, h)
-        for pg in list(self.ctx.pages):
+        was_mobile = self.mobile
+        self.view, self.mobile = (w, h), mobile
+        if mobile != was_mobile:
+            self.dpr = MOBILE_DPR if mobile else 1.0
+        await self._emulate()
+        if mobile != was_mobile:  # the site serves a different layout to phones: load it again
             with contextlib.suppress(Exception):
-                await pg.set_viewport_size({"width": w, "height": h})
+                if self.page.url.startswith("http"):
+                    await self.page.reload(wait_until="domcontentloaded", timeout=15000)
         await self._restart_screencast()
+
+    def _ua(self) -> str:
+        if self.mobile:
+            return (f"Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) "
+                    f"Chrome/{self.ua_major}.0.0.0 Mobile Safari/537.36")
+        return f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{self.ua_major}.0.0.0 Safari/537.36"
+
+    async def _emulate(self):
+        """Apply the page shape to the current page: size, pixel density, mobile/touch, user agent.
+
+        Playwright's set_viewport_size keeps its own idea of the size in step; the CDP override after
+        it adds what Playwright can't change per page (density, mobile, touch, user agent).
+        """
+        page = self.page
+        if not page:
+            return
+        w, h = self.view
+        with contextlib.suppress(Exception):
+            await page.set_viewport_size({"width": w, "height": h})
+        try:
+            if not self.emu or getattr(self.emu, "_panda_page", None) is not page:
+                if self.emu:
+                    with contextlib.suppress(Exception):
+                        await self.emu.detach()
+                self.emu = await self.ctx.new_cdp_session(page)
+                self.emu._panda_page = page
+            # Density stays 1 here (Playwright's own session also sets it); sharpness comes from the
+            # capture scale in _capture, which re-rasterizes the visible area at self.dpr.
+            await self.emu.send("Emulation.setDeviceMetricsOverride", {
+                "width": w, "height": h, "deviceScaleFactor": 1, "mobile": self.mobile,
+                "screenWidth": w, "screenHeight": h})
+            await self.emu.send("Emulation.setTouchEmulationEnabled", {"enabled": self.mobile, "maxTouchPoints": 5})
+            brands = [{"brand": "Chromium", "version": self.ua_major}, {"brand": "Google Chrome", "version": self.ua_major},
+                      {"brand": "Not.A/Brand", "version": "99"}]
+            await self.emu.send("Emulation.setUserAgentOverride", {
+                "userAgent": self._ua(), "acceptLanguage": "en-US,en", "platform": "Linux armv8l" if self.mobile else "Linux x86_64",
+                "userAgentMetadata": {"brands": brands, "fullVersion": self.browser.version, "platform": "Android" if self.mobile else "Linux",
+                                      "platformVersion": "14.0.0" if self.mobile else "", "architecture": "" if self.mobile else "x86",
+                                      "model": "Pixel 8" if self.mobile else "", "mobile": self.mobile}})
+        except Exception as exc:
+            log("emulation failed:", str(exc)[:120])
+            self.emu = None
+
+    async def _capture(self, quality: int) -> str | None:
+        """A sharp picture of the visible page in device pixels (base64 JPEG)."""
+        if self.emu:
+            with contextlib.suppress(Exception):
+                req = {"format": "jpeg", "quality": quality, "optimizeForSpeed": True}
+                if self.dpr > 1:  # the visible area (in page coordinates) re-rendered at dpr
+                    m = (await asyncio.wait_for(self.emu.send("Page.getLayoutMetrics"), 3))["cssVisualViewport"]
+                    req["clip"] = {"x": m["pageX"], "y": m["pageY"], "width": m["clientWidth"],
+                                   "height": m["clientHeight"], "scale": self.dpr}
+                r = await asyncio.wait_for(self.emu.send("Page.captureScreenshot", req), 5)
+                return r.get("data")
+        with contextlib.suppress(Exception):
+            return base64.b64encode(await self.page.screenshot(type="jpeg", quality=quality, timeout=5000)).decode()
+        return None
+
+    async def tap(self, x: float, y: float):
+        """A finger tap on phones (sites listen for touch), a mouse click on desktops."""
+        if self.mobile and self.emu:
+            try:
+                await self.emu.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]})
+                await asyncio.sleep(0.05)
+                await self.emu.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+                return
+            except Exception as exc:
+                log("touch failed, clicking instead:", str(exc)[:80])
+        await self.page.mouse.click(x, y)
 
     # what Panda is doing, for the live view ----------------------------------
     async def announce(self, kind: str, caption: str, box: dict | None = None, **extra):
@@ -497,11 +599,15 @@ class Engine:
             if t == "hello":
                 first = not self.viewer_active()
                 self.last_hello = time.time()
-                if p.get("mode"):
-                    await self.fit(str(p["mode"]), float(p.get("vw") or 0), float(p.get("vh") or 0))
+                # Only a viewer with a real size (the full panel) changes the page's shape; a chat card
+                # alone keeps it, so closing the panel on a phone doesn't reload the site as desktop.
+                if p.get("mode") and float(p.get("vw") or 0) > 50 and float(p.get("vh") or 0) > 50:
+                    await self.fit(str(p["mode"]), float(p["vw"]), float(p["vh"]))
                 if not self.cdp:
                     await self._restart_screencast()
                 # A hello repeats every few seconds; only a new viewer needs a fresh frame right away.
+                if first and self.page.url == "about:blank" and not self.busy:
+                    asyncio.create_task(self._goto(HOME_URL))  # an empty browser opens on Google
                 if first or time.time() - self.last_hello_snap > 6:
                     self.last_hello_snap = time.time()
                     await self.push_status(force=True)
@@ -520,10 +626,10 @@ class Engine:
             if t in ("click", "dblclick"):
                 x, y = float(p["x"]) * self.view[0], float(p["y"]) * self.view[1]
                 if t == "click":
-                    await page.mouse.click(x, y)
+                    await self.tap(x, y)
                 else:
                     await page.mouse.dblclick(x, y)
-                await asyncio.sleep(0.12)
+                await asyncio.sleep(0.15)
                 await self._report_focus()
             elif t == "scroll":
                 await page.mouse.move(float(p.get("x", 0.5)) * self.view[0], float(p.get("y", 0.5)) * self.view[1])
@@ -557,6 +663,7 @@ class Engine:
                     await self._adopt(pages[i])
             elif t == "newtab":
                 await self._adopt(await self.ctx.new_page())
+                asyncio.create_task(self._goto(HOME_URL))
             elif t == "closetab":
                 await self.page.close()
             await self.snap_frame()
@@ -725,6 +832,8 @@ class Engine:
                 name += ".png"
             path = OUT_DIR / name
             await page.screenshot(path=str(path), full_page=bool(r.get("full")))
+            if r.get("full"):
+                await self._emulate()  # a full-page shot resets the page's emulation
             return {**await self.summary(snap=False), "saved": str(path)}
         elif op == "tabs":
             return await self.summary(snap=False)
@@ -736,14 +845,13 @@ class Engine:
         elif op == "newtab":
             await self.announce("nav", "Opening a new tab")
             await self._adopt(await self.ctx.new_page())
-            if r.get("url"):
-                url = normalize(r["url"])
-                ok, why = url_ok(url)
-                if not ok:
-                    return {"ok": False, "error": why}
-                await self.announce("nav", f"Opening {host_of(url)}", url=url[:300])
-                await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                await self.settle(0.6)
+            url = normalize(r.get("url") or "")  # no address: Google
+            ok, why = url_ok(url)
+            if not ok:
+                return {"ok": False, "error": why}
+            await self.announce("nav", f"Opening {host_of(url)}", url=url[:300])
+            await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await self.settle(0.6)
         elif op == "closetab":
             await self.announce("nav", "Closing the tab")
             await page.close()

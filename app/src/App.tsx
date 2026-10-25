@@ -16,9 +16,10 @@ import { BrowserPanel } from "./components/BrowserPanel";
 import { BrowserContext, isAlive, useBrowserLink, useBrowserSelect } from "./lib/browser";
 import { ProjectsPage } from "./components/Projects";
 import { CustomizePage } from "./components/Customize";
+import { DeveloperPage } from "./components/Developer";
 import type { Attachment } from "./lib/files";
 
-export type View = "chat" | "projects" | "files" | "customize";
+export type View = "chat" | "projects" | "files" | "customize" | "developer";
 
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
@@ -130,7 +131,10 @@ function Shell({ userId, email }: { userId: string; email: string }) {
     history.replaceState(null, "", q.toString() ? `?${q}` : location.pathname);
   }, [activeId, view, projectId]);
 
-  const active = chats.find((c) => c.id === activeId) || null;
+  // The Developer chat lives in the Developer tab only, not in the chat list.
+  const devId = settings.developerChatId;
+  const listed = useMemo(() => (devId ? chats.filter((c) => c.id !== devId) : chats), [chats, devId]);
+  const active = listed.find((c) => c.id === activeId) || null;
 
   const ensureWorker = useCallback(async () => {
     if (!worker.alive && settings.autoStart) {
@@ -194,7 +198,7 @@ function Shell({ userId, email }: { userId: string; email: string }) {
     <BrowserContext.Provider value={browserCtx}>
     <div className={`app ${sideOpen ? "side-open" : ""} ${panelOpen && docked ? "with-dock" : ""}`}>
       {sideOpen && <div className="side-scrim" onClick={() => setSideOpen(false)} />}
-      <Sidebar chats={chats} activeId={view === "chat" ? activeId : null} email={email} userId={userId} worker={worker}
+      <Sidebar chats={listed} activeId={view === "chat" ? activeId : null} email={email} userId={userId} worker={worker}
         unread={unread} view={view} onGo={go}
         onNew={() => { setActiveId(null); setView("chat"); closeSideOnMobile(); }}
         onOpen={open} onSearch={() => setPanel("search")} onSettings={() => openSettings("general")}
@@ -204,7 +208,7 @@ function Shell({ userId, email }: { userId: string; email: string }) {
       <main className="main">
         <header className="topbar">
           <button className="icon-btn" onClick={() => setSideOpen((v) => !v)} aria-label="Sidebar"><IconSidebar /></button>
-          <div className="topbar-title">{view === "chat" ? active?.title || "" : ""}</div>
+          <div className="topbar-title">{view === "chat" ? active?.title || "" : view === "developer" ? "Developer" : ""}</div>
           {(browserLive || browserOpen) && browser && (
             <button className={`icon-btn browser-btn ${browserBusy ? "busy" : ""} ${needsYou ? "needs" : ""}`}
               onClick={() => setBrowserOpen((v) => !v)} aria-label="Panda's browser" title="Panda's browser"><IconGlobe /></button>
@@ -219,6 +223,9 @@ function Shell({ userId, email }: { userId: string; email: string }) {
           <FilesPage onOpenChat={open} />
         ) : view === "customize" ? (
           <CustomizePage online={online} onAsk={askPanda} />
+        ) : view === "developer" ? (
+          <DeveloperPage userId={userId} chats={chats} online={online} onSendMessage={sendMessage}
+            onChat={(c) => setChats((prev) => (prev.some((x) => x.id === c.id) ? prev : [c, ...prev]))} />
         ) : active ? (
           <ChatView key={active.id} chat={active} onModel={setModel} onSendMessage={sendMessage} online={online}
             onCommand={(n) => appCommand(n)} />
@@ -248,7 +255,7 @@ function Shell({ userId, email }: { userId: string; email: string }) {
       {panelOpen && <BrowserPanel link={browser!} online={online} docked={docked} onClose={() => setBrowserOpen(false)} />}
       {panel === "settings" && <SettingsModal email={email} userId={userId} worker={worker} online={online}
         initialTab={settingsTab} onClose={() => setPanel(null)} />}
-      {panel === "search" && <SearchModal chats={chats} onOpen={open} onClose={() => setPanel(null)} />}
+      {panel === "search" && <SearchModal chats={listed} onOpen={open} onClose={() => setPanel(null)} />}
       {panel === "notifications" && <NotificationsModal items={notifs} onClose={() => setPanel(null)} />}
     </div>
     </BrowserContext.Provider>

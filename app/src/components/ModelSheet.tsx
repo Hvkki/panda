@@ -13,7 +13,7 @@ export function ModelPicker({ model, effort, onChange, open, onOpenChange }: Pro
   return (
     <>
       <button type="button" className="chip model-chip" onClick={() => setOpen(true)}>
-        {modelName(model)} <span className="muted">{effortLabel(effort)}</span> <IconChevron size={14} />
+        {modelName(model)} <span className="muted model-effort">{effortLabel(effort)}</span> <IconChevron size={14} />
       </button>
       {isOpen && <ModelSheet model={model} effort={effort} onChange={onChange} onClose={() => setOpen(false)} />}
     </>

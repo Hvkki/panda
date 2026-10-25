@@ -41,6 +41,19 @@ CFG = json.load(open(CFG_PATH)) if CFG_PATH else json.loads(os.environ["KIROCREW
 SB_URL = CFG["supabase_url"].rstrip("/")
 SB_ANON = CFG["supabase_publishable_key"]
 OWNER = CFG["owner_id"]  # replaced by whoever pressed Start (claim_session)
+PRIMARY_OWNER = CFG["owner_id"]  # the account worker.json was made for (its Drive, the legacy state paths)
+# The session function writes the worker_sessions id of the Start press here when it pushes this
+# file to the account's own Kaggle notebook, so each run serves exactly the person who started it.
+INJECTED_SESSION_ID = ""
+
+
+def state_key(name: str) -> str:
+    """Storage path of this account's state (snapshots, browser logins).
+
+    The primary account keeps the original paths; every other account has its own folder, so two
+    workers running at the same time never overwrite each other.
+    """
+    return name if OWNER == PRIMARY_OWNER else f"users/{OWNER}/{name}"
 SECRETS = [CFG["kiro_api_key"], CFG["worker_password"], CFG.get("vapid_private", ""),
            (CFG.get("drive") or {}).get("refresh_token", ""), (CFG.get("drive") or {}).get("client_secret", "")]
 FILES_BUCKET = "panda-files"
@@ -195,12 +208,30 @@ PANDA_SECRETS = os.path.expanduser("~/.panda/secrets.env")
 SECRET_NAMES: list = []
 
 
+DEV_PREFIX = "DEV__"          # vault names of the Developer tab's env variables (stored without it in dev.env)
+DEV_ENV = os.path.expanduser("~/.panda/dev.env")
+DEV_ROWS: list = []           # [{name, value}] with the prefix removed
+DEV_LOCK = threading.Lock()
+DEV_TURNS = {"n": 0}          # developer turns running now; dev.env exists only while > 0
+
+
 def sync_secrets(sb: "Supabase") -> list:
-    """API keys from the app's vault -> env files the agent and MCP servers read."""
+    """API keys from the app's vault -> env files the agent and MCP servers read.
+
+    Developer variables (vault names starting with DEV__) are kept apart: they never go into
+    secrets.env or Crew's .env, and are written to ~/.panda/dev.env only while a turn of the
+    Developer chat runs.
+    """
     rows = sb.rest("GET", "secrets", params={"owner": f"eq.{OWNER}", "select": "name,value"}) or []
     for r in rows:
         if r["value"] not in SECRETS:
             SECRETS.append(r["value"])  # never let a key appear in logs or replies
+    with DEV_LOCK:
+        DEV_ROWS[:] = [{"name": r["name"][len(DEV_PREFIX):], "value": r["value"]} for r in rows
+                       if r["name"].startswith(DEV_PREFIX) and len(r["name"]) > len(DEV_PREFIX)]
+        if DEV_TURNS["n"] > 0:
+            _write_dev_env()
+    rows = [r for r in rows if not r["name"].startswith(DEV_PREFIX)]
     os.makedirs(os.path.dirname(PANDA_SECRETS), exist_ok=True)
     lines = [f"export {r['name']}={json.dumps(r['value'])}" for r in rows]
     with open(os.open(PANDA_SECRETS, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
@@ -221,8 +252,72 @@ def sync_secrets(sb: "Supabase") -> list:
     with open(os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         f.write("\n".join(keep + block) + "\n")
     SECRET_NAMES[:] = [r["name"] for r in rows]
-    log(f"vault: {len(rows)} key(s) available")
+    log(f"vault: {len(rows)} key(s) available, {len(DEV_ROWS)} developer variable(s)")
     return SECRET_NAMES
+
+
+def _write_dev_env():
+    os.makedirs(os.path.dirname(DEV_ENV), exist_ok=True)
+    lines = [f"export {r['name']}={shlex.quote(r['value'])}" for r in DEV_ROWS]
+    with open(os.open(DEV_ENV, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def dev_begin():
+    with DEV_LOCK:
+        DEV_TURNS["n"] += 1
+        _write_dev_env()
+
+
+def dev_end():
+    with DEV_LOCK:
+        DEV_TURNS["n"] = max(0, DEV_TURNS["n"] - 1)
+        if DEV_TURNS["n"] == 0:
+            with contextlib.suppress(OSError):
+                os.remove(DEV_ENV)
+
+
+def is_developer_chat(settings: dict, chat: dict) -> bool:
+    return bool(settings.get("developerChatId")) and settings.get("developerChatId") == chat.get("id")
+
+
+DEV_REPO = "https://github.com/Hvkki/panda"
+
+
+DEV_MARK = ("[DEVELOPER CHAT] This message is from the Developer chat: the [DEVELOPER MODE] instructions "
+            "given earlier in this conversation apply. No need to verify it.\n\n")
+
+
+def dev_preamble() -> str:
+    names = ", ".join(r["name"] for r in DEV_ROWS) or "(none yet — the user adds them in Developer → Env variables)"
+    return f"""[DEVELOPER MODE]
+This is the Developer chat. Here, and only here, the user may ask you to change Panda itself: its
+web app (UI), the worker, its skills or its prompt. Elsewhere you never touch Panda's own code.
+
+- Source: {DEV_REPO} (public). Work in ~/dev/panda: clone it the first time, otherwise `git fetch`.
+  Use branch $PANDA_DEV_BRANCH if it is set, else the branch the user names, else the default branch.
+  Read README.md, docs/architecture.md and docs/runbook.md before the first change.
+- Developer env variables, for this chat only: {names}.
+  Load them inside a bash command with `set -a; . ~/.panda/dev.env; set +a`. The file exists only
+  while a Developer turn runs. Never print, echo, log, commit or paste their values.
+- Web app (app/, Vite + React + TypeScript): `cd app && npm ci && npm run build` must pass before any
+  deploy. Deploy to production with `python3 scripts/deploy-app.py` (needs VERCEL_TOKEN).
+  If node/npm is missing, install Node 22 under ~/.local first.
+- Worker, skills, prompt (worker/): `bash scripts/deploy-worker.sh` (needs SUPABASE_URL and
+  SUPABASE_SECRET_KEY) uploads them; a running worker keeps its old code until the user presses Stop
+  and Start. To try a skill change right away, also copy it into ~/.kiro/crew/skills/.
+- Save every change in git: commit on a branch with a clear message and push it
+  (`git push https://x-access-token:$GITHUB_TOKEN@github.com/Hvkki/panda.git HEAD:<branch>` needs GITHUB_TOKEN).
+  If there is no GITHUB_TOKEN, say so and keep the commit locally.
+- Do exactly what the user asked, no more. For a bigger change, say the plan in two or three lines
+  first. Deploy only when the user asked for it (or clearly wants it live). Afterwards tell them what
+  changed, where, and how to undo it (git revert, or redeploy the previous commit).
+- Never weaken security: the owner-only checks, row-level security, the relay allow-list
+  (GW_ALLOWED in worker/worker.py) and the browser's private-address block stay as they are unless
+  the user explicitly asks and understands the risk.
+[END DEVELOPER MODE]
+
+"""
 
 
 # State the Crew snapshot does not carry: Crew's chat transcripts (crew/sessions) and
@@ -238,10 +333,10 @@ def _no_locks(info: tarfile.TarInfo):
 def restore(sb: Supabase) -> str:
     snap = f"{WORK}/restore-crew.tar.gz"
     extra = f"{WORK}/restore-kiro.tar.gz"
-    got = sb.download("latest-crew.tar.gz", snap)
+    got = sb.download(state_key("latest-crew.tar.gz"), snap)
     if got:
         sh(f"kirocrew restore {snap} --mode replace --force", timeout=900)
-    if sb.download("latest-kiro.tar.gz", extra):
+    if sb.download(state_key("latest-kiro.tar.gz"), extra):
         with tarfile.open(extra) as t:
             t.extractall(f"{HOME}/.kiro", filter="data")
         for lock in glob.glob(f"{HOME}/.kiro/sessions/cli/*.lock"):
@@ -258,14 +353,14 @@ def snapshot(sb: Supabase, reason: str) -> str:
     files = sorted(glob.glob(f"{out}/*.tar.gz"))
     if not files:
         raise RuntimeError("snapshot produced no file")
-    sb.upload("latest-crew.tar.gz", files[-1])
+    sb.upload(state_key("latest-crew.tar.gz"), files[-1])
     extra = f"{WORK}/kiro-extra.tar.gz"
     with tarfile.open(extra, "w:gz") as t:
         for d in EXTRA_DIRS:
             p = f"{HOME}/.kiro/{d}"
             if os.path.isdir(p):
                 t.add(p, arcname=d, filter=_no_locks)
-    sb.upload("latest-kiro.tar.gz", extra)
+    sb.upload(state_key("latest-kiro.tar.gz"), extra)
     log(f"snapshot uploaded ({reason}), {os.path.getsize(files[-1]) // 1024} KiB")
     return now_iso()
 
@@ -349,6 +444,39 @@ THINK = {}          # slot -> accumulated thinking text of the running turn
 THINK_REPLY = {}    # slot -> assistant message id being streamed
 THINK_SENT = {}     # slot -> length already written to Supabase
 THINK_LOCK = threading.Lock()
+CTX = {}            # slot -> latest context_usage reading from Crew's websocket
+
+
+def context_usage(gw: "Gateway", slot: str, since: float, streamed: dict | None) -> dict | None:
+    """The chat's context window use after this turn: {pct, used_tokens?, window_tokens?, reset?}.
+
+    Crew broadcasts it on the websocket right after the turn (after the SSE closed); when that
+    didn't arrive, the slot detail carries the same reading as context_pct.
+    """
+    def clean(d: dict) -> dict:
+        out = {"pct": round(float(d["pct"]), 1)}
+        if d.get("used_tokens") and d.get("window_tokens"):
+            out.update(used_tokens=int(d["used_tokens"]), window_tokens=int(d["window_tokens"]))
+        else:
+            out["reset"] = True
+        return out
+
+    for _ in range(12):  # up to ~3 s for the websocket reading
+        with THINK_LOCK:
+            d = CTX.get(slot)
+        if d and d.get("at", 0) >= since:
+            return clean(d)
+        time.sleep(0.25)
+    if streamed and isinstance(streamed.get("pct"), (int, float)):
+        return clean(streamed)
+    try:
+        s = gw.call("GET", f"/api/chat/slots/{slot}?limit=1", timeout=20)
+        if isinstance(s, dict) and isinstance(s.get("context_pct"), (int, float)):
+            return clean({"pct": s["context_pct"], "used_tokens": s.get("context_used_tokens"),
+                          "window_tokens": s.get("context_window_tokens")})
+    except Exception as exc:
+        log("context reading:", type(exc).__name__)
+    return streamed
 
 
 def thinking_listener(gw: "Gateway", stop: threading.Event):
@@ -376,6 +504,12 @@ def thinking_listener(gw: "Gateway", stop: threading.Event):
                     with THINK_LOCK:
                         if slot in THINK_REPLY:
                             THINK[slot] = THINK.get(slot, "") + str(d.get("content") or "")
+                elif msg.get("type") == "context_usage":
+                    # Crew measures the context after the turn, when the chat stream has already ended.
+                    d = msg.get("data") or {}
+                    if d.get("slot") and isinstance(d.get("pct"), (int, float)):
+                        with THINK_LOCK:
+                            CTX[d["slot"]] = {**d, "at": time.time()}
             ws.close()
         except Exception as exc:
             log("thinking stream:", type(exc).__name__, str(exc)[:100])
@@ -630,7 +764,7 @@ def browser_restore(sb: "Supabase"):
     """Download + decrypt the saved logins (cookies) so Panda is still signed in."""
     f = _fernet()
     tmp = f"{WORK}/browser-state.enc"
-    if not f or not sb.download(BROWSER_BLOB, tmp):
+    if not f or not sb.download(state_key(BROWSER_BLOB), tmp):
         return
     try:
         os.makedirs(BROWSER_DIR, exist_ok=True)
@@ -657,7 +791,7 @@ def browser_backup(sb: "Supabase", force: bool = False):
     with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as out:
         out.write(f.encrypt(open(BROWSER_STATE, "rb").read()))
     try:
-        sb.upload(BROWSER_BLOB, tmp, mime="application/octet-stream")
+        sb.upload(state_key(BROWSER_BLOB), tmp, mime="application/octet-stream")
         _browser_sync["mtime"] = m
     finally:
         with contextlib.suppress(OSError):
@@ -770,7 +904,7 @@ def browser_forget(sb: "Supabase") -> dict:
     for path in (BROWSER_STATE,):
         with contextlib.suppress(OSError):
             os.remove(path)
-    sb.delete_object(BROWSER_BLOB)
+    sb.delete_object(state_key(BROWSER_BLOB))
     _browser_sync["mtime"] = 0.0
     return {"forgotten": True, "note": note}
 
@@ -784,6 +918,9 @@ DRIVE_MIN = 45 * 2**20  # bigger outputs go to Drive (Supabase file limit is 50 
 def setup_drive():
     d = CFG.get("drive")
     if not d:
+        return False
+    if OWNER != PRIMARY_OWNER:  # worker.json's Drive belongs to the primary account, not to this user
+        log("google drive: not connected for this account (big files stay in Storage)")
         return False
     os.makedirs(os.path.dirname(DRIVE_CFG), exist_ok=True)
     with open(os.open(DRIVE_CFG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
@@ -1010,6 +1147,41 @@ def finish_without_model(sb: Supabase, chat: dict, msg: dict, text: str, meta: d
     sb.rest("PATCH", "messages", params={"id": f"eq.{msg['id']}"}, body={"status": "done"})
 
 
+# Commands after which the conversation no longer carries what Panda put in front of it (the app
+# context, the Developer instructions, the project): the next message brings it again.
+RESET_COMMANDS = {"/clear", "/compact"}
+
+
+def context_lost(sb: Supabase, chat_id: str, before_id: int) -> str:
+    """Why this chat's context must be given again, or "" if it still has it.
+
+    Read from the chat's own rows, so it also holds after a worker restart: a /clear or /compact
+    since the last normal message, or Crew compacting by itself (the context reading dropped a lot
+    during the last answer).
+    """
+    try:
+        rows = sb.rest("GET", "messages", params={
+            "chat_id": f"eq.{chat_id}", "id": f"lt.{before_id}", "role": "in.(user,assistant)",
+            "order": "id.desc", "limit": "24", "select": "role,content,meta"}) or []
+    except Exception as exc:
+        log("context check:", type(exc).__name__)
+        return ""
+    for r in rows:  # newest first, back to the last normal message
+        if r["role"] != "user":
+            continue
+        word = command_word(r.get("content") or "")
+        if word in RESET_COMMANDS:
+            return word
+        if not word:
+            break
+    pcts = [((r.get("meta") or {}).get("usage") or {}).get("pct") for r in rows
+            if r["role"] == "assistant" and not (r.get("meta") or {}).get("command")]
+    pcts = [p for p in pcts if isinstance(p, (int, float))][:2]
+    if len(pcts) == 2 and pcts[1] >= 35 and pcts[0] < pcts[1] * 0.55:
+        return "auto-compaction"
+    return ""
+
+
 def handle(sb: Supabase, gw: Gateway, msg: dict):
     chat = sb.rest("GET", "chats", params={"id": f"eq.{msg['chat_id']}", "select": "*"})[0]
     settings = user_settings(sb, chat["owner"])
@@ -1021,8 +1193,10 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
     if cmd:
         # Sent as typed (Crew matches the first word). Context the app would add waits for the next message.
         prompt = _ANSI.sub("", raw.strip())
-        if fresh_slot or needs_replay:
+        if fresh_slot or needs_replay or cmd in RESET_COMMANDS:
             PENDING_HINTS.add(slot)
+        if cmd in RESET_COMMANDS:
+            PROJECT_APPLIED.pop(slot, None)
         if needs_replay:
             PENDING_REPLAY.add(slot)
         log(f"chat {chat['id']}: command {cmd}")
@@ -1044,10 +1218,19 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             PENDING_REPLAY.discard(slot)
             prompt = replay_prefix(sb, chat["id"], msg["id"]) + prompt
             log(f"chat {chat['id']}: Crew lost the slot, replayed history from Supabase")
-        prompt = project_preamble(sb, chat, slot, fresh_slot or needs_replay) + prompt
+        lost = "" if (fresh_slot or needs_replay or slot in PENDING_HINTS) else context_lost(sb, chat["id"], msg["id"])
+        if lost:
+            PENDING_HINTS.add(slot)
+            log(f"chat {chat['id']}: context given again after {lost}")
+        prompt = project_preamble(sb, chat, slot, fresh_slot or needs_replay or bool(lost) or slot in PENDING_HINTS) + prompt
+        dev_chat = is_developer_chat(settings, chat)
         if fresh_slot or needs_replay or slot in PENDING_HINTS:
             PENDING_HINTS.discard(slot)
-            prompt = app_hints(settings) + prompt
+            prompt = app_hints(settings) + (dev_preamble() if dev_chat else "") + prompt
+        elif dev_chat:
+            # Every message of the Developer chat says so (one short line), so the agent never has
+            # to guess whether the full instructions from earlier still apply.
+            prompt = DEV_MARK + prompt
     before = scan_outputs()
     base_meta = {"model": chat.get("model"), "effort": chat.get("effort")}
     if cmd or kb:
@@ -1106,6 +1289,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             thinking = THINK.get(slot, thinking)
             THINK_REPLY.pop(slot, None)
         res = turn_result(gw, slot, want_stats=not cmd)
+        usage = context_usage(gw, slot, t0, usage)
         final = res["text"] or text
         if cmd:
             final = _ANSI.sub("", final)
@@ -1187,11 +1371,21 @@ def claim_next(sb: Supabase):
 
 
 def run_message(sb: Supabase, gw: Gateway, msg: dict):
+    dev = False
+    try:
+        chat = sb.rest("GET", "chats", params={"id": f"eq.{msg['chat_id']}", "select": "id,owner"})[0]
+        dev = is_developer_chat(user_settings(sb, chat["owner"]), chat)
+    except Exception:
+        pass
+    if dev:  # developer env variables exist on disk only while the Developer chat is answering
+        dev_begin()
     try:
         handle(sb, gw, msg)
     except Exception as exc:  # handle() records its own errors; this guards the thread
         log("turn crashed:", exc)
     finally:
+        if dev:
+            dev_end()
         with BUSY_LOCK:
             BUSY_CHATS.discard(msg["chat_id"])
 
@@ -1819,18 +2013,35 @@ def mirror_notifications(sb: Supabase, gw: Gateway, seen: set):
 
 
 def claim_session(sb: Supabase) -> dict:
-    """Claim the newest 'requested' session (the Start press); its owner is who we serve."""
+    """Claim the Start press this run serves; its owner is who we serve.
+
+    The session function writes the press's id into INJECTED_SESSION_ID. Without it (an older
+    function), take the oldest unclaimed press of the last 20 minutes: the PATCH only succeeds while
+    the row is still 'requested', so two workers booting at the same time never take the same one.
+    """
     global OWNER
-    rows = sb.rest("GET", "worker_sessions", params={
-        "status": "in.(requested,starting)", "order": "started_at.desc", "limit": "1", "select": "*"})
-    if rows and rows[0].get("owner"):
-        OWNER = rows[0]["owner"]
-    body = {"status": "starting", "heartbeat_at": now_iso(),
-            "kaggle_kernel": os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "local")}
-    if rows:
-        return sb.rest("PATCH", "worker_sessions", params={"id": f"eq.{rows[0]['id']}"},
-                       body=body, prefer="return=representation")[0]
-    return sb.rest("POST", "worker_sessions", body={"owner": OWNER, **body},
+    # kaggle_kernel stays what the session function wrote ("owner/notebook vN"): it tells which
+    # account's notebook this run is on.
+    body = {"status": "starting", "heartbeat_at": now_iso()}
+    want = INJECTED_SESSION_ID or os.environ.get("PANDA_SESSION_ID", "")
+    if want:
+        ids = [want]
+    else:
+        since = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+        rows = sb.rest("GET", "worker_sessions", params={
+            "status": "eq.requested", "started_at": f"gte.{since}", "order": "started_at.asc", "limit": "10",
+            "select": "id"}) or []
+        ids = [r["id"] for r in rows]
+    for sid in ids:
+        params = {"id": f"eq.{sid}"} if want else {"id": f"eq.{sid}", "status": "eq.requested"}
+        got = sb.rest("PATCH", "worker_sessions", params=params, body=body, prefer="return=representation")
+        if got:
+            if got[0].get("owner"):
+                OWNER = got[0]["owner"]
+            log(f"serving session {sid}" + ("" if OWNER == PRIMARY_OWNER else " (own state folder)"))
+            return got[0]
+    return sb.rest("POST", "worker_sessions", body={"owner": OWNER, **body,
+                                                    "kaggle_kernel": os.environ.get("KAGGLE_KERNEL_RUN_TYPE", "local")},
                    prefer="return=representation")[0]
 
 

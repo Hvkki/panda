@@ -28,6 +28,12 @@ set -a; . ./panda-api-keys.env; set +a
 - **`session` function:** Supabase dashboard → Edge Functions → `session`. Paste
   `supabase/functions/session/index.ts`. Set the function secrets `KAGGLE_API_TOKEN`,
   `KAGGLE_KERNEL` and `KAGGLE_DATASET` (values in the keys file).
+- **One Kaggle notebook (one CPU) per account:** `kirocrew-state/config/kernels.json` maps a user id
+  to its notebook, e.g. `{"<user id>": "vladraf/panda-worker-tetiana"}`; unlisted accounts use
+  `KAGGLE_KERNEL`. Create the notebook once (a private CPU script with internet and the
+  `KAGGLE_DATASET` attached; any placeholder code, Start replaces it), add the line, upload the file.
+  Each account's snapshots and browser logins live under `users/<user id>/` in the same bucket (the
+  account in `worker.json` keeps the top-level paths and is the only one with Google Drive).
 - **Auth settings:** Site URL `https://panda-app-gamma.vercel.app`. Redirect URL
   `https://panda-app-gamma.vercel.app/**`. "Allow new users to sign up" OFF.
 

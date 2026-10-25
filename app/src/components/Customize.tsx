@@ -258,7 +258,9 @@ function KeysTab({ online }: { online: boolean }) {
   const [rows, setRows] = useState<{ name: string; note: string; updated_at: string }[]>([]);
   const [form, setForm] = useState({ name: "", value: "", note: "" });
   const [msg, setMsg] = useState("");
-  const load = () => supabase.rpc("list_secrets").then(({ data }) => setRows(data || []));
+  // DEV__ names are the Developer tab's variables; they are managed there.
+  const load = () => supabase.rpc("list_secrets").then(({ data }) =>
+    setRows(((data || []) as { name: string; note: string; updated_at: string }[]).filter((r) => !r.name.startsWith("DEV__"))));
   useEffect(() => { load(); }, []);
   const sync = () => online ? runCommand("secrets.sync").catch(() => {}) : Promise.resolve();
 
@@ -271,7 +273,7 @@ function KeysTab({ online }: { online: boolean }) {
         <label>Value<input className="text-input" type="password" autoComplete="off" value={form.value} onChange={(e) => setForm({ ...form, value: e.target.value })} /></label>
         <label>Note<input className="text-input" placeholder="optional — what it's for" value={form.note} onChange={(e) => setForm({ ...form, note: e.target.value })} /></label>
         <div className="row-actions">
-          <button className="btn primary" disabled={!/^[A-Z][A-Z0-9_]{1,63}$/.test(form.name) || !form.value} onClick={async () => {
+          <button className="btn primary" disabled={!/^[A-Z][A-Z0-9_]{1,63}$/.test(form.name) || form.name.startsWith("DEV__") || !form.value} onClick={async () => {
             const { error } = await supabase.rpc("set_secret", { p_name: form.name, p_value: form.value, p_note: form.note });
             if (error) return setMsg(error.message);
             setForm({ name: "", value: "", note: "" });

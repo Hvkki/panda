@@ -14,7 +14,7 @@ export type BrowserStatus = {
   /** What Panda is doing right now ("Clicking “Search”"), empty when idle. */
   action?: string;
   /** The text field that has focus, so the app can offer the keyboard. */
-  focus?: { kind: string; label: string; secret?: boolean } | null;
+  focus?: { kind: string; label: string; secret?: boolean; y?: number } | null;
   w?: number;
   h?: number;
 };

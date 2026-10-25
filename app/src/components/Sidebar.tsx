@@ -2,7 +2,7 @@ import { useState } from "react";
 import { supabase, type Chat } from "../lib/supabase";
 import { useT } from "../lib/i18n";
 import { Wordmark } from "./Logo";
-import { IconBell, IconEdit, IconFolder, IconGear, IconGrid, IconPin, IconPlus, IconSearch, IconSliders, IconTrash } from "./Icons";
+import { IconBell, IconEdit, IconFolder, IconGear, IconGrid, IconPin, IconPlus, IconSearch, IconSliders, IconTrash, IconCode } from "./Icons";
 import { UsageMeter } from "./Usage";
 import type { Worker } from "./SessionChip";
 import type { View } from "../App";
@@ -66,6 +66,7 @@ export function Sidebar(p: Props) {
         <button className={p.view === "projects" ? "active" : ""} onClick={() => p.onGo("projects")}><IconFolder /> Projects</button>
         <button className={p.view === "files" ? "active" : ""} onClick={() => p.onGo("files")}><IconGrid /> Files</button>
         <button className={p.view === "customize" ? "active" : ""} onClick={() => p.onGo("customize")}><IconSliders /> Customize</button>
+        <button className={p.view === "developer" ? "active" : ""} onClick={() => p.onGo("developer")}><IconCode /> Developer</button>
         <button onClick={p.onNotifications}>
           <IconBell /> {t("notifications")} {p.unread > 0 && <span className="badge">{p.unread}</span>}
         </button>

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """pb — drive Panda's real browser from the command line.
 
-  pb open <url|search words>    go to a page (prints the page as a ref-tagged outline)
+  pb open <url|search words>    go to a page, or search Google (prints the page as a ref-tagged outline)
   pb snap [--full]              re-read the current page
   pb click <ref>                click an element by its ref (e.g. e12)   | pb click --xy 400 300
   pb type <ref> "text" [--submit]

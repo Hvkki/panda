@@ -10,6 +10,7 @@ Fixtures (optional): crew_settings.json / crew_commands.json captured from a rea
 worker.crew_settings() / worker.crew_commands(); built-in samples are used otherwise.
 """
 import asyncio
+import contextlib
 import base64
 import functools
 import http.server
@@ -84,7 +85,8 @@ MESSAGES = [
         meta={"model": "claude-sonnet-5.5", "tools": ["Running: python3 ~/.kiro/crew/skills/panda-browser/pb.py open worldwildlife.org",
                                                       "Running: python3 ~/.kiro/crew/skills/panda-browser/pb.py click e41"]}),
 ]
-SETTINGS = {"theme": "light", "browserTopic": TOPIC, "name": "Alex", "showThinking": False, "approvals": "ask"}
+DEV_CHAT = "aaaaaaaa-0000-4000-8000-0000000000de"
+SETTINGS = {"theme": "light", "browserTopic": TOPIC, "developerChatId": DEV_CHAT, "name": "Alex", "showThinking": False, "approvals": "ask"}
 SESSION = {"id": "sess-1", "owner": UID, "status": "running", "stop_requested": False, "started_at": iso(NOW - 1500),
            "heartbeat_at": iso(NOW - 5), "stopped_at": None, "info": {"usage": USAGE, "crew": "0.11.0"}}
 COMMAND_RESULTS = {"crew.commands": CREW_COMMANDS, "crew.settings": CREW_SETTINGS, "usage": USAGE,
@@ -113,6 +115,7 @@ class State:
         self.inputs = []
         self.control = "agent"
         self.frames = {}
+        self.mobile = False
 
 
 ST = State()
@@ -143,8 +146,13 @@ async def handle_route(route):
     if not path.startswith("/rest/v1/"):
         return await ok({})
     table = path.split("/rest/v1/")[1]
+    if table == "rpc/list_secrets":
+        return await ok([{"name": "OPENAI_API_KEY", "note": "", "updated_at": iso(NOW)},
+                         {"name": "DEV__VERCEL_TOKEN", "note": "developer", "updated_at": iso(NOW)},
+                         {"name": "DEV__SUPABASE_SECRET_KEY", "note": "developer", "updated_at": iso(NOW)}])
     if table == "chats":
-        return await ok(CHATS if req.method == "GET" else ([] if not single else CHATS[0]))
+        rows = CHATS + [{**CHATS[0], "id": DEV_CHAT, "title": "Developer", "pinned": False}]
+        return await ok(rows if req.method == "GET" else ([] if not single else CHATS[0]))
     if table == "messages":
         if req.method != "GET":
             return await ok({} if single else [])
@@ -260,7 +268,8 @@ def on_input(p):
     t = (p or {}).get("t")
     if t == "takeover":
         ST.control = "user"
-        ws_broadcast("status", status("user", busy=False, action="", focus={"kind": "search", "label": "Search Wikipedia"}))
+        ws_broadcast("status", status("user", busy=False, action="", focus={"kind": "search", "label": "Search Wikipedia", "y": 0.06},
+                                      **({"w": 400, "h": 720} if ST.mobile else {})))
     elif t == "done":
         ST.control = "agent"
         ws_broadcast("status", status("agent"))
@@ -268,7 +277,7 @@ def on_input(p):
 
 def push_live(kind="desktop"):
     fr = ST.frames[kind]
-    w, h = (1024, 720) if kind == "desktop" else (480, 880)
+    w, h = (1024, 720) if kind == "desktop" else (400, 720)
     ws_broadcast("status", status(w=w, h=h))
     ws_broadcast("frame", {"d": base64.b64encode(fr).decode(), "w": w, "h": h})
     ws_broadcast("action", {"k": "click", "c": "Clicking “Conservation status” link", "t": int(time.time() * 1000),
@@ -306,7 +315,8 @@ async def main():
         await shot.mouse.wheel(0, 900)
         await asyncio.sleep(0.6)
         ST.frames["desktop_end"] = await shot.screenshot(type="jpeg", quality=70)
-        mob = await (await b.new_context(viewport={"width": 480, "height": 880})).new_page()
+        mob = await (await b.new_context(viewport={"width": 400, "height": 720}, device_scale_factor=1.5, is_mobile=True, has_touch=True,
+                                         user_agent="Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36")).new_page()
         await mob.goto("https://en.wikipedia.org/wiki/Red_panda", wait_until="domcontentloaded", timeout=45000)
         await asyncio.sleep(1.5)
         ST.frames["mobile"] = await mob.screenshot(type="jpeg", quality=60)
@@ -356,6 +366,8 @@ async def main():
         t2 = (await anims(page, "svg.panda-working") or {}).get("ringTransform")
         REPORT["ring_turns"] = bool(t1 and t2 and t1 != t2)
         REPORT["credit_chips"] = await page.locator(".credit-chip").all_inner_texts()
+        REPORT["session_chip_phone"] = await page.locator(".session-chip").inner_text()
+        REPORT["context_meter"] = await page.locator(".ctx-ring").all_inner_texts()
         REPORT["chat_total"] = await page.locator(".chat-total").inner_text() if await page.locator(".chat-total").count() else None
         REPORT["command_cards"] = await page.locator(".command-out").count()
         REPORT["cards"] = {"live": await page.locator(".bcard.is-live").count(), "ended": await page.locator(".bcard.is-ended").count()}
@@ -373,14 +385,40 @@ async def main():
         hello = [i for i in ST.inputs if (i or {}).get("t") == "hello"]
         REPORT["hello_from_panel"] = hello[-1] if hello else None
         await page.screenshot(path=f"{OUT}/5-browser-panel-phone.png")
+        ST.mobile = True
         await page.get_by_role("button", name=re.compile("Take over")).click()
         await asyncio.sleep(0.8)
         REPORT["takeover_sent"] = any((i or {}).get("t") == "takeover" for i in ST.inputs)
+        REPORT["typebar_before_keyboard_button"] = await page.locator(".bp-typebar").count()
+        REPORT["type_hint"] = await page.locator(".bp-type-hint").all_inner_texts()
+        await page.screenshot(path=f"{OUT}/6a-browser-takeover-phone.png")
+        await page.locator(".bp-kbd-btn").click()
+        await asyncio.sleep(0.4)
         REPORT["typebar"] = await page.locator(".bp-typebar").count()
+        REPORT["stage_keyboard_mode"] = await page.locator(".bp-stage.kb").count()
         await page.locator(".bp-typebar input").fill("red panda adoption")
         await asyncio.sleep(0.3)
         REPORT["typed_forwarded"] = [i.get("text") for i in ST.inputs if (i or {}).get("t") == "text"]
         await page.screenshot(path=f"{OUT}/6-browser-takeover-phone.png")
+        ST.mobile = False
+        await page.close()
+
+        # 3b. Developer tab, phone: the Developer chat and its env variables.
+        page = await new_page(390, 844)
+        await page.goto(f"{APP}/?v=developer")
+        await page.wait_for_selector(".dev-page", timeout=20000)
+        await asyncio.sleep(1.0)
+        REPORT["dev_chat"] = await page.locator(".dev-chat .composer").count()
+        REPORT["dev_chat_in_sidebar_list"] = await page.locator(".side-link", has_text="Developer").count()
+        await page.screenshot(path=f"{OUT}/8a-developer-chat-phone.png")
+        await page.get_by_role("button", name="Env variables").click()
+        await asyncio.sleep(0.6)
+        await page.get_by_role("button", name="Import .env").click()
+        await page.locator(".dev-bulk textarea").fill("# deploy\nVERCEL_TOKEN=abc\nexport SUPABASE_URL=\"https://x.supabase.co\"\n")
+        await asyncio.sleep(0.3)
+        REPORT["dev_env_rows"] = await page.locator(".dev-env .row-card b").all_inner_texts()
+        REPORT["dev_import_preview"] = await page.locator(".dev-bulk .muted").inner_text()
+        await page.screenshot(path=f"{OUT}/8b-developer-env-phone.png")
         await page.close()
 
         # 4. Desktop: docked browser next to the chat; settings tabs.
@@ -400,7 +438,8 @@ async def main():
         await page.locator(".browser-panel .bp-head .icon-btn").first.click()
         await page.locator(".sidebar .side-foot .icon-btn").click()
         await page.get_by_role("tab", name="Kiro Crew").click()
-        await page.wait_for_selector(".crew-row", timeout=10000)
+        with contextlib.suppress(Exception):  # no rows without crew_settings.json fixtures
+            await page.wait_for_selector(".crew-row", timeout=10000)
         await asyncio.sleep(0.4)
         REPORT["crew_rows"] = await page.locator(".crew-row").count()
         await page.screenshot(path=f"{OUT}/8-settings-kiro-crew.png")
@@ -463,7 +502,8 @@ async def main():
         await asyncio.sleep(0.4)
         await page.screenshot(path=f"{OUT}/19-settings-general-phone.png")
         await page.get_by_role("tab", name="Kiro Crew").dispatch_event("click")
-        await page.wait_for_selector(".crew-row", timeout=10000)
+        with contextlib.suppress(Exception):  # no rows without crew_settings.json fixtures
+            await page.wait_for_selector(".crew-row", timeout=10000)
         await asyncio.sleep(0.4)
         REPORT["crew_overflow"] = await page.evaluate("() => { const b=document.querySelector('.modal-body'); return b ? b.scrollWidth - b.clientWidth : -1; }")
         REPORT["diag"] = await page.evaluate("""() => {
@@ -522,4 +562,10 @@ async def main():
     print(json.dumps(REPORT, indent=1, ensure_ascii=False))
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception as exc:  # later steps can need fixtures; still show what was checked
+        REPORT["failed_at"] = f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}"
+        print(json.dumps(REPORT, indent=1, ensure_ascii=False))
+        raise SystemExit(1)

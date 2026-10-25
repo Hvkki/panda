@@ -21,6 +21,10 @@ pb text                         # readable article text (cheaper than the outlin
 pb shot report.png              # save a screenshot to ~/outputs (appears as a file card)
 ```
 
+`pb open red panda facts` (words, not an address) searches Google; `pb newtab` opens Google.
+When the user watches on a phone the page is the site's mobile version (narrow, touch) — refs
+work the same, but menus may sit behind a ☰ button.
+
 Every action prints the updated outline, so you rarely need `pb snap`.
 Refs are only valid for the page you just read — after a click that changes the page, use the new refs.
 The user watches each step live (a cursor shows where you click and a caption says what you do),

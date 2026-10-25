@@ -7,6 +7,12 @@ import {
   IconLock, IconPlus, IconRetry, IconSpinner, IconX,
 } from "./Icons";
 
+/** A touch screen with a text field focused: its on-screen keyboard is (about to be) up. */
+const keyboardUp = () => {
+  const a = document.activeElement;
+  return "ontouchstart" in window && !!a && (a.tagName === "INPUT" || a.tagName === "TEXTAREA");
+};
+
 const SPECIAL = ["Enter", "Backspace", "Tab", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Delete", "Home", "End", "PageUp", "PageDown"];
 
 /**
@@ -25,8 +31,11 @@ export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserL
   const [taps, setTaps] = useState<{ id: number; x: number; y: number }[]>([]);
   const [size, setSize] = useState<{ vw: number; vh: number } | undefined>(undefined);
   const [typed, setTyped] = useState("");
+  // The phone keyboard opens only when you ask for it (the ⌨ button), never by itself.
+  const [kbdOpen, setKbdOpen] = useState(false);
   const typedRef = useRef("");
   const editing = useRef(false);
+  const freeze = useRef(false);                // keyboard up: keep the page size, don't re-lay it out
   const view = useRef<HTMLDivElement>(null);   // the rendered page (exact size of the picture)
   const stage = useRef<HTMLDivElement>(null);  // the free area it is fitted into
   const kbd = useRef<HTMLInputElement>(null);
@@ -40,7 +49,12 @@ export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserL
     const measure = () => {
       const r = el.getBoundingClientRect();
       const next = { vw: Math.round(r.width / 20) * 20, vh: Math.round(r.height / 20) * 20 };
-      setSize((s) => (s && s.vw === next.vw && s.vh === next.vh ? s : next));
+      setSize((s) => {
+        if (s && s.vw === next.vw && s.vh === next.vh) return s;
+        // An on-screen keyboard only makes the free area shorter: the page keeps its shape.
+        if (s && s.vw === next.vw && (freeze.current || keyboardUp())) return s;
+        return next;
+      });
     };
     measure();
     const ro = new ResizeObserver(measure);
@@ -51,6 +65,19 @@ export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserL
 
   useEffect(() => { if (status && !editing.current) setAddress(status.url === "about:blank" ? "" : status.url); }, [status?.url]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { typedRef.current = ""; setTyped(""); }, [status?.focus?.label, status?.control]);
+  useEffect(() => { if (status?.control === "agent") setKbdOpen(false); }, [status?.control]);
+  useEffect(() => { freeze.current = kbdOpen; if (kbdOpen) kbd.current?.focus(); }, [kbdOpen]);
+  // Keyboard up: the page shows at full width and scrolls so the field you type into stays visible.
+  const focusY = status?.focus?.y;
+  useEffect(() => {
+    const el = stage.current, v = view.current;
+    if (!kbdOpen || !el || !v) return;
+    const id = window.setTimeout(() => {
+      const y = (focusY ?? 0.3) * v.offsetHeight;
+      el.scrollTo({ top: Math.max(0, y - el.clientHeight * 0.4), behavior: "smooth" });
+    }, 250);  // after the keyboard finished opening
+    return () => window.clearTimeout(id);
+  }, [kbdOpen, focusY]);
   useEffect(() => {
     const esc = (e: KeyboardEvent) => { if (e.key === "Escape" && !(e.target instanceof HTMLInputElement)) onClose(); };
     window.addEventListener("keydown", esc);
@@ -146,7 +173,7 @@ export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserL
       )}
 
       <div className="bp-body">
-        <div className="bp-stage" ref={stage}>
+        <div className={`bp-stage ${kbdOpen && mine ? "kb" : ""}`} ref={stage}>
           <div className={`bp-view ${mine ? "mine" : ""}`} ref={view} tabIndex={0} onKeyDown={key}
             style={{ ["--r" as string]: dims.w / dims.h }}
             onClick={(e) => { if (mine && !("ontouchstart" in window)) { tap(e.clientX, e.clientY); view.current?.focus(); } }}
@@ -198,18 +225,22 @@ export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserL
       <div className={`bp-caption ${control}`}>
         <span className="bp-caption-icon">{status?.busy && control === "agent" ? <IconSpinner size={15} /> : control === "agent" ? <IconCursor size={15} /> : <IconHand size={15} />}</span>
         <span className="bp-caption-text">{caption}</span>
+        {mine && focus && !kbdOpen && (
+          <button className="chip bp-type-hint" onClick={() => setKbdOpen(true)}>
+            <IconKeyboard size={15} /> Type into {focus.label ? `“${focus.label.slice(0, 22)}”` : "the field"}</button>
+        )}
       </div>
 
-      {mine && (
+      {mine && kbdOpen && (
         <form className="bp-typebar" onSubmit={(e) => { e.preventDefault(); send({ t: "key", key: "Enter" }); typedRef.current = ""; setTyped(""); }}>
-          <span className="bp-kbd-icon"><IconKeyboard size={17} /></span>
           <input ref={kbd} value={typed} type={focus?.secret ? "password" : "text"} onChange={(e) => onTyped(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Backspace" && !typedRef.current) { e.preventDefault(); send({ t: "key", key: "Backspace" }); } }}
-            placeholder={focus ? `Typing into ${focus.label || "the selected field"}…` : "Tap a field on the page, then type here"}
+            placeholder={focus ? `Typing into ${focus.label || "the selected field"}…` : "Tap a field on the page first"}
             autoComplete="off" autoCapitalize="off" autoCorrect="off" spellCheck={false} enterKeyHint="go" />
-          <button type="button" className="chip" onClick={() => send({ t: "key", key: "Tab" })}>Tab</button>
-          <button type="button" className="chip icon-chip" onClick={() => send({ t: "key", key: "Backspace" })} aria-label="Delete"><IconBackspace size={16} /></button>
-          <button type="submit" className="chip icon-chip" aria-label="Enter"><IconEnter size={16} /></button>
+          <button type="button" className="chip" onMouseDown={(e) => e.preventDefault()} onClick={() => send({ t: "key", key: "Tab" })}>Tab</button>
+          <button type="button" className="chip icon-chip" onMouseDown={(e) => e.preventDefault()} onClick={() => send({ t: "key", key: "Backspace" })} aria-label="Delete"><IconBackspace size={16} /></button>
+          <button type="submit" className="chip icon-chip" onMouseDown={(e) => e.preventDefault()} aria-label="Enter"><IconEnter size={16} /></button>
+          <button type="button" className="chip icon-chip" onClick={() => { kbd.current?.blur(); setKbdOpen(false); }} aria-label="Hide the keyboard"><IconX size={16} /></button>
         </form>
       )}
 
@@ -221,11 +252,16 @@ export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserL
           </>
         ) : control === "needs_user" ? (
           <>
-            <button className="btn primary grow" onClick={() => { send({ t: "takeover" }); window.setTimeout(() => kbd.current?.focus(), 50); }}><IconHand size={16} /> {t("takeOver")}</button>
+            <button className="btn primary grow" onClick={() => send({ t: "takeover" })}><IconHand size={16} /> {t("takeOver")}</button>
             <button className="btn" onClick={() => send({ t: "done" })}>I'm done</button>
           </>
         ) : (
-          <button className="btn primary grow" onClick={() => send({ t: "done" })}>{t("giveBack")}</button>
+          <>
+            <button className={`btn bp-kbd-btn ${kbdOpen ? "on" : ""} ${focus && !kbdOpen ? "hint" : ""}`} aria-pressed={kbdOpen}
+              onClick={() => setKbdOpen((v) => !v)} aria-label={kbdOpen ? "Hide the keyboard" : "Keyboard"} title="Keyboard">
+              <IconKeyboard size={18} /></button>
+            <button className="btn primary grow" onClick={() => send({ t: "done" })}>{t("giveBack")}</button>
+          </>
         )}
       </div>
     </div>

@@ -42,7 +42,7 @@ export function SessionChip({ worker }: { worker: Worker }) {
   const [, tick] = useState(0);
   useEffect(() => {
     if (state !== "on" && state !== "starting") return;
-    const id = window.setInterval(() => tick((n) => n + 1), 30000);
+    const id = window.setInterval(() => tick((n) => n + 1), 15000);
     return () => window.clearInterval(id);
   }, [state]);
   const mins = s ? Math.floor((Date.now() - Date.parse(s.started_at)) / 60000) : 0;
@@ -60,7 +60,7 @@ export function SessionChip({ worker }: { worker: Worker }) {
     }
   };
 
-  const label = state === "on" ? <>{t("running")}<span className="session-up"> · {up}</span></> : state === "starting" ? t("starting")
+  const label = state === "on" ? <><span className="session-word">{t("running")} · </span><span className="session-up">{up}</span></> : state === "starting" ? t("starting")
     : state === "stopping" ? t("stopping") : t("offline");
   return (
     <div className="session">
@@ -68,7 +68,7 @@ export function SessionChip({ worker }: { worker: Worker }) {
         title={state === "off" ? t("start") : state === "on" ? `${t("running")} · ${up} — ${t("stop")}` : t("stop")}>
         <span className="dot" /> <span className="session-label">{busy ? "…" : label}</span>
         {(state === "off" || state === "on") && <span className="session-action"><IconPower size={14} />
-          {state === "off" ? t("start") : t("stop")}</span>}
+          <span className={state === "on" ? "session-action-text" : ""}>{state === "off" ? t("start") : t("stop")}</span></span>}
       </button>
       {err && <div className="session-err" onClick={() => setErr("")}>{err}</div>}
     </div>
