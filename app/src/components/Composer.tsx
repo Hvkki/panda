@@ -9,6 +9,7 @@ import { ALL_MODELS, EFFORTS } from "../lib/models";
 import { buildCatalog, matchCommands, parseCommand, useCrewCommands, type SlashCmd } from "../lib/slash";
 import { fmtTokens } from "../lib/usage";
 import { useVoice } from "../lib/voice";
+import { VoiceWave } from "./VoiceWave";
 
 /** `steer`: sent while Panda is answering, so it goes into the running reply instead of waiting. */
 export type SendMeta = { command?: string; steer?: boolean };
@@ -144,8 +145,9 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
     sendCrew(cmd, "");
   };
 
-  const send = () => {
-    const raw = text.trim();
+  /** `override`: send this text instead of the box (voice "send" hands over what it heard). */
+  const send = (override?: string) => {
+    const raw = (override ?? text).trim();
     const p = raw.startsWith("/") && !ready.length ? parseCommand(catalog, raw) : null;
     if (p) {
       if (p.cmd.kind === "client") return runClient(p.cmd, p.args);
@@ -170,29 +172,38 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
     clear();
   };
 
-  // Voice input: tap to talk, tap again to stop. The words land in the box, ready to edit or send.
+  // Voice input: tap the mic and talk. X throws it away, the square puts the words in the box to
+  // edit, the arrow sends them straight away.
+  const focusAfterVoice = useRef(false);
   const voice = useVoice({
     online, language: settings.language, onNotice: setNotice,
-    onText: (said) => {
+    onText: (said, final, andSend) => {
       if (!said) return;
       const base = voiceBase.current;
-      setText((prev) => (prev.startsWith(base) ? base : prev.trimEnd() + " ") + said);
-      ref.current?.focus();
+      const next = (text.startsWith(base) ? base : text.trimEnd() + " ") + said;
+      if (final && andSend) { send(next); return; }
+      setText(next);
+      if (final) focusAfterVoice.current = true;
     },
+    onCancel: () => setText(voiceBase.current.trimEnd()),
   });
-  const toggleMic = () => {
-    if (voice.state === "idle") voiceBase.current = text.trim() ? text.trimEnd() + " " : "";
+  const voiceOn = voice.state !== "idle";
+  useEffect(() => {
+    if (!voiceOn && focusAfterVoice.current) { focusAfterVoice.current = false; ref.current?.focus(); }
+  }, [voiceOn]);
+  const startMic = () => {
+    voiceBase.current = text.trim() ? text.trimEnd() + " " : "";
     voice.toggle();
   };
-  const micLabel = voice.state === "recording" ? "Stop and turn into text"
-    : voice.state === "listening" ? "Stop listening" : voice.state === "transcribing" ? "Turning your voice into text" : "Voice input";
+  const transcribing = voice.state === "transcribing";
+  const clock = `${Math.floor(voice.secs / 60)}:${String(voice.secs % 60).padStart(2, "0")}`;
 
   // kiro-cli often reports only the percentage (reset: no token counts); the meter still shows it.
   const pct = context && typeof context.pct === "number" && Number.isFinite(context.pct) ? Math.max(0, Math.min(100, context.pct)) : null;
   const tokens = context && !context.reset && context.used_tokens && context.window_tokens;
 
   return (
-    <div className={`composer ${matches.length ? "menu-open" : ""}`}
+    <div className={`composer ${matches.length ? "menu-open" : ""} ${voiceOn ? "voice-on" : ""}`}
       onDragOver={(e) => e.preventDefault()}
       onDrop={(e) => { e.preventDefault(); if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files); }}
       onPaste={(e) => { if (e.clipboardData.files.length) { e.preventDefault(); addFiles(e.clipboardData.files); } }}>
@@ -233,8 +244,9 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
       {parsed && !matches.length && (parsed.cmd.args || parsed.cmd.off) && (
         <div className="slash-hint"><b>{parsed.cmd.name}</b> {parsed.cmd.args} <span className="muted">— {parsed.cmd.off || parsed.cmd.desc}</span></div>
       )}
-      <textarea
+      {(!voiceOn || text.trim()) && <textarea
         ref={ref}
+        readOnly={voiceOn}
         rows={1}
         value={text}
         placeholder={t("placeholder")}
@@ -251,7 +263,20 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
             send();
           }
         }}
-      />
+      />}
+      {voiceOn ? (
+        <div className="voice-bar" role="group" aria-label="Voice input">
+          <button type="button" className="icon-btn voice-x" onClick={voice.cancel} title="Cancel" aria-label="Cancel voice input"><IconX /></button>
+          <VoiceWave level={voice.level} frozen={transcribing} metered={voice.metered()} />
+          <span className="voice-time" aria-live="polite">{transcribing ? "Writing…" : voice.state === "listening" ? "Listening" : clock}</span>
+          <button type="button" className="voice-stop" onClick={() => voice.finish(false)} disabled={transcribing}
+            title="Stop, then edit the text" aria-label="Stop, then edit the text">
+            {transcribing ? <span className="mic-spin" aria-hidden /> : <IconStop size={16} />}
+          </button>
+          <button type="button" className="send-btn" onClick={() => voice.finish(true)} disabled={transcribing}
+            title="Stop and send" aria-label="Stop and send"><IconSend /></button>
+        </div>
+      ) : (
       <div className="composer-bar">
         <input ref={fileInput} type="file" multiple hidden onChange={(e) => { if (e.target.files) addFiles(e.target.files); e.target.value = ""; }} />
         <button type="button" className="icon-btn" onClick={() => fileInput.current?.click()} title="Add files" aria-label="Add files"><IconPlus /></button>
@@ -281,20 +306,17 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
         )}
         <div className="grow" />
         {voice.available ? (
-          <button type="button" className={`icon-btn mic-btn ${voice.state === "recording" || voice.state === "listening" ? "rec" : ""} ${voice.state === "transcribing" ? "busy" : ""}`}
-            onClick={toggleMic} disabled={voice.state === "transcribing"} title={micLabel} aria-label={micLabel} aria-pressed={voice.state !== "idle"}>
-            {voice.state === "recording" ? <span className="mic-secs">{Math.floor(voice.secs / 60)}:{String(voice.secs % 60).padStart(2, "0")}</span>
-              : voice.state === "transcribing" ? <span className="mic-spin" aria-hidden /> : <IconMic />}
-          </button>
+          <button type="button" className="icon-btn" onClick={startMic} title="Voice input" aria-label="Voice input"><IconMic /></button>
         ) : null}
         {busy && onStop && !text.trim() ? (
           <button type="button" className="send-btn stop" onClick={onStop} title={t("stopGen")} aria-label={t("stopGen")}><IconStop /></button>
         ) : (
-          <button type="button" className="send-btn" onClick={send} disabled={(!text.trim() && !ready.length) || uploading} title="Send" aria-label="Send">
+          <button type="button" className="send-btn" onClick={() => send()} disabled={(!text.trim() && !ready.length) || uploading} title="Send" aria-label="Send">
             <IconSend />
           </button>
         )}
       </div>
+      )}
       {notice && <div className="composer-notice" role="status">{notice}</div>}
     </div>
   );
