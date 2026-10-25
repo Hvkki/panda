@@ -131,7 +131,7 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
                 onRetry={m.role === "assistant" ? retry : undefined}
                 onOption={(text) => onSendMessage(chat, text)} />
             ))}
-          {!loading && waiting && <PendingReply queued={waiting.status === "pending"} />}
+          {!loading && waiting && <PendingReply queued={waiting.status === "pending"} model={chat.model} />}
           {!loading && totals.replies > 0 && (
             <div className="chat-total" title="Kiro credits used by Panda's replies in this chat">
               <IconCoins size={13} /> {fmtCredits(totals.credits)} {t("creditsUnit")} · {totals.replies} {totals.replies === 1 ? "reply" : "replies"}

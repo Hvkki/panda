@@ -165,7 +165,7 @@ select { padding: 8px 30px 8px 11px; border-radius: 10px; border: 1px solid var(
 .panda .pd-ear-l { transform-origin: 75% 85%; }
 .panda .pd-ear-r { transform-origin: 25% 85%; }
 .panda .pd-ring, .panda .pd-ring2 { transform-box: fill-box; transform-origin: center; opacity: 0; transition: opacity .35s var(--ease); }
-.panda .pd-halo { fill: var(--accent); opacity: 0; transform-box: fill-box; transform-origin: center; }
+.panda .pd-halo { fill: var(--pd-a, var(--accent)); opacity: 0; transform-box: fill-box; transform-origin: center; }
 .panda .pd-cheek { fill: #f59a8b; opacity: 0; transition: opacity .3s; }
 .panda .pd-pupils { transition: transform .3s var(--ease); }
 .panda-alive .pd-eyes { animation: pd-blink 5.4s infinite; }
@@ -198,6 +198,66 @@ select { padding: 8px 30px 8px 11px; border-radius: 10px; border: 1px solid var(
   .panda-working .pd-ring { animation-duration: 1.6s; }
   .panda-working .pd-ring2 { animation: none; opacity: 0; }
 }
+/* Model pandas: Opus (crown + circling sparks), Sonnet (glasses + spark), Haiku (sprout + speed).
+   Each tints its working orbit; the parts calm down under reduced motion. */
+.panda-opus { --pd-a: #8B5CF6; --pd-b: #F5B82E; }
+.panda-sonnet { --pd-a: #3B82F6; --pd-b: #22D3EE; }
+.panda-haiku { --pd-a: #22C55E; --pd-b: #A3E635; }
+.panda .pd-sparkles, .panda .pd-star, .panda .pd-crown, .panda .pd-gem, .panda .pd-leaf, .panda .pd-sprout, .panda .pd-bolt { transform-box: fill-box; transform-origin: center; }
+.panda .pd-sparkles { transform-box: view-box; transform-origin: 32px 32px; }
+.panda .pd-crown { transform-origin: 50% 100%; }
+.panda .pd-sprout { transform-origin: 30% 100%; }
+.panda .pd-leaf { transform-origin: 0% 60%; }
+.panda .pd-leaf.l2 { transform-origin: 100% 60%; }
+.panda .pd-star { opacity: .9; }
+.panda .pd-glint { opacity: 0; }
+.panda .pd-bolt { opacity: .9; }
+.panda .pd-speed { opacity: 0; transition: opacity .3s; }
+.panda-alive .pd-sparkles { animation: pd-spin 14s linear infinite; }
+.panda-alive .pd-star { animation: pd-twinkle 2.8s ease-in-out infinite; }
+.panda-alive .pd-star.s2 { animation-delay: .7s; } .panda-alive .pd-star.s3 { animation-delay: 1.4s; } .panda-alive .pd-star.s4 { animation-delay: 2.1s; }
+.panda-alive .pd-gem { animation: pd-gem 3.6s ease-in-out infinite; }
+.panda-alive .pd-glint { animation: pd-glint 4.5s ease-in-out infinite; }
+.panda-alive .pd-leaf { animation: pd-leaf 3.2s ease-in-out infinite; }
+.panda-alive .pd-leaf.l2 { animation-delay: .4s; }
+/* working: Opus gathers power slowly and grandly, Sonnet thinks in quick flashes, Haiku sprints */
+.panda-opus.panda-working .pd-sparkles { animation-duration: 3.2s; }
+.panda-opus.panda-working .pd-star { animation-duration: 1s; }
+.panda-opus.panda-working .pd-crown { animation: pd-crown 1.8s ease-in-out infinite; }
+.panda-opus.panda-working .pd-gem { animation-duration: .9s; }
+.panda-opus.panda-working .pd-halo { animation-duration: 2.6s; }
+.panda-opus.panda-working .pd-ring { animation-duration: 1.6s; }
+.panda-sonnet.panda-working .pd-glint { animation-duration: 1.3s; }
+.panda-sonnet.panda-working .pd-bolt { animation: pd-zap 1.1s steps(1, end) infinite; }
+.panda-sonnet.panda-working .pd-ring { animation-duration: .95s; }
+.panda-haiku.panda-working .pd-float { animation-duration: .62s; }
+.panda-haiku.panda-working .pd-ring { animation-duration: .6s; }
+.panda-haiku.panda-working .pd-ring2 { animation-duration: 1.1s; }
+.panda-haiku.panda-working .pd-leaf { animation-duration: .45s; }
+.panda-haiku.panda-working .pd-speed { opacity: 1; }
+.panda-haiku.panda-working .pd-speed path { animation: pd-dash .5s linear infinite; }
+.panda-haiku.panda-working .pd-speed .l2 { animation-delay: .15s; } .panda-haiku.panda-working .pd-speed .l3 { animation-delay: .3s; }
+.panda-happy.panda-opus .pd-star { animation-duration: .6s; }
+@keyframes pd-twinkle { 0%, 100% { transform: scale(.55) rotate(0); opacity: .45; } 50% { transform: scale(1.15) rotate(45deg); opacity: 1; } }
+@keyframes pd-gem { 0%, 100% { filter: none; } 50% { filter: drop-shadow(0 0 2.4px #C4B5FD) brightness(1.35); } }
+@keyframes pd-crown { 0%, 100% { transform: translateY(0) rotate(0); } 40% { transform: translateY(-1.4px) rotate(-4deg); } 75% { transform: translateY(-.6px) rotate(3deg); } }
+@keyframes pd-glint { 0%, 70%, 100% { opacity: 0; transform: translateX(-3px); } 80% { opacity: .95; } 90% { opacity: 0; transform: translateX(3px); } }
+@keyframes pd-zap { 0%, 100% { opacity: .9; transform: scale(1); } 15% { opacity: .25; } 30% { opacity: 1; transform: scale(1.18); } 45% { opacity: .9; transform: scale(1); } }
+@keyframes pd-leaf { 0%, 100% { transform: rotate(0); } 50% { transform: rotate(-12deg); } }
+@keyframes pd-dash { 0% { transform: translateX(4px); opacity: 0; } 30% { opacity: 1; } 100% { transform: translateX(-6px); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .panda .pd-sparkles, .panda .pd-star, .panda .pd-crown, .panda .pd-gem, .panda .pd-glint, .panda .pd-leaf, .panda .pd-bolt,
+  .panda .pd-speed path, .panda-haiku.panda-working .pd-float { animation: none !important; }
+}
+
+/* Smooth streaming: a soft caret at the end of the text while the reply is still arriving. */
+.prose.streaming > :last-child::after { content: ""; display: inline-block; width: .5em; height: .5em; margin-left: .25em;
+  border-radius: 50%; background: var(--accent); vertical-align: .05em; animation: stream-caret 1s ease-in-out infinite; }
+.prose.streaming > :is(ul, ol, pre, table, .table-wrap, .codeblock):last-child::after { display: none; }
+.prose.streaming > :is(ul, ol):last-child > li:last-child::after { content: ""; display: inline-block; width: .5em; height: .5em; margin-left: .25em;
+  border-radius: 50%; background: var(--accent); vertical-align: .05em; animation: stream-caret 1s ease-in-out infinite; }
+@keyframes stream-caret { 0%, 100% { opacity: .25; transform: scale(.7); } 50% { opacity: 1; transform: scale(1); } }
+@media (prefers-reduced-motion: reduce) { .prose.streaming > :last-child::after { animation: none; opacity: .6; } }
 .wordmark { display: inline-flex; align-items: center; gap: 9px; font-family: var(--display); font-weight: 600; letter-spacing: -0.01em; }
 
 /* ── login / splash ──────────────────────────────────────────── */
@@ -369,6 +429,8 @@ select { padding: 8px 30px 8px 11px; border-radius: 10px; border: 1px solid var(
 .sheet-handle { width: 40px; height: 4px; border-radius: 4px; background: var(--line-2); margin: 6px auto 8px; }
 .sheet-row { display: flex; align-items: center; justify-content: space-between; width: 100%; text-align: left; padding: 11px 14px; min-height: 54px; border-radius: 13px; }
 .sheet-row:hover, .sheet-row.selected { background: var(--bg-2); }
+.sheet-row-main { display: flex; align-items: center; gap: 12px; }
+.sheet-row-main .panda { flex: none; }
 .sheet-title { font-size: 1.01em; display: flex; align-items: center; font-weight: 500; }
 .sheet-sub { color: var(--muted); font-size: 0.87em; margin-top: 2px; }
 .sheet-sep { height: 1px; background: var(--line); margin: 8px 12px; }

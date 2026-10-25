@@ -7,6 +7,7 @@ import { useT } from "../lib/i18n";
 import { modelName } from "../lib/models";
 import { describeStep, summarize } from "../lib/steps";
 import { fmtCredits } from "../lib/usage";
+import { useSmoothText } from "../lib/smoothText";
 import { Logo } from "./Logo";
 import { MessageFiles, PandaImage, PandaLink } from "./Files";
 import { fileKind, type Attachment } from "../lib/files";
@@ -187,11 +188,11 @@ export function ApprovalCard({ m }: { m: Message }) {
 }
 
 /* ── placeholder while the worker picks the message up ─────────────────── */
-export function PendingReply({ queued }: { queued: boolean }) {
+export function PendingReply({ queued, model }: { queued: boolean; model?: string }) {
   const t = useT();
   return (
     <div className="msg assistant">
-      <div className="avatar"><Logo size={28} working /></div>
+      <div className="avatar"><Logo size={28} working model={model} /></div>
       <div className="msg-body">
         <div className="activity live">
           <div className="step current">
@@ -212,6 +213,8 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
   const [copied, setCopied] = useState(false);
   const live = m.status === "streaming" || m.status === "waiting";
   const hop = useJustFinished(live, m.status === "done");
+  // Smooth the half-second jumps of the stream into a steady flow (history renders at once).
+  const smooth = useSmoothText(m.role === "assistant" ? m.content || "" : "", live);
 
   const { online } = useBrowser();
   if (m.role === "tool") return m.meta.kind === "approval" ? <ApprovalCard m={m} /> : null;
@@ -236,23 +239,26 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
   }
 
   const cmd = m.meta.command || command || "";
-  const [body, options] = splitOptions(m.content || "");
+  const [fullBody, options] = splitOptions(m.content || "");
+  // While typing, hide a half-arrived "[OPTIONS: …" tail; the chips appear when the reply is done.
+  const body = smooth.typing ? splitOptions(smooth.text)[0].replace(/\[OPTIONS:[^\]]*$/, "").trimEnd() : fullBody;
+  const proseCls = `prose${smooth.typing ? " streaming" : ""}`;
   const tools = (m.meta.tools || []).filter(Boolean);
   const showThinking = settings.showThinking && !!m.thinking;
   const credits = typeof m.meta.credits === "number" ? m.meta.credits : m.meta.turn_stats?.credits;
   const showBrowser = !!m.meta.browser || (isLast && online && usedBrowser(tools));
   return (
     <div className={`msg assistant ${cmd ? "is-command" : ""}`}>
-      <div className="avatar"><Logo size={28} animated working={live} happy={hop} /></div>
+      <div className="avatar"><Logo size={28} animated working={live} happy={hop} model={m.meta.model} /></div>
       <div className="msg-body">
         {showThinking && <Thinking text={m.thinking} live={live && !m.content} />}
         <Activity tools={tools} live={live} hasText={!!body} />
         {cmd && (body || live) ? (
           <div className="command-out">
             <div className="command-head"><IconSlash size={14} /> {cmd}{live && <IconSpinner size={13} />}</div>
-            {body && <div className="prose"><Markdown text={body} /></div>}
+            {body && <div className={proseCls}><Markdown text={body} /></div>}
           </div>
-        ) : body ? <div className="prose"><Markdown text={body} /></div> :
+        ) : body ? <div className={proseCls}><Markdown text={body} /></div> :
           live && !tools.length && !showThinking ? (
             <div className="activity live"><div className="step current">
               <span className="step-icon"><IconSpinner size={15} /></span>

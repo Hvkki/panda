@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { EFFORTS, MAIN_MODELS, MORE_MODELS, effortLabel, modelName } from "../lib/models";
 import { useT } from "../lib/i18n";
 import { IconAlert, IconCheck, IconChevron } from "./Icons";
+import { Logo, pandaTier } from "./Logo";
 
 type Props = { model: string; effort: string; onChange: (model: string, effort: string) => void };
 
@@ -31,9 +32,12 @@ function ModelSheet({ model, effort, onChange, onClose }: Props & { onClose: () 
 
   const row = (id: string, name: string, blurb: string, credits: number) => (
     <button key={id} className={`sheet-row ${model === id ? "selected" : ""}`} onClick={() => { onChange(id, effort); onClose(); }}>
-      <div>
-        <div className="sheet-title">{name} <span className="credit">{credits}×</span></div>
-        {blurb && <div className="sheet-sub">{blurb}</div>}
+      <div className="sheet-row-main">
+        {pandaTier(id) && <Logo size={34} model={id} animated />}
+        <div>
+          <div className="sheet-title">{name} <span className="credit">{credits}×</span></div>
+          {blurb && <div className="sheet-sub">{blurb}</div>}
+        </div>
       </div>
       {model === id && <span className="accent"><IconCheck /></span>}
     </button>
