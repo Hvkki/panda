@@ -514,6 +514,7 @@ select { padding: 8px 30px 8px 11px; border-radius: 10px; border: 1px solid var(
   border-bottom: 1px solid var(--line); font-family: var(--sans); background: var(--bg-2); }
 .codeblock pre { margin: 0; padding: 12px 14px; overflow-x: auto; font-size: 0.83em; line-height: 1.55; }
 .table-wrap { overflow-x: auto; margin: 0.8em 0; border: 1px solid var(--line); border-radius: 12px; }
+.prose :is(th, td) { word-break: normal; overflow-wrap: normal; hyphens: none; }  /* whole words: the table scrolls instead */
 .prose table { border-collapse: collapse; font-family: var(--sans); font-size: 0.9em; min-width: 100%; }
 .prose th, .prose td { border-bottom: 1px solid var(--line); padding: 8px 11px; text-align: left; vertical-align: top; }
 .prose tr:last-child td { border-bottom: 0; }

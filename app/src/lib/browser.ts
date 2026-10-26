@@ -100,7 +100,7 @@ export class BrowserLink {
     const sizes = [...this.viewers.values()].filter(Boolean) as Size[];
     const big = sizes.sort((a, b) => b.vw * b.vh - a.vw * a.vh)[0];
     const mobile = !!big && window.innerWidth < 900;
-    this.send({ t: "hello", mode: mobile ? "mobile" : "desktop", vw: big?.vw || 0, vh: big?.vh || 0, lang: document.documentElement.lang || "en" });
+    this.send({ t: "hello", mode: mobile ? "mobile" : "desktop", vw: big?.vw || 0, vh: big?.vh || 0, lang: big ? document.documentElement.lang || "en" : "" });
   }
 
   private onFrame(payload: { d: string; w?: number; h?: number }) {

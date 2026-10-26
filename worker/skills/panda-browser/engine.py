@@ -640,15 +640,16 @@ class Engine:
             if t == "hello":
                 first = not self.viewer_active()
                 self.last_hello = time.time()
+                # Only the open browser panel (a real size) sets the language, so a second device or a
+                # chat card can't flip it back and forth. No reload: the next page you open uses it.
                 lang = str(p.get("lang") or "")[:2]
-                if lang in LANGS and lang != self.lang:  # speak the user's language to websites
+                sized = float(p.get("vw") or 0) > 50 and float(p.get("vh") or 0) > 50
+                if sized and lang in LANGS and lang != self.lang:
                     self.lang = lang
+                    log("browser language ->", lang)
                     with contextlib.suppress(Exception):
                         await self.ctx.set_extra_http_headers({"Accept-Language": LANGS[lang]})
                     await self._emulate()
-                    with contextlib.suppress(Exception):
-                        if self.page.url.startswith("http") and not self.busy:
-                            await self.page.reload(wait_until="domcontentloaded", timeout=15000)
                 # Only a viewer with a real size (the full panel) changes the page's shape; a chat card
                 # alone keeps it, so closing the panel on a phone doesn't reload the site as desktop.
                 if p.get("mode") and float(p.get("vw") or 0) > 50 and float(p.get("vh") or 0) > 50:
