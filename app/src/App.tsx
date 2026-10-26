@@ -10,7 +10,7 @@ import { Composer, type SendMeta } from "./components/Composer";
 import { SessionChip, useWorker } from "./components/SessionChip";
 import { NotificationsModal, SearchModal, SettingsModal, type SettingsTab } from "./components/Panels";
 import { Logo } from "./components/Logo";
-import { IconClock, IconDoc, IconGlobe, IconImage, IconPen, IconPlus, IconSidebar } from "./components/Icons";
+import { IconGlobe, IconPlus, IconSidebar } from "./components/Icons";
 import { FilesPage } from "./components/Files";
 import { BrowserPanel } from "./components/BrowserPanel";
 import { BrowserContext, isAlive, useBrowserLink, useBrowserSelect } from "./lib/browser";
@@ -47,12 +47,6 @@ export default function App() {
   );
 }
 
-const STARTERS = [
-  { icon: <IconPen size={17} />, title: "Write a LinkedIn post", text: "Write a LinkedIn post about my project" },
-  { icon: <IconDoc size={17} />, title: "Make a 6-slide deck", text: "Make a 6-slide deck about red pandas" },
-  { icon: <IconImage size={17} />, title: "Find photos", text: "Find 4 photos of Tuscany for a blog post" },
-  { icon: <IconClock size={17} />, title: "Schedule a reminder", text: "Every Monday at 9, send me my week's goals" },
-];
 
 function useWide(px: number) {
   const [wide, setWide] = useState(() => window.innerWidth >= px);
@@ -236,19 +230,11 @@ function Shell({ userId, email }: { userId: string; email: string }) {
               <div className="home-mark"><Logo size={64} animated look={typing ? "down" : null} /></div>
               <h1 className="greeting serif">{t(greetingKey())}{name ? `, ${capitalize(name)}` : ""}</h1>
             </div>
-            <div className="home-composer">
+            <div className="chat-bottom home-bottom">
               <Composer key={prefill} initialText={prefill} model={draft.model} effort={draft.effort} online={online}
                 onModel={(model, effort) => setDraft({ model, effort })} onTyping={setTyping}
-                onCommand={(n) => appCommand(n)}
+                onCommand={(n) => appCommand(n)} context={{ pct: 0, reset: true }}
                 onSend={(text, att, meta) => { setPrefill(""); startChat(text, att, null, meta); }} autoFocus />
-            </div>
-            <div className="starters">
-              {STARTERS.map((s) => (
-                <button key={s.text} className="starter" onClick={() => startChat(s.text)}>
-                  <span className="starter-icon">{s.icon}</span>
-                  <span className="starter-text"><b>{s.title}</b><span className="muted">{s.text}</span></span>
-                </button>
-              ))}
             </div>
           </div>
         )}
