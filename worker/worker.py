@@ -213,6 +213,39 @@ DEV_ENV = os.path.expanduser("~/.panda/dev.env")
 DEV_ROWS: list = []           # [{name, value}] with the prefix removed
 DEV_LOCK = threading.Lock()
 DEV_TURNS = {"n": 0}          # developer turns running now; dev.env exists only while > 0
+DEV_LATEST: dict = {}         # config/dev-latest.json: where the newest Panda work is (scripts/mark-latest.py)
+
+
+def refresh_dev_latest(sb: "Supabase") -> None:
+    """Read which branch/commit holds the newest Panda work, written by scripts/mark-latest.py."""
+    path = f"{HOME}/.panda/dev-latest.json"
+    try:
+        if sb.download("config/dev-latest.json", path):
+            data = json.load(open(path))
+            if isinstance(data, dict):
+                DEV_LATEST.clear()
+                DEV_LATEST.update(data)
+    except Exception as exc:
+        log("dev-latest read failed:", type(exc).__name__)
+
+
+def _latest_line() -> str:
+    def when(e) -> str:
+        return f"{str(e.get('at', ''))[:16].replace('T', ' ')} UTC"
+
+    def one(e) -> str:
+        return f"{e.get('branch')} @ {e.get('commit')} ({when(e)})"
+    last = DEV_LATEST.get("latest")
+    if not isinstance(last, dict) or not last.get("branch"):
+        return ("- Newest work: not recorded yet. After you push or deploy, run "
+                "`python3 scripts/mark-latest.py push|app|worker` so the next Developer agent knows.\n")
+    s = (f"- Newest work: branch `{last['branch']}`, commit {last.get('commit')} — \"{last.get('subject', '')}\" "
+         f"({last.get('part')}, {when(last)}).\n")
+    live = [f"{k} live from {one(DEV_LATEST[k])}" for k in ("app", "worker") if isinstance(DEV_LATEST.get(k), dict)]
+    if live:
+        s += "  " + "; ".join(live) + ".\n"
+    return s + ("  Start from that branch ($PANDA_DEV_BRANCH) unless the user names another. After every push run "
+                "`python3 scripts/mark-latest.py push` (the deploy scripts record app/worker themselves).\n")
 
 
 def sync_secrets(sb: "Supabase") -> list:
@@ -259,6 +292,9 @@ def sync_secrets(sb: "Supabase") -> list:
 def _write_dev_env():
     os.makedirs(os.path.dirname(DEV_ENV), exist_ok=True)
     lines = [f"export {r['name']}={shlex.quote(r['value'])}" for r in DEV_ROWS]
+    last = DEV_LATEST.get("latest") if isinstance(DEV_LATEST.get("latest"), dict) else {}
+    if last.get("branch") and not any(r["name"] == "PANDA_DEV_BRANCH" for r in DEV_ROWS):
+        lines.append(f"export PANDA_DEV_BRANCH={shlex.quote(str(last['branch']))}")
     with open(os.open(DEV_ENV, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -297,7 +333,7 @@ web app (UI), the worker, its skills or its prompt. Elsewhere you never touch Pa
 - Source: {DEV_REPO} (public). Work in ~/dev/panda: clone it the first time, otherwise `git fetch`.
   Use branch $PANDA_DEV_BRANCH if it is set, else the branch the user names, else the default branch.
   Read README.md, docs/architecture.md and docs/runbook.md before the first change.
-- Developer env variables, for this chat only: {names}.
+{_latest_line()}- Developer env variables, for this chat only: {names}.
   Load them inside a bash command with `set -a; . ~/.panda/dev.env; set +a`. The file exists only
   while a Developer turn runs. Never print, echo, log, commit or paste their values.
 - Web app (app/, Vite + React + TypeScript): `cd app && npm ci && npm run build` must pass before any
@@ -1333,7 +1369,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
         elif dev_chat:
             # Every message of the Developer chat says so (one short line), so the agent never has
             # to guess whether the full instructions from earlier still apply.
-            prompt = DEV_MARK + prompt
+            prompt = DEV_MARK + _latest_line() + "\n" + prompt
     before = scan_outputs()
     base_meta = {"model": chat.get("model"), "effort": chat.get("effort")}
     if cmd or kb:
@@ -1577,6 +1613,7 @@ def run_message(sb: Supabase, gw: Gateway, msg: dict):
     except Exception:
         pass
     if dev:  # developer env variables exist on disk only while the Developer chat is answering
+        refresh_dev_latest(sb)
         dev_begin()
     try:
         handle(sb, gw, msg)
@@ -1838,6 +1875,84 @@ def _reason(exc) -> str:
     return scrub(exc)[:200]
 
 
+KIRO_USAGE_HOSTS = ("https://codewhisperer.us-east-1.amazonaws.com", "https://q.eu-central-1.amazonaws.com")
+
+
+def _num(v) -> float | None:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def kiro_plan_by_api_key() -> dict:
+    """The Kiro plan total, read with Panda's own KIRO_API_KEY.
+
+    Kiro Crew skips this under API-key sign-in (reason "api_key_auth"), but Kiro's
+    GetUsageLimits accepts the key when the request says it is one (TokenType: API_KEY).
+    Returns {} when it can't be read, so the caller keeps whatever Crew said.
+    """
+    key = CFG.get("kiro_api_key") or ""
+    if not key:
+        return {}
+    headers = {"Authorization": f"Bearer {key}", "TokenType": "API_KEY",
+               "Content-Type": "application/x-amz-json-1.0",
+               "X-Amz-Target": "AmazonCodeWhispererService.GetUsageLimits",
+               "User-Agent": "AmazonQ-For-CLI/1.24.0 ua/2.0 os/linux lang/rust Panda"}
+    data = None
+    for host in KIRO_USAGE_HOSTS:
+        try:
+            r = requests.post(host, json={"origin": "AI_EDITOR", "resourceType": "AGENTIC_REQUEST"},
+                              headers=headers, timeout=20, allow_redirects=False)
+        except requests.RequestException as exc:
+            log("kiro plan read failed:", type(exc).__name__)
+            continue
+        if r.status_code == 200:
+            data = r.json()
+            break
+        log("kiro plan read:", host.split("//")[1].split(".")[0], r.status_code)
+    if not isinstance(data, dict):
+        return {}
+    rows = [b for b in data.get("usageBreakdownList") or [] if isinstance(b, dict)]
+    b = next((x for x in rows if x.get("resourceType") == "CREDIT"), rows[0] if len(rows) == 1 else None)
+    if not b:
+        return {}
+    used = _num(b.get("currentUsageWithPrecision")) or _num(b.get("currentUsage")) or 0.0
+    limit = _num(b.get("usageLimitWithPrecision")) or _num(b.get("usageLimit"))
+    if not limit:
+        return {}
+    out: dict = {"available": True, "source": "kiro_api_key", "credits_used": round(used, 2),
+                 "credits_plan": round(limit, 2), "percentage": round(used / limit * 100, 1)}
+    over = _num(b.get("currentOveragesWithPrecision")) or _num(b.get("currentOverages"))
+    if over:
+        out["credits_overage"] = round(over, 2)
+    if _num(b.get("overageRate")):
+        out["overage_rate"] = b["overageRate"]
+    title = (data.get("subscriptionInfo") or {}).get("subscriptionTitle")
+    if isinstance(title, str) and title:
+        out["plan"] = title.title()  # "KIRO PRO+" -> "Kiro Pro+"
+    reset = _num(b.get("nextDateReset")) or _num(data.get("nextDateReset"))
+    if reset:
+        out["resets"] = datetime.fromtimestamp(reset, timezone.utc).strftime("%Y-%m-%d")
+    bonus = []
+    for x in b.get("bonuses") or []:
+        if not isinstance(x, dict) or not _num(x.get("usageLimit")):
+            continue
+        item = {"name": str(x.get("displayName") or "Bonus credits")[:60],
+                "used": round(_num(x.get("currentUsage")) or 0, 2), "total": round(x["usageLimit"], 2)}
+        exp = _num(x.get("expiresAt"))
+        if exp:
+            item["days_left"] = max(0, int((exp - time.time()) // 86400))
+        bonus.append(item)
+    ft = b.get("freeTrialInfo") or {}
+    if isinstance(ft, dict) and ft.get("freeTrialStatus") == "ACTIVE" and _num(ft.get("usageLimit")):
+        item = {"name": "Free trial", "used": round(_num(ft.get("currentUsage")) or 0, 2),
+                "total": round(ft["usageLimit"], 2)}
+        if _num(ft.get("freeTrialExpiry")):
+            item["days_left"] = max(0, int((ft["freeTrialExpiry"] - time.time()) // 86400))
+        bonus.append(item)
+    if bonus:
+        out["bonus_credits"] = bonus
+    return out
+
+
 def refresh_usage(sb: Supabase, gw: Gateway, force: bool = False) -> dict | None:
     """Kiro account credits (used / plan / reset date) and this gateway's credits per day.
 
@@ -1869,6 +1984,15 @@ def refresh_usage(sb: Supabase, gw: Gateway, force: bool = False) -> dict | None
             account = {**account, **billing}
     except Exception:
         pass
+    if not account.get("credits_plan"):
+        # Crew can't read the plan under API-key sign-in ("api_key_auth"): read it with the key.
+        try:
+            own = kiro_plan_by_api_key()
+        except Exception as exc:
+            own = {}
+            log("kiro plan read failed:", _reason(exc))
+        if own:
+            account = own
     usage = {"account": account, "daily": daily, "at": now_iso()}
     SESSION_INFO["usage"] = usage
     if USAGE_STATE["sid"]:

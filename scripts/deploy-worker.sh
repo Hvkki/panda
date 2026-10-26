@@ -21,3 +21,4 @@ up code/worker.py worker/worker.py text/x-python
 up config/prompt.md worker/prompt.md text/markdown
 up code/skills.tar.gz "$TAR" application/gzip
 rm -f "$TAR"
+python3 scripts/mark-latest.py worker || true  # tell the next Developer agent which code is live

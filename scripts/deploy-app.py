@@ -53,6 +53,8 @@ def main():
         s = call("GET", f"{API}/v13/deployments/{dep['id']}", token)
         if s.get("readyState") in ("READY", "ERROR", "CANCELED"):
             print(s["readyState"], *(s.get("alias") or [s.get("url")]))
+            if s.get("readyState") == "READY":  # tell the next Developer agent which code is live
+                subprocess.run([sys.executable, str(ROOT / "scripts" / "mark-latest.py"), "app"], check=False)
             return
         time.sleep(3)
     sys.exit("timed out waiting for the deployment")
