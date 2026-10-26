@@ -461,8 +461,8 @@ select { padding: 8px 30px 8px 11px; border-radius: 10px; border: 1px solid var(
 .sheet-label.as-btn { width: 100%; }
 .chev { display: inline-grid; transition: transform .2s var(--ease); }
 .chev.up { transform: rotate(180deg); }
-.effort-row { display: flex; gap: 6px; padding: 4px 12px 6px; flex-wrap: wrap; }
-.effort-pill { flex: 1; min-width: 64px; padding: 9px 10px; border-radius: 11px; border: 1px solid var(--line); background: var(--panel-2); font-size: .9em; font-weight: 500; }
+.effort-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(56px, 1fr)); gap: 6px; padding: 4px 12px 6px; }
+.effort-pill { min-width: 0; padding: 9px 4px; border-radius: 11px; border: 1px solid var(--line); background: var(--panel-2); font-size: .86em; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; }
 .effort-pill.on { background: var(--ink); color: var(--bg); border-color: var(--ink); }
 .sheet-warn { display: flex; gap: 6px; align-items: center; margin: 4px 14px; font-size: .82em; color: var(--warn); }
 .sheet-foot { font-size: 0.78em; padding: 8px 14px 0; }
