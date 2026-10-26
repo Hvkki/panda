@@ -889,17 +889,18 @@ html:has(.sheet-backdrop), html:has(.sheet-backdrop) body { overscroll-behavior-
 /* One real pencil stroke: press and pull slowly, lift a little, carry the paw back in the air, set it
    down, a short pause. The arm sweep (pdw-sweep) moves the whole stroke across the board. */
 @keyframes pdw-hand {
-  0% { transform: rotate(-3deg) translate(0, 0); }
-  12% { transform: rotate(-2.4deg) translate(.1px, .15px); animation-timing-function: cubic-bezier(.4, 0, .6, 1); }
-  48% { transform: rotate(3.4deg) translate(.6px, -.2px); }
-  58% { transform: rotate(3.8deg) translate(.5px, -1.8px); }
-  80% { transform: rotate(-2.6deg) translate(-.2px, -1.4px); }
-  90% { transform: rotate(-3deg) translate(0, 0); }
-  100% { transform: rotate(-3deg) translate(0, 0); } }
+  0% { transform: rotate(-6deg) translate(0, 0); }
+  12% { transform: rotate(-5deg) translate(.2px, .3px); animation-timing-function: cubic-bezier(.4, 0, .6, 1); }
+  48% { transform: rotate(6deg) translate(1px, -.3px); }
+  58% { transform: rotate(6.5deg) translate(.8px, -3px); }
+  80% { transform: rotate(-5deg) translate(-.4px, -2.4px); }
+  90% { transform: rotate(-6deg) translate(0, 0); }
+  100% { transform: rotate(-6deg) translate(0, 0); } }
 @keyframes pdw-look { 0%, 100% { transform: rotate(1.5deg); } 50% { transform: rotate(4deg) translateX(.6px); } }
 @keyframes pdw-breathe { 50% { transform: scale(1.012, .992); } }
 @media (prefers-reduced-motion: reduce) {
-  .pdw .pdw-line, .pdw .pdw-fill, .pdw-hand, .pdw-head, .pdw-ear, .pdw-body, .pdw-arm { animation: none; }
+  /* The paw keeps drawing (it is the point of the card): one slow stroke at a time, nothing else moves. */
+  .pdw .pdw-line, .pdw .pdw-fill, .pdw-head, .pdw-ear, .pdw-body, .pdw-arm { animation: none; }
   .pdw .pdw-line { stroke-dashoffset: 0; }
 }
 .drive-tag { color: #1a73e8; font-weight: 500; }
