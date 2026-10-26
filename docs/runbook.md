@@ -101,6 +101,9 @@ Use the tester user id that appears in `tools/*.py`. Lock the account again afte
 - **UI:** `cd app && npm run build`, then `python tools/screenshots/mock_ui.py <out-dir> [fixtures]`.
   Supabase (auth, REST, Storage, Realtime) is mocked; it saves screenshots and checks the panda
   animations. Both browser tests need `PANDA_CHROMIUM` where Playwright's own download is missing.
+- **Pictures UI:** `python tools/screenshots/mock_drawing.py <out-dir> [picture.png]` (same mocks):
+  the drawing panda and its % in real time, light and dark, an uploaded inline picture, and an old
+  reply that names a worker path.
 
 ## Local setup
 

@@ -891,6 +891,105 @@ def stop_browser(sb: "Supabase"):
         log("final browser backup failed:", exc)
 
 
+# ── Codex (pictures with the user's ChatGPT plan): login kept across runs ────
+# Kaggle starts every run on a clean disk, so the login is saved encrypted (same key as the browser
+# logins) and put back at start, and Codex itself is installed again. Only the login and settings
+# are kept, not Codex's logs, caches or pictures.
+CODEX_VERSION = "0.164.0"  # same pin as skills/panda-image/make_image.py
+CODEX_HOME = os.path.expanduser("~/.codex")
+CODEX_FILES = ("auth.json", "config.toml")
+CODEX_BLOB = "codex/login.enc"
+CODEX_FLAG = os.path.expanduser("~/.panda/codex-installing")  # make_image.py waits while it exists
+_codex_sync = {"sig": None}
+
+
+def _codex_sig() -> tuple:
+    sig = []
+    for n in CODEX_FILES:
+        try:
+            st = os.stat(os.path.join(CODEX_HOME, n))
+            sig.append((n, st.st_mtime, st.st_size))
+        except OSError:
+            pass
+    return tuple(sig)
+
+
+def _signed_in(sig) -> bool:
+    return any(n == "auth.json" for n, *_ in (sig or ()))
+
+
+def codex_restore(sb: "Supabase") -> bool:
+    """Download + decrypt the saved Codex login, so pictures work without signing in again."""
+    f = _fernet()
+    tmp = f"{WORK}/codex-login.enc"
+    if not f or not sb.download(state_key(CODEX_BLOB), tmp):
+        return False
+    try:
+        files = json.loads(f.decrypt(open(tmp, "rb").read()))
+        os.makedirs(CODEX_HOME, exist_ok=True)
+        for n, b64 in files.items():
+            if n in CODEX_FILES:
+                p = os.path.join(CODEX_HOME, n)
+                with open(os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as out:
+                    out.write(base64.b64decode(b64))
+        _codex_sync["sig"] = _codex_sig()
+        log("codex login restored")
+        return True
+    except Exception as exc:  # wrong key or corrupt blob: the user signs in again, never crash
+        log("codex login could not be restored:", type(exc).__name__)
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+
+
+def codex_backup(sb: "Supabase", force: bool = False):
+    """Encrypt + upload the Codex login when it changed (a sign-in, a token refresh, a sign-out)."""
+    f = _fernet()
+    sig = _codex_sig()
+    if not f or (not force and sig == _codex_sync["sig"]):
+        return
+    if not _signed_in(sig):
+        if _signed_in(_codex_sync["sig"]):  # signed out during this run: forget the saved login too
+            sb.delete_object(state_key(CODEX_BLOB))
+            log("codex login removed (signed out)")
+        _codex_sync["sig"] = sig
+        return
+    files = {n: base64.b64encode(open(os.path.join(CODEX_HOME, n), "rb").read()).decode()
+             for n, *_ in sig}
+    tmp = f"{WORK}/codex-login.enc"
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as out:
+        out.write(f.encrypt(json.dumps(files).encode()))
+    try:
+        sb.upload(state_key(CODEX_BLOB), tmp, mime="application/octet-stream")
+        _codex_sync["sig"] = sig
+        log("codex login saved")
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+
+
+def _codex_install():
+    try:
+        if not shutil.which("codex", path=ENV["PATH"]):
+            sh(f"npm install -g @openai/codex@{CODEX_VERSION}", timeout=600)
+        log("codex ready" if shutil.which("codex", path=ENV["PATH"]) else "codex install failed")
+    except Exception as exc:
+        log("codex install failed:", exc)
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(CODEX_FLAG)
+
+
+def start_codex(sb: "Supabase"):
+    """Put the Codex login back; if there is one, install Codex in the background (~20 s)."""
+    if not codex_restore(sb):
+        return
+    os.makedirs(os.path.dirname(CODEX_FLAG), exist_ok=True)
+    open(CODEX_FLAG, "w").close()
+    threading.Thread(target=_codex_install, daemon=True).start()
+
+
 # ── Voice input: free local Whisper (faster-whisper on the worker's CPU) ─────
 # The app records the user's voice and sends it as an `stt` command; this turns it into text.
 # Its packages live in their own folder so they never change Kiro Crew's numpy or huggingface-hub.
@@ -1114,15 +1213,29 @@ def _reply_refs(text: str) -> tuple[set, set]:
 
 
 def _resolve_local(target: str) -> str | None:
-    """A referenced path that points to a real file under ~/outputs or ~/work (nothing else)."""
+    """A referenced path that points to a real file under ~/outputs or ~/work, or an image Kiro Crew
+    keeps beside a chat (nothing else)."""
     t = (target or "").strip().strip("<>")
     if not t or t.startswith("panda-file:") or re.match(r"^[a-z][a-z0-9+.-]*://", t, re.I):
         return None
     p = os.path.abspath(os.path.expanduser(t))
     roots = (OUTPUTS, WORKDIR)
-    if not any(p == r or p.startswith(r + os.sep) for r in roots):
+    if not any(p == r or p.startswith(r + os.sep) for r in roots) and not _crew_attachment(p):
         return None
     return p if os.path.isfile(p) else None
+
+
+CREW_SESSIONS = os.path.expanduser("~/.kiro/crew/sessions")
+_ATTACH_PREFIX = re.compile(r"^[0-9a-f]{16}-")  # Crew names its copies <sha256 prefix>-<name>
+
+
+def _crew_attachment(p: str) -> bool:
+    """An image in sessions/<chat>.attachments/. When Crew saves a turn it copies every image the
+    reply shows with ![](…) there and rewrites the path, so the final text names that copy, not the
+    file the agent made (in ~/work, ~/.codex, …)."""
+    parent = os.path.dirname(p)
+    return (os.path.dirname(parent) == CREW_SESSIONS and parent.endswith(".attachments")
+            and p.lower().endswith(IMAGE_EXT) and not os.path.islink(p))
 
 
 def _referenced(path: str, targets: set) -> bool:
@@ -1137,6 +1250,8 @@ def _referenced(path: str, targets: set) -> bool:
 
 def _publish_one(sb: Supabase, chat: dict, message_id: int, path: str, size: int) -> dict | None:
     name = os.path.basename(path)
+    if _crew_attachment(path):
+        name = _ATTACH_PREFIX.sub("", name) or name
     mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
     body = {"owner": chat["owner"], "chat_id": chat["id"], "message_id": message_id,
             "project_id": chat.get("project_id"), "kind": "output", "name": name, "mime": mime, "size": size}
@@ -1194,6 +1309,7 @@ def link_files(text: str, published: list) -> str:
     for local, row, _inline in published:
         for form in (local, local.replace(HOME, "~", 1)):
             text = text.replace(f"]({form})", f"](panda-file:{row['id']})")
+            text = text.replace(f"](<{form}>)", f"](panda-file:{row['id']})")
             text = text.replace(f"`{form}`", f"`{os.path.basename(local)}`")
     return text
 
@@ -2442,6 +2558,7 @@ def main():
         mem_on = user_settings(sb, OWNER).get("memory", True)
         sh(f"kirocrew config set memory.writes_enabled {'true' if mem_on else 'false'}")
         start_browser(sb)
+        _safe(start_codex, sb)
         start_stt()
         gw_proc = start_gateway()
         gw = Gateway()
@@ -2486,6 +2603,10 @@ def main():
                 except Exception as exc:
                     log("browser sync:", type(exc).__name__)
                 try:
+                    codex_backup(sb)
+                except Exception as exc:
+                    log("codex sync:", type(exc).__name__)
+                try:
                     refresh_usage(sb, gw)
                 except Exception as exc:
                     log("usage refresh:", type(exc).__name__)
@@ -2507,6 +2628,7 @@ def main():
         stop_evt.set()
         pool.shutdown(wait=True, cancel_futures=False)  # let answers in flight finish
         stop_browser(sb)
+        _safe(codex_backup, sb, True)
         set_sess(status="stopping")
         snap_at = snapshot(sb, reason)
         SESSION_INFO.update(stop_reason=reason, runtime_secs=round(time.time() - T0))

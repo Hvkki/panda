@@ -85,6 +85,21 @@ runs rows of the account that pressed Start, and expires rows that waited more t
 Outputs up to 45 MB go to Storage. Larger outputs go to Google Drive, and the `files` row points to
 `drive:<file id>`. The Drive copy stays in the owner's Drive when the card is deleted in the app.
 
+Inline images: when Crew saves a turn it copies every image the reply shows with `![](…)` into
+`~/.kiro/crew/sessions/<chat>.attachments/<hash>-<name>` and rewrites the path, so the final text names
+that copy. The worker publishes those copies too (images only) and rewrites them to `panda-file:<id>`,
+which the app resolves to a signed URL (react-markdown's `urlTransform` must let `panda-file:` through).
+A path the app cannot load shows "picture not available", never a link.
+
+## Pictures (Codex)
+
+`panda-image` runs `codex exec` with the owner's ChatGPT plan (pinned `@openai/codex` 0.164.0) and copies
+the PNG out of `~/.codex/generated_images`. Kaggle starts on a clean disk, so the worker saves
+`~/.codex/auth.json` (and `config.toml`) encrypted with the browser key to `codex/login.enc` in
+`kirocrew-state` (per account, like the browser logins) whenever it changes and at stop, and at start
+puts it back and reinstalls Codex. While the newest step is `make_image.py`, the app shows a drawing
+panda with an estimated % (`IMAGE_SECS` in `app/src/lib/drawing.ts`, measured at 44 s).
+
 ## Browser
 
 `panda-browser` runs a headless Chromium with a local HTTP API (the `pb` command). Frames go out as

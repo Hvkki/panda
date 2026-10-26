@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { supabase, type Message } from "../lib/supabase";
 import { useSettings } from "../lib/settings";
@@ -13,6 +13,7 @@ import { MessageFiles, PandaImage, PandaLink } from "./Files";
 import { fileKind, type Attachment } from "../lib/files";
 import { useBrowser, usedBrowser } from "../lib/browser";
 import { BrowserCard } from "./BrowserCard";
+import { DrawingPanda } from "./DrawingPanda";
 import { IconAlert, IconBrain, IconCheck, IconChevron, IconCoins, IconCopy, IconRetry, IconShield, IconSlash, IconSpinner } from "./Icons";
 
 /** "/compact focus on the plan" → "/compact" when the message is a command. */
@@ -58,19 +59,23 @@ const secsLabel = (ms: number) => (ms >= 3000 ? ` · ${Math.round(ms / 1000)}s` 
 
 const OPTIONS_RE = /\[OPTIONS:\s*([^\]]+)\]\s*$/;
 
+/** react-markdown drops every URL scheme it does not know, so `panda-file:<id>` (an uploaded file,
+ *  see Files.tsx) would reach the image and link components as "". Other URLs keep the default check. */
+const keepPandaFiles = (url: string) => (/^panda-file:[\w-]+$/.test(url) ? url : defaultUrlTransform(url));
+
 function splitOptions(text: string): [string, string[]] {
   const m = text.match(OPTIONS_RE);
   if (!m) return [text, []];
   return [text.slice(0, m.index).trimEnd(), m[1].split("|").map((s) => s.trim()).filter(Boolean).slice(0, 4)];
 }
 
-const Markdown = memo(function Markdown({ text }: { text: string }) {
+const Markdown = memo(function Markdown({ text, live = false }: { text: string; live?: boolean }) {
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]}
+    <ReactMarkdown remarkPlugins={[remarkGfm]} urlTransform={keepPandaFiles}
       components={{
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
         a: ({ node, ...p }) => <PandaLink {...p} />,
-        img: ({ src, alt }) => <PandaImage src={typeof src === "string" ? src : undefined} alt={alt} />,
+        img: ({ src, alt }) => <PandaImage src={typeof src === "string" ? src : undefined} alt={alt} live={live} />,
         code: ({ className, children, ...rest }) => {
           const inline = !className && !String(children).includes("\n");
           if (inline) return <code className="inline-code" {...rest}>{children}</code>;
@@ -236,6 +241,17 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
   const [textAt, now] = useChangedAt((m.content || "").length, live);
   const [toolAt] = useChangedAt(toolCount, live);
   const [startAt] = useChangedAt(m.id, live);
+  // A picture is being made: the newest step is the image tool. The key changes per image step
+  // (steps with the same label count once, like the activity list), so each one starts at 0%.
+  const toolList: string[] | undefined = m.meta?.tools;
+  const drawKey = useMemo(() => {
+    if (m.status !== "streaming") return "";
+    const labels = (toolList || []).filter(Boolean).map((x) => describeStep(x));
+    const last = labels[labels.length - 1];
+    if (!last?.image) return "";
+    return `img-${labels.filter((s, i) => i === 0 || s.label !== labels[i - 1].label).length}`;
+  }, [m.status, toolList]);
+  const [drawAt] = useChangedAt(drawKey, live);
 
   const { online } = useBrowser();
   if (m.role === "tool") return m.meta.kind === "approval" ? <ApprovalCard m={m} /> : null;
@@ -278,6 +294,7 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
   const showStatus = live && !!body && caughtUp && quietFor >= 1500 && m.status !== "waiting";
   const statusLabel = lastStep && toolAt > textAt ? lastStep.label : t("thinking");
   const showBrowser = !!m.meta.browser || (isLast && online && usedBrowser(tools));
+  const drawing = !!drawKey && toolAt >= textAt;
   return (
     <div className={`msg assistant ${cmd ? "is-command" : ""}`}>
       <div className="avatar"><Logo size={28} animated working={live} happy={hop} model={m.meta.model} /></div>
@@ -287,16 +304,17 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
         {cmd && (body || live) ? (
           <div className="command-out">
             <div className="command-head"><IconSlash size={14} /> {cmd}{live && <IconSpinner size={13} />}</div>
-            {body && <div className={proseCls}><Markdown text={body} /></div>}
+            {body && <div className={proseCls}><Markdown text={body} live={live} /></div>}
           </div>
-        ) : body ? <div className={proseCls}><Markdown text={body} /></div> :
+        ) : body ? <div className={proseCls}><Markdown text={body} live={live} /></div> :
           live && !tools.length && !showThinking ? (
             <div className="activity live"><div className="step current">
               <span className="step-icon"><IconSpinner size={15} /></span>
               <span className="step-label shimmer">{m.status === "waiting" ? "Waiting for your approval" : t("thinking")}{secsLabel(now - startAt)}</span>
             </div></div>
           ) : null}
-        {showStatus && (
+        {drawing && <DrawingPanda key={drawKey} startedAt={drawAt} />}
+        {showStatus && !drawing && (
           <div className="live-status" role="status">
             <IconSpinner size={13} />
             {lastStep && toolAt > textAt && <span className="step-glyph">{lastStep.icon}</span>}

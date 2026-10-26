@@ -17,10 +17,22 @@ export function usePandaFile(ref: string | undefined) {
   return url;
 }
 
-export function PandaImage({ src, alt }: { src?: string; alt?: string }) {
-  const url = usePandaFile(src);
+/** A path on the worker's disk (named in a reply but never uploaded): the app cannot load it. */
+const isLocalPath = (s?: string) => !!s && !/^(panda-file:|https?:|data:|blob:)/i.test(s);
+
+export function PandaImage({ src, alt, live }: { src?: string; alt?: string; live?: boolean }) {
+  const local = isLocalPath(src);
+  const url = usePandaFile(local ? undefined : src);
+  const [broken, setBroken] = useState(false);
+  // While the reply streams, the path is still the worker's: the uploaded copy replaces it at the end.
+  if (local) return live ? <span className="img-loading" /> : <MissingImage alt={alt} />;
+  if (!src || broken) return <MissingImage alt={alt} />;
   if (!url) return <span className="img-loading" />;
-  return <a href={url} target="_blank" rel="noreferrer"><img src={url} alt={alt || ""} loading="lazy" /></a>;
+  return <a href={url} target="_blank" rel="noreferrer"><img src={url} alt={alt || ""} loading="lazy" onError={() => setBroken(true)} /></a>;
+}
+
+function MissingImage({ alt }: { alt?: string }) {
+  return <span className="img-missing"><IconImage size={16} />{alt ? `${alt} · ` : ""}picture not available</span>;
 }
 
 export function PandaLink(props: React.AnchorHTMLAttributes<HTMLAnchorElement>) {

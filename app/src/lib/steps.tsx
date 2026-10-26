@@ -4,7 +4,7 @@ import {
   IconSlides, IconSparkle, IconTable, IconTerminal, IconTool, IconUsers,
 } from "../components/Icons";
 
-export type Step = { icon: ReactNode; label: string; detail: string; error?: boolean };
+export type Step = { icon: ReactNode; label: string; detail: string; error?: boolean; image?: boolean };
 
 const base = (p: string) => p.split(/[\\/]/).pop() || p;
 const short = (s: string, n = 70) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
@@ -30,6 +30,14 @@ export function describeStep(raw: string): Step {
       `Creating ${ext === "pdf" ? "PDF" : ext === "docx" ? "Word document" : "slides"} · ${base(doc[1])}`);
   }
   if (low.includes("make_doc.py")) return s(<IconDoc size={15} />, "Creating document");
+  // A new picture with Codex (panda-image skill). `image` makes the chat show the drawing panda.
+  if (low.includes("make_image.py")) {
+    if (/\s--login\b/.test(low)) return s(<IconImage size={15} />, "Signing in to Codex");
+    if (/\s--status\b/.test(low)) return s(<IconImage size={15} />, "Checking picture limits");
+    const q = t.match(/make_image\.py\s+(["'])(.+?)\1/);
+    return s(<IconImage size={15} />, q ? `Drawing · ${short(q[2], 40)}` : "Drawing a picture", { image: true });
+  }
+  if (/\bcodex\s+exec\b/.test(low) && /imag|picture|draw/.test(low)) return s(<IconImage size={15} />, "Drawing a picture", { image: true });
   if (low.includes("find_images.py")) {
     const q = t.match(/find_images\.py\s+["']([^"']+)["']/);
     return s(<IconImage size={15} />, q ? `Searching images · ${short(q[1], 40)}` : "Searching images");
@@ -87,5 +95,6 @@ export function summarize(steps: Step[]): string {
   const real = steps.filter((x) => !x.error);
   if (!real.length) return "Done";
   const made = real.find((x) => x.label.startsWith("Creating"));
-  return `${real.length} step${real.length === 1 ? "" : "s"}${made ? ` · ${made.label.split(" · ")[0].replace("Creating", "Created")}` : ""}`;
+  const drew = real.some((x) => x.image);
+  return `${real.length} step${real.length === 1 ? "" : "s"}${made ? ` · ${made.label.split(" · ")[0].replace("Creating", "Created")}` : drew ? " · Drew a picture" : ""}`;
 }

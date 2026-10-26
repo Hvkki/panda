@@ -46,3 +46,9 @@
 
 13. **Screenshots show state, not motion.** A still frame cannot prove an animation or a live stream.
     Say "not verified" until someone has seen it on a device.
+
+14. **Inline images went missing twice over.** Kiro Crew rewrites a reply's `![](/path)` to its own copy in
+    `sessions/<chat>.attachments/` before the worker reads the final text, so the worker must publish
+    from there. And react-markdown's default `urlTransform` turns unknown schemes such as
+    `panda-file:` into `""`, so the app needs its own transform. `tools/screenshots/mock_drawing.py`
+    checks both.
