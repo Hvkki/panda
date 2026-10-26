@@ -1,0 +1,41 @@
+// Panda for Android: a Trusted Web Activity (TWA).
+// The app opens the live Panda web app full screen inside Chrome, so the
+// mic, Google sign-in, notifications and updates work exactly like the web app.
+plugins { id "com.android.application" }
+
+def host = "panda-app-gamma.vercel.app"
+
+android {
+    namespace "com.hvkki.panda"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.hvkki.panda"
+        minSdk 23
+        targetSdk 35
+        versionCode((project.findProperty("versionCode") ?: "1") as int)
+        versionName "1.0." + versionCode
+        manifestPlaceholders = [host: host, url: "https://" + host + "/"]
+    }
+
+    // Signing key lives outside git. scripts/build-apk.sh passes its path and passwords.
+    signingConfigs {
+        release {
+            storeFile file(System.getenv("PANDA_KEYSTORE") ?: "missing.jks")
+            storePassword System.getenv("PANDA_KEYSTORE_PASS")
+            keyAlias "panda"
+            keyPassword System.getenv("PANDA_KEYSTORE_PASS")
+        }
+    }
+    buildTypes {
+        release { minifyEnabled false; signingConfig signingConfigs.release }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation "com.google.androidbrowserhelper:androidbrowserhelper:2.5.0"
+}

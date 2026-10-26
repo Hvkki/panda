@@ -36,6 +36,12 @@ set -a; . ./panda-api-keys.env; set +a
   account in `worker.json` keeps the top-level paths and is the only one with Google Drive).
 - **Auth settings:** Site URL `https://panda-app-gamma.vercel.app`. Redirect URL
   `https://panda-app-gamma.vercel.app/**`. "Allow new users to sign up" OFF.
+- **Android app (`android/`):** a Trusted Web Activity: it opens the live web app full screen in
+  Chrome, so app deploys reach it with no new APK. Build with `python3 scripts/build-apk.py
+  --version-code N` (raise N for each new APK; needs JDK 17+, `$ANDROID_HOME`, Gradle as `$GRADLE`).
+  The signing key lives in `kirocrew-state/config/android/`, never in git; losing it means the
+  next APK cannot install over the old one. Its fingerprint is in
+  `app/public/.well-known/assetlinks.json`; if that file is not live, the app shows a URL bar.
 
 ## Rotate keys
 

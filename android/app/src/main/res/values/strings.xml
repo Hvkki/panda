@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Panda</string>
+    <!-- Lets the site prove this app is Panda's, so Chrome hides its URL bar. -->
+    <string name="asset_statements" translatable="false">[{\"relation\": [\"delegate_permission/common.handle_all_urls\"], \"target\": {\"namespace\": \"web\", \"site\": \"https://panda-app-gamma.vercel.app\"}}]</string>
+    <color name="panda_bg">#FAF7F2</color>
+</resources>

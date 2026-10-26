@@ -1,0 +1,14 @@
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.hvkki.panda",
+      "sha256_cert_fingerprints": [
+        "C8:80:3E:B7:63:7D:0F:9F:E5:1B:F1:65:56:68:64:FA:F6:B4:89:55:38:0B:06:A8:0E:0B:E1:F3:19:08:D8:CB"
+      ]
+    }
+  }
+]
