@@ -85,6 +85,8 @@ export type UsageInfo = {
   account?: AccountUsage;
   /** Credits per day on the gateway (all activity, background work included). */
   daily?: { date: string; credits: number; messages?: number }[];
+  /** This month's gateway credits split into chat replies and background work, counted since `since`. */
+  split?: { replies: number; background: number; titles: number; memory: number; other: number; since: string | null };
   at?: string;
 };
 

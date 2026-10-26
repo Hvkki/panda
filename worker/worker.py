@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import glob
 import json
+import math
 import os
 import re
 import shlex
@@ -1953,6 +1954,45 @@ def kiro_plan_by_api_key() -> dict:
     return out
 
 
+def crew_spend_split() -> dict:
+    """This month's gateway credits: chat replies vs background work (titles, memory, other).
+
+    Read from Kiro Crew's per-turn records (~/.kiro/crew/usage/tokens/*.jsonl). These live on this
+    machine only, so they start fresh at each Start; `since` says from when they count.
+    """
+    month = time.strftime("%Y-%m")
+    out = {"replies": 0.0, "background": 0.0, "titles": 0.0, "memory": 0.0, "other": 0.0, "since": None}
+    for path in sorted(glob.glob(f"{HOME}/.kiro/crew/usage/tokens/{month}-*.jsonl")):
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(r, dict) or r.get("_type") != "tokens":
+                    continue
+                try:
+                    c = float(r.get("credits") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(c):
+                    continue
+                ts = str(r.get("ts") or "")
+                if ts and (out["since"] is None or ts < out["since"]):
+                    out["since"] = ts
+                slot, surface = str(r.get("slot") or ""), str(r.get("surface") or "")
+                kind = surface.split(":", 1)[0]
+                if slot.startswith("_") or kind in ("bg", "cron", "subagent", "spawn", "workflow", "task", "heartbeat"):
+                    out["background"] += c
+                    part = "titles" if surface == "bg:bg_oneliner" else "memory" if surface == "bg:consolidation" else "other"
+                    out[part] += c
+                else:
+                    out["replies"] += c
+    for k in ("replies", "background", "titles", "memory", "other"):
+        out[k] = round(out[k], 2)
+    return out
+
+
 def refresh_usage(sb: Supabase, gw: Gateway, force: bool = False) -> dict | None:
     """Kiro account credits (used / plan / reset date) and this gateway's credits per day.
 
@@ -1994,6 +2034,8 @@ def refresh_usage(sb: Supabase, gw: Gateway, force: bool = False) -> dict | None
         if own:
             account = own
     usage = {"account": account, "daily": daily, "at": now_iso()}
+    with contextlib.suppress(Exception):
+        usage["split"] = crew_spend_split()
     SESSION_INFO["usage"] = usage
     if USAGE_STATE["sid"]:
         try:

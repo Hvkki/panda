@@ -117,10 +117,28 @@ export function UsagePanel({ userId, worker, online }: { userId: string; worker:
         </section>
       )}
 
-      {gwMonth != null && (
+      {usage?.split ? (
         <section>
           <h3>Everything Kiro Crew ran · {t("thisMonth")}</h3>
-          <p><b>{fmtCredits(gwMonth)}</b> {t("creditsUnit")} <span className="muted small">— includes background work: chat titles, memory, scheduled tasks and helpers.</span></p>
+          <div className="by-model">
+            {([
+              ["Chat replies", usage.split.replies],
+              ["Background", usage.split.background],
+            ] as const).map(([name, n]) => (
+              <div key={name} className="by-model-row">
+                <span className="by-model-name">{name}</span>
+                <span className="by-model-bar"><span style={{ width: `${(n / Math.max(0.01, usage.split!.replies, usage.split!.background)) * 100}%` }} /></span>
+                <span className="by-model-n">{fmtCredits(n)}</span>
+              </div>
+            ))}
+          </div>
+          <p className="muted small">Background: chat titles {fmtCredits(usage.split.titles)}, memory {fmtCredits(usage.split.memory)}, other {fmtCredits(usage.split.other)}.</p>
+          {usage.split.since && <p className="muted tiny">Counted since {new Date(usage.split.since).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}. Kiro Crew starts counting again at each Start; "Panda's replies" above keeps the whole month.</p>}
+        </section>
+      ) : gwMonth != null && (
+        <section>
+          <h3>Everything Kiro Crew ran · {t("thisMonth")}</h3>
+          <p><b>{fmtCredits(gwMonth)}</b> {t("creditsUnit")} <span className="muted small">— chat replies and background work together, since the last Start.</span></p>
         </section>
       )}
       <p className="muted tiny">Each reply shows the credits it used under the message. Numbers come from Kiro (kiro-cli's metering) through Kiro Crew.</p>
