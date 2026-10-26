@@ -874,20 +874,20 @@ html:has(.sheet-backdrop), html:has(.sheet-backdrop) body { overscroll-behavior-
 .pdw .pdw-stroke { stroke-dasharray: 1; stroke-dashoffset: 1;
   animation: pdw-draw calc(var(--d) * var(--T) * 1s) linear calc((var(--s) * var(--T) - var(--t0)) * 1s) both; }
 .pdw .pdw-wash { opacity: 0; animation: pdw-wash calc(var(--d) * var(--T) * 1s) ease calc((var(--s) * var(--T) - var(--t0)) * 1s) both; }
-.pdw-arm { transform-box: view-box; transform-origin: 166px 140px; animation: pdw-sweep calc(var(--T) * 1s) ease-in-out calc(var(--t0) * -1s) both; }
-.pdw-hand { transform-box: view-box; transform-origin: 166px 140px; animation: pdw-scribble .34s ease-in-out infinite alternate; }
-.pdw-head { transform-box: view-box; transform-origin: 132px 120px; animation: pdw-look 2.6s ease-in-out infinite; }
+.pdw-arm { transform-box: view-box; transform-origin: 184px 130px; animation: pdw-sweep calc(var(--T) * 1s) ease-in-out calc(var(--t0) * -1s) both; }
+.pdw-hand { transform-box: view-box; transform-origin: 184px 130px; animation: pdw-scribble .34s ease-in-out infinite alternate; }
+.pdw-head { transform-box: view-box; transform-origin: 153px 128px; animation: pdw-look 2.6s ease-in-out infinite; }
 .pdw-ear { transform-box: fill-box; transform-origin: 50% 85%; }
 .pdw-ear-l { animation: pd-twitch-l 5.2s ease-in-out infinite; }
 .pdw-ear-r { animation: pd-twitch-r 6.4s ease-in-out 1.2s infinite; }
-.pdw-body { transform-box: view-box; transform-origin: 132px 198px; animation: pdw-breathe 3.2s ease-in-out infinite; }
+.pdw-body { transform-box: view-box; transform-origin: 153px 196px; animation: pdw-breathe 3.2s ease-in-out infinite; }
 @keyframes pdw-draw { to { stroke-dashoffset: 0; } }
 @keyframes pdw-fade { from { opacity: 0; } }
 @keyframes pdw-wash { from { opacity: 0; } to { opacity: .9; } }
-@keyframes pdw-sweep { 0% { transform: rotate(-14deg); } 22% { transform: rotate(12deg); } 32% { transform: rotate(-6deg); } 45% { transform: rotate(-20deg); }
-  58% { transform: rotate(-10deg); } 66% { transform: rotate(-24deg); } 80% { transform: rotate(8deg); } 92% { transform: rotate(-4deg); } 100% { transform: rotate(2deg); } }
+@keyframes pdw-sweep { 0% { transform: rotate(-10deg); } 22% { transform: rotate(14deg); } 32% { transform: rotate(-2deg); } 45% { transform: rotate(-16deg); }
+  58% { transform: rotate(-6deg); } 66% { transform: rotate(-20deg); } 80% { transform: rotate(10deg); } 92% { transform: rotate(0deg); } 100% { transform: rotate(4deg); } }
 @keyframes pdw-scribble { from { transform: rotate(-2.2deg) translate(-.6px, .4px); } to { transform: rotate(2.4deg) translate(.8px, -.6px); } }
-@keyframes pdw-look { 0%, 100% { transform: rotate(5deg); } 50% { transform: rotate(8deg) translateX(1px); } }
+@keyframes pdw-look { 0%, 100% { transform: rotate(1.5deg); } 50% { transform: rotate(4deg) translateX(.6px); } }
 @keyframes pdw-breathe { 50% { transform: scale(1.012, .992); } }
 @media (prefers-reduced-motion: reduce) {
   .pdw .pdw-line, .pdw .pdw-fill, .pdw-hand, .pdw-head, .pdw-ear, .pdw-body, .pdw-arm { animation: none; }

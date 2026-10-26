@@ -10,7 +10,6 @@ A real Chromium that keeps its logins between sessions. The user sees it live in
 app and can take over at any time.
 
 ```bash
-pb() { python3 ~/.kiro/crew/skills/panda-browser/pb.py "$@"; }
 pb open github.com/login        # prints the page as an outline; interactive items carry refs like [ref=e12]
 pb click e12                    # click by ref
 pb type e7 "my search" --submit # fill a field, press Enter
@@ -20,6 +19,10 @@ pb scroll down 800
 pb text                         # readable article text (cheaper than the outline)
 pb shot report.png              # save a screenshot to ~/outputs (appears as a file card)
 ```
+
+`pb` is an installed command: call it as is. Never define a `pb()` shell function or alias —
+that command can't be auto-approved and the step hangs.
+
 
 `pb open red panda facts` (words, not an address) searches Google; `pb newtab` opens Google.
 When the user watches on a phone the page is the site's mobile version (narrow, touch) — refs

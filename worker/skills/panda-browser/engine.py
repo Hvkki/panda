@@ -780,13 +780,17 @@ class Engine:
             return {"ok": True, "jpeg": base64.b64encode(jpg).decode(), "w": self.view[0], "h": self.view[1],
                     **{k: v for k, v in (await self.summary(snap=False)).items() if k in ("url", "title")}}
         if self.control == "user":  # the user took over: wait for them to give it back
-            self.message = "Panda is waiting for you to press Done"
+            # Wait briefly, not 15 minutes: a silent long wait looked like Panda had stopped answering.
+            # After that the agent hears why and tells the user to press Done.
+            self.message = "Panda wants the browser back. Press Done when you're finished."
             await self.push_status(force=True)
             self.done_evt.clear()
             try:
-                await asyncio.wait_for(self.done_evt.wait(), 900)
+                await asyncio.wait_for(self.done_evt.wait(), float(os.environ.get("PANDA_BROWSER_USER_WAIT", 45)))
             except asyncio.TimeoutError:
-                return {"ok": False, "error": "the user is still controlling the browser; try again later"}
+                return {"ok": False, "error": "The user has control of the browser (they tapped Take over) and has not "
+                        "pressed Done. Do not retry in a loop: tell the user to press Done in the browser panel, "
+                        "then stop or continue without the browser."}
         async with self.lock:
             self.busy = True
             self.last_agent_ts = time.time()

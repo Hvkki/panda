@@ -53,76 +53,74 @@ export function DrawingPanda({ startedAt, expected = IMAGE_SECS }: { startedAt: 
   const timing: Vars = { "--T": expected, "--t0": t0 };
   return (
     <div className="pdw-card" role="status" aria-live="off" aria-label={`Panda is drawing your picture, ${pct}%`}>
-      <svg className="pdw" viewBox="0 0 360 236" style={timing} aria-hidden>
-        {/* room: warm glow, floor, rug */}
-        <circle cx="244" cy="92" r="112" fill="#F4ECE0" />
-        <path d="M0 210H360V236H0Z" fill="#F1E9DC" />
-        <Sk d="M6 210.5C90 208.8 270 211.8 354 209.8" w={1.3} op={0.7} />
-        <Sk d="M38 214C38 204 222 204 222 214C222 224 38 224 38 214Z" fill={MANILLA} w={1.3} i={1} />
-        <path d="M60 214c10 2 24 3 40 3M150 218c14 0 28-1 40-3" stroke={KRAFT} strokeWidth="1.2" fill="none" strokeLinecap="round" className="pdw-fill" />
+      <svg className="pdw" viewBox="52 30 256 184" style={timing} aria-hidden>
+        {/* room: warm round glow behind the easel, rug under the chair */}
+        <circle cx="181" cy="117" r="91" fill="#F6ECDF" />
+        <Sk d="M84 200C84 192 276 192 276 200C276 208 84 208 84 200Z" fill="#EAD9BF" w={1.3} i={1} />
 
-        {/* easel: back leg, front legs, brace, the big board, clamp, tray with pencils */}
-        <Sk d="M248 20H254L259 206H253Z" fill="#C99872" w={1.3} i={2} />
-        <Sk d="M182 14H190L171 212H163Z" fill={KRAFT} w={1.5} i={2} />
-        <Sk d="M314 14H322L342 212H334Z" fill={KRAFT} w={1.5} i={2} />
-        <Sk d="M168 182H337V188H168Z" fill={KRAFT} w={1.2} i={3} />
-        <Sk d="M150 24H330V146H150Z" fill="#FFFEFA" w={2} i={3} />
-        <path className="pdw-line" d="M148.5 26.5H331.8M151.5 144.6H328.4" stroke={INK} strokeWidth="0.9" opacity="0.35" fill="none" pathLength={1} style={{ "--i": 4 } as Vars} />
-        <Sk d="M231 13H257V27H231Z" fill={KRAFT} w={1.3} i={4} />
-        <Sk d="M144 146H336V156H144Z" fill={KRAFT} w={1.5} i={4} />
-        <Sk d="M292 140H314L318 143L314 146H292Z" fill={CLAY} w={1.1} i={5} />
-        <Sk d="M268 140.5H281V146H268Z" fill="#F2B8A2" w={1.1} i={5} />
+        {/* easel: hidden back leg, right leg, posts, the big board, clamp, shelf with an eraser and a box */}
+        <Sk d="M137 147L122 201H128L143 147Z" fill={KRAFT_DEEP} w={1.3} i={2} />
+        <Sk d="M240 64H247L264 200H257Z" fill={KRAFT} w={1.5} i={2} />
+        <Sk d="M144 42H151V56H144ZM226 42H233V56H226Z" fill={KRAFT} w={1.4} i={2} />
+        <Sk d="M130 53H244Q247 53 247 56V145Q247 148 244 148H130Q127 148 127 145V56Q127 53 130 53Z" fill="#FFFEFA" w={2} i={3} />
+        <Sk d="M180 46.5H197Q198.5 46.5 198.5 48V56.5Q198.5 58 197 58H180Q178.5 58 178.5 56.5V48Q178.5 46.5 180 46.5Z" fill={KRAFT_DEEP} w={1.3} i={4} />
+        <Sk d="M186 147.5H256V155H186Z" fill={KRAFT} w={1.5} i={4} />
+        <Sk d="M204 155H210V194H204ZM194 176H257V181.5H194Z" fill={KRAFT} w={1.3} i={5} />
+        <Sk d="M206.5 142H215.5V147.5H206.5Z" fill={WHITE} w={1.1} i={5} />
+        <Sk d="M221 141H240Q241.5 141 241.5 142.5V147.5H219.5V142.5Q219.5 141 221 141Z" fill={CLAY} w={1.1} i={5} />
 
-        {/* the picture taking shape: mountains, ground, a sun like Claude's spark, birds, shading, colour */}
-        <Wash at={0.8} len={0.08} color={MANILLA} d="M176 122L204 86L220 104L246 66L274 108L290 94L318 124L322 130C262 122 210 118 168 128Z" />
-        <Wash at={0.88} len={0.07} color="#F5C9AE" d="M226 46a12 12 0 1 0 24 0a12 12 0 1 0-24 0Z" />
-        <Stroke at={0.02} len={0.2} d="M176 122L204 86L220 104L246 66L274 108L290 94L318 124" />
-        <Stroke at={0.22} len={0.1} w={1.7} d="M168 128C210 118 262 122 322 130" />
-        <Stroke at={0.34} len={0.1} color={CLAY} w={2.2} d="M226 46a12 12 0 1 0 24 0a12 12 0 1 0-24 0" />
-        <Stroke at={0.45} len={0.12} color={CLAY} w={2.2}
-          d="M254 46h6M249.3 57.3l4.3 4.3M238 62v6M226.7 57.3l-4.3 4.3M222 46h-6M226.7 34.7l-4.3-4.3M238 30v-6M249.3 34.7l4.3-4.3" />
-        <Stroke at={0.58} len={0.08} w={1.6} d="M270 40q5-5 10 0q5-5 10 0M292 56q4-4 8 0q4-4 8 0" />
-        <Stroke at={0.67} len={0.12} w={1.2} color="#6B6355" d="M252 80l-6 10M258 88l-6 10M264 96l-5 9M210 98l-4 7M296 104l-5 8M304 110l-4 7" />
+        {/* the picture taking shape on the board: mountains, ground, a sun like Claude's spark, birds, shading */}
+        <g transform="translate(189 62) scale(0.36) translate(-166 -24)">
+          <Wash at={0.8} len={0.08} color={MANILLA} d="M176 122L204 86L220 104L246 66L274 108L290 94L318 124L322 130C262 122 210 118 168 128Z" />
+          <Wash at={0.88} len={0.07} color="#F5C9AE" d="M226 46a12 12 0 1 0 24 0a12 12 0 1 0-24 0Z" />
+          <Stroke at={0.02} len={0.2} w={3.4} d="M176 122L204 86L220 104L246 66L274 108L290 94L318 124" />
+          <Stroke at={0.22} len={0.1} w={3} d="M168 128C210 118 262 122 322 130" />
+          <Stroke at={0.34} len={0.1} color={CLAY} w={2.8} d="M226 46a12 12 0 1 0 24 0a12 12 0 1 0-24 0" />
+          <Stroke at={0.45} len={0.12} color={CLAY} w={2.8}
+            d="M254 46h6M249.3 57.3l4.3 4.3M238 62v6M226.7 57.3l-4.3 4.3M222 46h-6M226.7 34.7l-4.3-4.3M238 30v-6M249.3 34.7l4.3-4.3" />
+          <Stroke at={0.58} len={0.08} w={2} d="M270 40q5-5 10 0q5-5 10 0M292 56q4-4 8 0q4-4 8 0" />
+          <Stroke at={0.67} len={0.12} w={1.6} color="#6B6355" d="M252 80l-6 10M258 88l-6 10M264 96l-5 9M210 98l-4 7M296 104l-5 8M304 110l-4 7" />
+        </g>
 
-        {/* chair seat and far legs, under the panda */}
-        <Sk d="M78 194H186V201H78Z" fill={KRAFT_DEEP} w={1.5} i={5} />
-        <Sk d="M100 201H105V211H100ZM159 201H164V211H159Z" fill={KRAFT_DEEP} w={1.1} i={5} />
-
-        {/* panda from behind: white back, black shoulder band, resting left arm, little tail */}
+        {/* panda from behind: black arms and legs around a white back, round head, little cloud of a tail */}
         <g className="pdw-body">
-          <Sk d="M86 198C78 160 88 124 132 118C176 124 186 160 178 198Z" fill={WHITE} i={6} />
-          <path className="pdw-fill" d="M112 162q4 3 8 2M146 170q4 2 8 0M124 150q3 2 6 1" stroke={CLOUD} strokeWidth="1.2" fill="none" strokeLinecap="round" />
-          <Sk d="M88 152C90 128 108 118 132 118C156 118 174 128 176 152C164 141 148 135 132 135C116 135 100 141 88 152Z" fill={FUR} i={7} />
-          <Sk d="M126 190c-3-1-3-5 0-6c0-3 4-4 6-2c2-2 6-1 6 2c3 1 3 5 0 6c-1 3-5 3-6 1c-1 2-5 2-6-1Z" fill={WHITE} w={1.2} i={8} />
-          <Sk d="M92 132C78 142 74 166 80 182C84 190 96 188 98 178C100 162 100 146 98 136Z" fill={FUR} i={8} />
+          <Sk d="M117 126C106 142 105 172 111 196H195C200 172 199 142 189 126C172 117 134 117 117 126Z" fill={FUR} i={6} />
+          <Sk d="M130 128C126 148 126 168 130 184H177C181 168 181 148 177 128C162 122 145 122 130 128Z" fill={WHITE} i={7} />
+          <path className="pdw-fill" d="M140 150q4 3 8 2M160 160q4 2 8 0M146 168q3 2 6 1" stroke={CLOUD} strokeWidth="1.1" fill="none" strokeLinecap="round" />
+          <Sk d="M119 126C134 137 172 137 188 126C176 118 131 118 119 126Z" fill={FUR} w={1.4} i={7} />
+          <Sk d="M145 173c-4-1-4-7 0-8c0-4 5-6 8-3c3-3 8-1 8 3c4 1 4 7 0 8c-2 3-7 3-8 1c-1 2-6 2-8-1Z" fill={WHITE} w={1.3} i={8} />
+          <Sk d="M114 186C110 196 120 201 130 197C131 192 128 187 122 186ZM178 186C176 194 184 200 194 197C196 192 192 187 186 186Z" fill={FUR} w={1.3} i={8} />
         </g>
 
-        {/* chair back between us and the panda */}
-        <Sk d="M88 146H96V212H88ZM168 146H176V212H168Z" fill={KRAFT} w={1.5} i={9} />
-        <Sk d="M82 140Q132 134 182 140L182 151Q132 145 82 151Z" fill={KRAFT} w={1.5} i={9} />
-        <Sk d="M96 170H168V176H96Z" fill={KRAFT} w={1.3} i={10} />
-
-        {/* head from behind: ears, round white back of the head, a tuft of fur */}
-        <g className="pdw-head">
-          <g className="pdw-ear pdw-ear-l"><Sk d="M96.5 66a11.5 11.5 0 1 0 23 0a11.5 11.5 0 1 0-23 0Z" fill={FUR} i={10} /></g>
-          <g className="pdw-ear pdw-ear-r"><Sk d="M144.5 64a11.5 11.5 0 1 0 23 0a11.5 11.5 0 1 0-23 0Z" fill={FUR} i={10} /></g>
-          <Sk d="M100 92C100 72 116 63 132 63C150 63 164 73 164 92C164 110 150 121 132 121C114 121 100 110 100 92Z" fill={WHITE} w={2} i={11} />
-          <path className="pdw-fill" d="M128 67q4-5 9-1M118 76q3-3 7-2M142 74q3-2 7 0M110 98q2 4 6 6" stroke={CLOUD} strokeWidth="1.2" fill="none" strokeLinecap="round" />
-        </g>
-
-        {/* drawing arm: sweeps across the board over the picture's time, the paw scribbles */}
+        {/* drawing arm: reaches up to the board, sweeps across it over the picture's time, the paw scribbles */}
         <g className="pdw-arm">
           <g className="pdw-hand">
-            <path className="pdw-fill" d="M166 140Q192 128 212 104" stroke={FUR} strokeWidth="18" strokeLinecap="round" fill="none" />
-            <g transform="translate(219 96) rotate(-45)" className="pdw-fill">
-              <path d="M-4 -2.7H0V2.7H-4Z" fill="#F2B8A2" stroke={INK} strokeWidth="1" />
-              <path d="M0 -2.7H16V2.7H0Z" fill={CLAY} stroke={INK} strokeWidth="1" />
-              <path d="M16 -2.7L22.5 0L16 2.7Z" fill={MANILLA} stroke={INK} strokeWidth="1" strokeLinejoin="round" />
-              <path d="M20.6 -0.8L23 0L20.6 0.8Z" fill={INK} />
+            <path className="pdw-fill" d="M183 132Q197 128 204 114" stroke={FUR} strokeWidth="15" strokeLinecap="round" fill="none" />
+            <path className="pdw-line" d="M190.5 125.5Q198 120 200 112" stroke="#5A534C" strokeWidth="1" fill="none" pathLength={1} style={{ "--i": 12 } as Vars} />
+            <g transform="translate(205 112) rotate(-62)" className="pdw-fill">
+              <path d="M-4 -2.4H0V2.4H-4Z" fill="#F2B8A2" stroke={INK} strokeWidth="0.9" />
+              <path d="M0 -2.4H13V2.4H0Z" fill={CLAY} stroke={INK} strokeWidth="0.9" />
+              <path d="M13 -2.4L19 0L13 2.4Z" fill={MANILLA} stroke={INK} strokeWidth="0.9" strokeLinejoin="round" />
+              <path d="M17.4 -0.7L19.5 0L17.4 0.7Z" fill={INK} />
             </g>
-            <circle className="pdw-fill" cx="214" cy="101" r="9.5" fill={FUR} />
-            <path className="pdw-line" d="M205 104q4 6 12 4" stroke="#5A534C" strokeWidth="1.1" fill="none" pathLength={1} style={{ "--i": 12 } as Vars} />
+            <circle className="pdw-fill" cx="204" cy="113" r="7.5" fill={FUR} />
           </g>
+        </g>
+
+        {/* chair back, in front of the panda: curved top rail, two posts, lower rail */}
+        <Sk d="M117 138Q153 131 190 138V148Q153 141 117 148Z" fill={KRAFT} w={1.6} i={9} />
+        <Sk d="M121 146H129V203H121ZM178 146H186V203H178Z" fill={KRAFT} w={1.5} i={9} />
+        <Sk d="M129 180H178V186H129Z" fill={KRAFT} w={1.3} i={10} />
+        <circle className="pdw-fill" cx="125" cy="142.6" r="1.3" fill={KRAFT_DEEP} />
+        <circle className="pdw-fill" cx="182" cy="142.6" r="1.3" fill={KRAFT_DEEP} />
+
+        {/* head from behind: black ears, big round white head, a tuft of fur on top */}
+        <g className="pdw-head">
+          <g className="pdw-ear pdw-ear-l"><Sk d="M115 74a12.5 12.5 0 1 0 25 0a12.5 12.5 0 1 0-25 0Z" fill={FUR} i={10} /></g>
+          <g className="pdw-ear pdw-ear-r"><Sk d="M167 73a12.5 12.5 0 1 0 25 0a12.5 12.5 0 1 0-25 0Z" fill={FUR} i={10} /></g>
+          <Sk d="M120 97C120 77 135 64 153 64C172 64 187 77 187 97C187 116 172 129 153 129C135 129 120 116 120 97Z" fill={WHITE} w={2} i={11} />
+          <Sk d="M147 66q2-6 6-4q1-4 5-1q4-1 3 4" fill={WHITE} w={1.3} i={12} />
+          <path className="pdw-fill" d="M130 84q3-4 7-3M168 82q4-1 7 2M127 110q3 5 8 7M176 108q-2 5-6 7" stroke={CLOUD} strokeWidth="1.1" fill="none" strokeLinecap="round" />
         </g>
       </svg>
       <div className="pdw-caption">

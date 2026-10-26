@@ -310,7 +310,7 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
           live && !tools.length && !showThinking ? (
             <div className="activity live"><div className="step current">
               <span className="step-icon"><IconSpinner size={15} /></span>
-              <span className="step-label shimmer">{m.status === "waiting" ? "Waiting for your approval" : t("thinking")}{secsLabel(now - startAt)}</span>
+              <span className="step-label shimmer">{m.status === "waiting" ? "Waiting for your approval" : m.meta.queued ? "Waiting for the last step to finish" : t("thinking")}{secsLabel(now - startAt)}</span>
             </div></div>
           ) : null}
         {drawing && <DrawingPanda key={drawKey} startedAt={drawAt} />}

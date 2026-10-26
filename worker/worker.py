@@ -203,6 +203,23 @@ def install_skills(sb: "Supabase"):
         with tarfile.open(arc) as t:
             t.extractall(dest, filter="data")
         log("skills installed:", ", ".join(sorted(os.listdir(dest)))[:300])
+    install_skill_commands()
+
+
+# Skill helpers as real commands. The skills used to tell the agent to define a shell function
+# (`pb() { python3 …; }`), and Kiro Crew refuses to auto-approve a command that redefines a program
+# name: the step then waited for an approval nobody saw, and the chat seemed to stop answering.
+SKILL_COMMANDS = {"pb": "panda-browser/pb.py", "drive": "panda-drive/drive.py"}
+
+
+def install_skill_commands():
+    bindir = f"{HOME}/.local/bin"
+    os.makedirs(bindir, exist_ok=True)
+    for name, rel in SKILL_COMMANDS.items():
+        dst = f"{bindir}/{name}"
+        with open(dst, "w") as f:
+            f.write(f'#!/bin/sh\nexec python3 "$HOME/.kiro/crew/skills/{rel}" "$@"\n')
+        os.chmod(dst, 0o755)
 
 
 PANDA_SECRETS = os.path.expanduser("~/.panda/secrets.env")
@@ -750,6 +767,34 @@ def is_thinking(c: dict) -> bool:
     return "thinking" in kind or "reasoning" in kind
 
 
+def wait_queued(sb: Supabase, gw: Gateway, slot: str, qid: str, reply_id: int, meta: dict,
+                cancelled: threading.Event, limit: float = 1800) -> None:
+    """Crew queued the message because this chat's previous turn is still running (e.g. a long
+    tool step). Before, the worker took the instant empty receipt as the answer and showed nothing.
+    Now the reply says it waits, and the queued turn's answer is read once that turn has run."""
+    sb.rest("PATCH", "messages", params={"id": f"eq.{reply_id}"}, body={"meta": meta})
+    t0, seen_run = time.time(), False
+    while time.time() - t0 < limit:
+        time.sleep(2.5)
+        try:
+            row = sb.rest("GET", "messages", params={"id": f"eq.{reply_id}", "select": "cancel"})
+            if row and row[0].get("cancel"):
+                cancelled.set()
+                with contextlib.suppress(Exception):
+                    gw.call("POST", f"/api/chat/slots/{slot}/stop")
+                return
+            d = gw.call("GET", f"/api/chat/slots/{slot}?limit=1")
+        except Exception as exc:
+            log("queued wait:", type(exc).__name__)
+            continue
+        in_queue = any(str(q.get("id") or "") == qid for q in (d.get("queue") or []) if isinstance(q, dict))
+        if not in_queue and d.get("running"):
+            seen_run = True
+        elif not in_queue and not d.get("running") and (seen_run or time.time() - t0 > 6):
+            return
+    log(f"queued message still waiting after {int(limit)}s")
+
+
 def ask_approval(sb: Supabase, gw: Gateway, chat: dict, slot: str, reply_id: int, c: dict) -> str:
     """Show an approval card in the app and wait for the user's answer (max 9 min)."""
     rid = permission_id(c)
@@ -1272,7 +1317,30 @@ def _publish_one(sb: Supabase, chat: dict, message_id: int, path: str, size: int
         return None
 
 
-def publish_outputs(sb: Supabase, chat: dict, message_id: int, before: dict, reply: str = "") -> list:
+# Chats answer in parallel and share ~/outputs, so "every new file there" is only this turn's when no
+# other turn ran at the same time. Otherwise a picture made in one chat showed up in another.
+TURNS: dict = {}          # "chat:msg" -> True once another turn overlapped it
+TURNS_LOCK = threading.Lock()
+CLAIMED: dict = {}        # path -> (mtime, size) already published by some turn
+# The turn's own steps used the browser (the browser is shared too, so its last screen is not proof).
+USED_BROWSER = re.compile(r"panda-browser|\bpb(?:\.py)?\s+(open|click|type|select|hover|scroll|snap|text|shot|"
+                          r"handoff|press|tab|back|reload|wait|newtab)", re.I)
+
+
+def turn_begin(key: str) -> None:
+    with TURNS_LOCK:
+        for k in TURNS:
+            TURNS[k] = True
+        TURNS[key] = bool(TURNS)
+
+
+def turn_end(key: str) -> bool:
+    with TURNS_LOCK:
+        return TURNS.pop(key, False)
+
+
+def publish_outputs(sb: Supabase, chat: dict, message_id: int, before: dict, reply: str = "",
+                    overlapped: bool = False) -> list:
     """Upload the turn's deliverables; return [(local_path, file_row, inline)].
 
     What counts as a deliverable:
@@ -1283,13 +1351,14 @@ def publish_outputs(sb: Supabase, chat: dict, message_id: int, before: dict, rep
     `inline` is set for images embedded with ![](…): the app shows them in the text, not as a card.
     """
     targets, img_targets = _reply_refs(reply)
-    new = {p: sz for p, (mt, sz) in scan_outputs().items() if before.get(p) != (mt, sz) and sz > 0}
+    new = {p: sz for p, (mt, sz) in scan_outputs().items()
+           if before.get(p) != (mt, sz) and sz > 0 and CLAIMED.get(p) != (mt, sz)}
     for t in targets | img_targets:  # inline images etc. the agent kept in ~/work
         p = _resolve_local(t)
         if p and p not in new:
             new[p] = os.path.getsize(p)
     referenced = {p for p in new if _referenced(p, targets | img_targets)}
-    chosen = referenced or {p for p in new if p.startswith(OUTPUTS + os.sep)}
+    chosen = referenced or (set() if overlapped else {p for p in new if p.startswith(OUTPUTS + os.sep)})
     published = []
     for path in sorted(chosen):
         row = _publish_one(sb, chat, message_id, path, new[path])
@@ -1297,6 +1366,9 @@ def publish_outputs(sb: Supabase, chat: dict, message_id: int, before: dict, rep
             continue
         inline = path.lower().endswith(IMAGE_EXT) and _referenced(path, img_targets)
         published.append((path, row, inline))
+        with contextlib.suppress(OSError):
+            st = os.stat(path)
+            CLAIMED[path] = (st.st_mtime, st.st_size)
         if len(published) >= 20:
             break
     if published:
@@ -1488,6 +1560,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             # to guess whether the full instructions from earlier still apply.
             prompt = DEV_MARK + _latest_line() + "\n" + prompt
     before = scan_outputs()
+    turn_begin(reply_key := f"{chat['id']}:{msg['id']}")
     base_meta = {"model": chat.get("model"), "effort": chat.get("effort")}
     if cmd or kb:
         base_meta["command"] = cmd or "/kb"
@@ -1540,9 +1613,13 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
     if not cmd:
         with BUSY_LOCK:
             BUSY_SLOTS[chat["id"]] = {"slot": slot, "since": time.time()}
+    queued_id = ""  # Crew queued this message: the chat's previous turn is still running
     try:
         for c in gw.stream_chat(slot, prompt):
             if not isinstance(c, dict):
+                continue
+            if isinstance(c.get("receipt"), dict) and c["receipt"].get("queued"):
+                queued_id = str(c["receipt"].get("queue_id") or "") or "?"
                 continue
             kind = c.get("type")
             if kind == "permission":
@@ -1580,6 +1657,8 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             if cancelled.is_set():
                 tools.append("stopped by you")
                 break
+        if queued_id:
+            wait_queued(sb, gw, slot, queued_id, reply["id"], {**meta(), "queued": True}, cancelled)
         stream_done.set()
         with BUSY_LOCK:
             BUSY_SLOTS.pop(chat["id"], None)
@@ -1602,7 +1681,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             final = _ANSI.sub("", final)
         if not final.strip() and res["errors"]:
             raise RuntimeError(res["errors"][-1][:400])
-        published = publish_outputs(sb, chat, reply["id"], before, final)
+        published = publish_outputs(sb, chat, reply["id"], before, final, overlapped=turn_end(reply_key))
         final = scrub(link_files(final, published))
         # Inline images show in the text; only the rest become download cards.
         done_meta = {**meta(), "files": [row["id"] for _, row, inline in published if not inline]}
@@ -1612,7 +1691,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
         if stats:
             done_meta["turn_stats"] = {k: stats[k] for k in ("elapsed_ms", "ttft_ms", "model", "credits", "retries")
                                        if k in stats}
-        shot = browser_snapshot(sb, chat, reply["id"], t0)
+        shot = browser_snapshot(sb, chat, reply["id"], t0) if USED_BROWSER.search("\n".join(tools)) else None
         if shot:
             done_meta["browser"] = shot
         sb.rest("PATCH", "messages", params={"id": f"eq.{reply['id']}"},
@@ -1628,6 +1707,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
         stream_done.set()
         with BUSY_LOCK:
             BUSY_SLOTS.pop(chat["id"], None)
+        turn_end(reply_key)
         with push_lock:
             pass
         with THINK_LOCK:

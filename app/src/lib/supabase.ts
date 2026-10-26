@@ -43,6 +43,7 @@ export type Message = {
     model?: string;
     effort?: string;
     tools?: string[];
+    queued?: boolean;       // Crew queued it behind a turn that was still running
     usage?: ContextUsage | null;
     secs?: number;
     kind?: string;
