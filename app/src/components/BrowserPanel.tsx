@@ -33,6 +33,19 @@ export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserL
   const [typed, setTyped] = useState("");
   // The phone keyboard opens only when you ask for it (the ⌨ button), never by itself.
   const [kbdOpen, setKbdOpen] = useState(false);
+  const [full, setFull] = useState(false);
+  const panel = useRef<HTMLDivElement>(null);
+  useEffect(() => {  // leaving system fullscreen (Back, Esc) also leaves Panda's fullscreen
+    const off = () => { if (!document.fullscreenElement) setFull(false); };
+    document.addEventListener("fullscreenchange", off);
+    return () => document.removeEventListener("fullscreenchange", off);
+  }, []);
+  const toggleFull = () => {
+    const on = !full;
+    setFull(on);
+    if (on) panel.current?.requestFullscreen?.().catch(() => {});  // iPhone has no API: the CSS still fills the screen
+    else if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  };
   const typedRef = useRef("");
   const editing = useRef(false);
   const freeze = useRef(false);                // keyboard up: keep the page size, don't re-lay it out
@@ -136,7 +149,7 @@ export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserL
   const secure = (status?.url || "").startsWith("https://");
 
   return (
-    <div className={`browser-panel ${docked ? "docked" : ""} ctl-${control}`} role="dialog" aria-label="Panda's browser">
+    <div ref={panel} className={`browser-panel ${docked ? "docked" : ""} ${full ? "full" : ""} ctl-${control}`} role="dialog" aria-label="Panda's browser">
       <div className="bp-head">
         <button className="icon-btn" onClick={onClose} aria-label="Close"><IconX /></button>
         <div className="bp-titles">
@@ -146,6 +159,11 @@ export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserL
         <span className={`bp-pill ${pill}`}>{pill === "busy" && <i className="dot" />}
           {{ off: t("offline"), needs: t("needsYou"), you: "You", busy: t("live"), idle: "Idle" }[pill]}</span>
         <button className={`icon-btn ${logOpen ? "on" : ""}`} onClick={() => setLogOpen((v) => !v)} aria-label="Steps" title="Steps"><IconList /></button>
+        <button className={`icon-btn ${full ? "on" : ""}`} onClick={toggleFull} aria-label={full ? "Exit full screen" : "Full screen"} title="Full screen">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            {full ? <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" /> : <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />}
+          </svg>
+        </button>
       </div>
 
       <form className="bp-url" onSubmit={(e) => { e.preventDefault(); if (mine && address.trim()) send({ t: "nav", url: address.trim() }); editing.current = false; (document.activeElement as HTMLElement)?.blur(); }}>

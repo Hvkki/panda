@@ -40,7 +40,7 @@ OUT_DIR = Path(os.environ.get("PANDA_OUTPUTS", HOME / "outputs"))
 PORT = int(os.environ.get("PANDA_BROWSER_PORT", "5480"))
 VIEW_W, VIEW_H = 1024, 720
 VIEWER_TTL = 20          # seconds a viewer stays "present" after its last hello
-MIN_FRAME_GAP = 0.12     # max ~8 fps
+MIN_FRAME_GAP = 0.07     # max ~14 fps
 MAX_FRAME_B64 = 190_000  # Realtime free tier payload limit is ~250 KB
 BEST_QUALITY = 60
 CURSOR_LEAD = 0.35       # while someone watches, show where Panda will click before it clicks
@@ -48,8 +48,10 @@ CURSOR_LEAD = 0.35       # while someone watches, show where Panda will click be
 # pixel per CSS pixel, so text stays sharp when the picture is scaled up to the phone's screen.
 MOBILE_W = 400
 MOBILE_DPR = 1.5
-MOBILE_FRAME_GAP = 0.2   # sharp frames are bigger: at most ~5 a second
+MOBILE_FRAME_GAP = 0.12  # sharp frames are bigger: at most ~8 a second
 HOME_URL = "https://www.google.com/"
+# The app's language -> what the browser tells websites (navigator.language, Accept-Language).
+LANGS = {"en": "en-US,en", "it": "it-IT,it,en", "uk": "uk-UA,uk,en"}
 SEARCH_URL = "https://www.google.com/search?q="
 TLDS = ("com", "it", "org", "net", "io", "dev", "app", "co", "uk", "de", "fr", "es", "eu", "ua", "ru", "info", "me", "ai")
 
@@ -224,6 +226,7 @@ class Engine:
         self.ua_major = "140"
         self.closing = False
         self.view = (VIEW_W, VIEW_H)       # current page size in CSS px (phone viewers get a tall, narrow page)
+        self.lang = "en"
         self.mobile = False                # a phone is watching: real mobile page, touch taps
         self.dpr = 1.0                     # device pixels per CSS pixel of the live picture
         self.emu = None                    # CDP session of the current page for emulation and sharp captures
@@ -507,7 +510,9 @@ class Engine:
             w = MOBILE_W
             h = int(max(560, min(1100, w * vh / vw)))
         else:
-            w, h = VIEW_W, VIEW_H
+            # Tablets and big screens: keep the desktop width, match the panel's shape so the page fills it.
+            w = VIEW_W
+            h = int(max(600, min(1400, w * vh / vw))) if vw > 50 and vh > 50 else VIEW_H
         if (w, h) == self.view and mobile == self.mobile:
             return
         was_mobile = self.mobile
@@ -555,7 +560,7 @@ class Engine:
             brands = [{"brand": "Chromium", "version": self.ua_major}, {"brand": "Google Chrome", "version": self.ua_major},
                       {"brand": "Not.A/Brand", "version": "99"}]
             await self.emu.send("Emulation.setUserAgentOverride", {
-                "userAgent": self._ua(), "acceptLanguage": "en-US,en", "platform": "Linux armv8l" if self.mobile else "Linux x86_64",
+                "userAgent": self._ua(), "acceptLanguage": LANGS.get(self.lang, "en-US,en"), "platform": "Linux armv8l" if self.mobile else "Linux x86_64",
                 "userAgentMetadata": {"brands": brands, "fullVersion": self.browser.version, "platform": "Android" if self.mobile else "Linux",
                                       "platformVersion": "14.0.0" if self.mobile else "", "architecture": "" if self.mobile else "x86",
                                       "model": "Pixel 8" if self.mobile else "", "mobile": self.mobile}})
@@ -635,6 +640,15 @@ class Engine:
             if t == "hello":
                 first = not self.viewer_active()
                 self.last_hello = time.time()
+                lang = str(p.get("lang") or "")[:2]
+                if lang in LANGS and lang != self.lang:  # speak the user's language to websites
+                    self.lang = lang
+                    with contextlib.suppress(Exception):
+                        await self.ctx.set_extra_http_headers({"Accept-Language": LANGS[lang]})
+                    await self._emulate()
+                    with contextlib.suppress(Exception):
+                        if self.page.url.startswith("http") and not self.busy:
+                            await self.page.reload(wait_until="domcontentloaded", timeout=15000)
                 # Only a viewer with a real size (the full panel) changes the page's shape; a chat card
                 # alone keeps it, so closing the panel on a phone doesn't reload the site as desktop.
                 if p.get("mode") and float(p.get("vw") or 0) > 50 and float(p.get("vh") or 0) > 50:

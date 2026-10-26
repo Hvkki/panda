@@ -461,9 +461,12 @@ select { padding: 8px 30px 8px 11px; border-radius: 10px; border: 1px solid var(
 .sheet-label.as-btn { width: 100%; }
 .chev { display: inline-grid; transition: transform .2s var(--ease); }
 .chev.up { transform: rotate(180deg); }
-.effort-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(56px, 1fr)); gap: 6px; padding: 4px 12px 6px; }
-.effort-pill { min-width: 0; padding: 9px 4px; border-radius: 11px; border: 1px solid var(--line); background: var(--panel-2); font-size: .86em; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; }
-.effort-pill.on { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.effort-list { display: flex; flex-direction: column; padding: 2px 4px 4px; }
+.effort-item { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 10px 12px; min-height: 46px; border-radius: 12px; font-size: 1.02em; }
+.effort-item:hover { background: var(--bg-2); }
+.effort-tag { font-size: .78em; padding: 2px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted, inherit); display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.effort-tag.warn { background: #fdf3d6; border-color: #f0d68a; color: #7a5a00; }
+.effort-check { margin-left: auto; display: inline-flex; }
 .sheet-warn { display: flex; gap: 6px; align-items: center; margin: 4px 14px; font-size: .82em; color: var(--warn); }
 .sheet-foot { font-size: 0.78em; padding: 8px 14px 0; }
 
@@ -1025,3 +1028,7 @@ select { padding: 8px 30px 8px 11px; border-radius: 10px; border: 1px solid var(
 .update-banner { position: fixed; left: 50%; top: calc(env(safe-area-inset-top, 0px) + 10px); transform: translateX(-50%); z-index: 1000;
   background: var(--accent); color: #fff; border: 0; border-radius: 999px; padding: 9px 16px; font: inherit; font-size: .88em;
   box-shadow: 0 6px 20px rgba(0,0,0,.18); cursor: pointer; animation: rise .2s var(--ease); }
+
+/* Browser full screen: fills the whole screen, also where the Fullscreen API is missing (iPhone). */
+.browser-panel.full { position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100dvh !important;
+  max-width: none !important; max-height: none !important; border-radius: 0 !important; z-index: 1000; margin: 0 !important; }

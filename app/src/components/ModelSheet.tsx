@@ -51,15 +51,16 @@ function ModelSheet({ model, effort, onChange, onClose }: Props & { onClose: () 
         {MAIN_MODELS.map((m) => row(m.id, m.name, m.blurb, m.credits))}
         <div className="sheet-sep" />
         <div className="sheet-label">{t("effort")}</div>
-        <div className="effort-row">
+        <div className="effort-list">
           {EFFORTS.map((e) => (
-            <button key={e.id} className={`effort-pill ${effort === e.id ? "on" : ""}`} onClick={() => { onChange(model, e.id); onClose(); }}
-              title={"warn" in e ? e.warn : "note" in e ? e.note : undefined}>
-              {e.label}
+            <button key={e.id} className={`effort-item ${effort === e.id ? "on" : ""}`} onClick={() => { onChange(model, e.id); onClose(); }}>
+              <span className="effort-name">{e.label}</span>
+              {"note" in e && <span className="effort-tag">{e.note}</span>}
+              {"warn" in e && <span className="effort-tag warn"><IconAlert size={12} /> 8× or more usage</span>}
+              {effort === e.id && <span className="accent effort-check"><IconCheck /></span>}
             </button>
           ))}
         </div>
-        {effort === "max" && <p className="sheet-warn"><IconAlert size={13} /> Max effort uses much more credit.</p>}
         <div className="sheet-sep" />
         <button className="sheet-label as-btn" onClick={() => setShowMore((v) => !v)}>
           {t("moreModels")} <span className={`chev ${showMore ? "up" : ""}`}><IconChevron size={14} /></span>
