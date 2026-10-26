@@ -43,7 +43,7 @@ VIEWER_TTL = 20          # seconds a viewer stays "present" after its last hello
 MIN_FRAME_GAP = 0.07     # max ~14 fps
 MAX_FRAME_B64 = 190_000  # Realtime free tier payload limit is ~250 KB
 BEST_QUALITY = 60
-CURSOR_LEAD = 0.35       # while someone watches, show where Panda will click before it clicks
+CURSOR_LEAD = 0.18       # while someone watches, show where Panda will click before it clicks
 # Phones: a real mobile page (mobile layout, touch, mobile user agent) rendered at more than 1 device
 # pixel per CSS pixel, so text stays sharp when the picture is scaled up to the phone's screen.
 MOBILE_W = 400
@@ -231,6 +231,10 @@ class Engine:
         self.dpr = 1.0                     # device pixels per CSS pixel of the live picture
         self.emu = None                    # CDP session of the current page for emulation and sharp captures
         self.xvfb: subprocess.Popen | None = None  # the virtual screen Chromium draws on
+        self.pending_fit: tuple | None = None  # a panel resize that came while Panda was busy
+        self.tab_ids: dict = {}            # page -> stable tab id (indexes shift when a tab closes)
+        self.next_tab = 1
+        self.thumbs: dict[int, str] = {}   # tab id -> small JPEG of how it looked, for the tab overview
 
     # lifecycle ----------------------------------------------------------------
     def _virtual_screen(self) -> bool:
@@ -316,7 +320,34 @@ class Engine:
                 return await route.abort("blockedbyclient")
         await route.continue_()
 
+    def _tid(self, page) -> int:
+        if page not in self.tab_ids:
+            self.tab_ids[page] = self.next_tab
+            self.next_tab += 1
+        return self.tab_ids[page]
+
+    async def _thumb(self):
+        """A small picture of the current tab, kept for the tab overview."""
+        if not self.page or not self.emu or self.page.is_closed():
+            return
+        with contextlib.suppress(Exception):
+            m = (await asyncio.wait_for(self.emu.send("Page.getLayoutMetrics"), 2))["cssVisualViewport"]
+            w = m["clientWidth"]
+            r = await asyncio.wait_for(self.emu.send("Page.captureScreenshot", {
+                "format": "jpeg", "quality": 45, "optimizeForSpeed": True,
+                "clip": {"x": m["pageX"], "y": m["pageY"], "width": w, "height": min(m["clientHeight"], w * 1.4),
+                         "scale": min(1.0, 260 / max(1, w))}}), 3)
+            self.thumbs[self._tid(self.page)] = r["data"]
+
+    async def send_thumbs(self):
+        await self._thumb()
+        live = {self._tid(p) for p in self.ctx.pages}
+        self.thumbs = {k: v for k, v in self.thumbs.items() if k in live}
+        await self.link.broadcast("thumbs", {"thumbs": self.thumbs})
+
     async def _adopt(self, page):
+        if self.page and self.page is not page and not self.page.is_closed():
+            await self._thumb()  # remember how the tab we leave looked
         self.page = page
         self.focus = None
         await self._emulate()
@@ -350,8 +381,11 @@ class Engine:
 
     async def _page_closed(self, page):
         # Ignore closes caused by shutting down or swapping the whole context.
-        if self.closing or page.context is not self.ctx or self.page is not page:
+        if self.closing or page.context is not self.ctx:
             return
+        self.thumbs.pop(self.tab_ids.pop(page, 0), None)
+        if self.page is not page:  # a background tab closed: only the list changes
+            return await self.push_status(force=True)
         try:
             pages = [p for p in self.ctx.pages if not p.is_closed()]
             await self._adopt(pages[-1] if pages else await self.ctx.new_page())
@@ -490,9 +524,18 @@ class Engine:
             title = await asyncio.wait_for(self.page.title(), 2)
         except Exception:
             title = ""
-        tabs = []
-        for i, p in enumerate(self.ctx.pages):
-            tabs.append({"i": i, "u": p.url[:200], "active": p is self.page})
+        pages = list(self.ctx.pages)
+
+        async def name(p):
+            if p is self.page:
+                return title
+            try:
+                return await asyncio.wait_for(p.title(), 0.4)
+            except Exception:
+                return ""
+        names = await asyncio.gather(*(name(p) for p in pages)) if len(pages) > 1 else [title]
+        tabs = [{"i": i, "id": self._tid(p), "u": p.url[:200], "t": (names[i] or "")[:80], "active": p is self.page}
+                for i, p in enumerate(pages)]
         recent = time.time() - self.action_ts < 6
         st = {"url": self.page.url, "title": title[:120], "tabs": tabs, "control": self.control,
               "message": self.message, "busy": self.busy, "loading": self.loading, "viewer": self.viewer_active(),
@@ -504,8 +547,16 @@ class Engine:
             await self.link.broadcast("status", st)
 
     async def fit(self, mode: str, vw: float, vh: float):
-        """Phone viewers get a real mobile page shaped like their screen; desktops get 1024x720."""
-        mobile = mode == "mobile" and vw > 50 and vh > 50
+        """Shape the page like the viewer's panel. Always the DESKTOP site, also for phones: switching
+        to the mobile site reloaded the page and broke Panda's clicks mid-task. While Panda is using
+        the browser the page keeps its size; the new shape is applied once Panda is done."""
+        if self.busy:
+            self.pending_fit = (mode, vw, vh)
+            return
+        self.pending_fit = None
+        if mode == "mobile":  # a phone only watches: the page stays exactly as it is
+            return
+        mobile = False
         if mobile:
             w = MOBILE_W
             h = int(max(560, min(1100, w * vh / vw)))
@@ -671,8 +722,12 @@ class Engine:
                 self.control, self.message, self.focus = "agent", "", None
                 self.done_evt.set()
                 return await self.push_status(force=True)
-            if self.control == "agent":
-                return  # view only until the user takes over
+            if t == "tabs":  # the tab overview opened: send fresh pictures of the tabs
+                return await self.send_thumbs()
+            # Tabs can be opened, switched and closed whenever Panda isn't using the browser.
+            tab_op = t in ("tab", "newtab", "closetab")
+            if self.control == "agent" and not (tab_op and not self.busy):
+                return  # otherwise view only until the user takes over
             page = self.page
             if t in ("click", "dblclick"):
                 x, y = float(p["x"]) * self.view[0], float(p["y"]) * self.view[1]
@@ -713,10 +768,17 @@ class Engine:
                     await pages[i].bring_to_front()
                     await self._adopt(pages[i])
             elif t == "newtab":
+                url = normalize(str(p.get("url") or ""))
+                ok, _why = url_ok(url)
                 await self._adopt(await self.ctx.new_page())
-                asyncio.create_task(self._goto(HOME_URL))
+                asyncio.create_task(self._goto(url if ok else HOME_URL))
             elif t == "closetab":
-                await self.page.close()
+                pages = self.ctx.pages
+                i = int(p.get("i", pages.index(self.page) if self.page in pages else -1))
+                if 0 <= i < len(pages):
+                    await pages[i].close()
+                await asyncio.sleep(0.15)
+                await self.push_status(force=True)
             await self.snap_frame()
         except Exception as exc:
             log("input failed:", t, str(exc)[:120])
@@ -757,9 +819,9 @@ class Engine:
             out["snapshot"] = await self.snapshot(full)
         return out
 
-    async def settle(self, extra=0.35):
+    async def settle(self, extra=0.15):
         with contextlib.suppress(Exception):
-            await self.page.wait_for_load_state("domcontentloaded", timeout=5000)
+            await self.page.wait_for_load_state("domcontentloaded", timeout=4000)
         await asyncio.sleep(extra)
         await self.snap_frame()
 
@@ -803,6 +865,9 @@ class Engine:
             finally:
                 self.busy = False
                 self.last_agent_ts = time.time()
+                if self.pending_fit:
+                    with contextlib.suppress(Exception):
+                        await self.fit(*self.pending_fit)
                 await self.push_status(force=True)
 
     async def _do(self, op: str, r: dict) -> dict:
@@ -815,7 +880,7 @@ class Engine:
                 return {"ok": False, "error": why}
             await self.announce("nav", f"Opening {host_of(url)}", url=url[:300])
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await self.settle(0.8)
+            await self.settle(0.4)
         elif op == "snap":
             await self.announce("look", "Looking at the page")
         elif op == "click":
@@ -857,7 +922,7 @@ class Engine:
             loc = self._loc(r["ref"])
             await self.announce("hover", f"Pointing at {self._target(r['ref'])}", await self._box(loc))
             await loc.hover(timeout=8000)
-            await self.settle(0.3)
+            await self.settle(0.15)
         elif op == "press":
             await self.announce("key", f"Pressing {r['key']}", key=str(r["key"])[:30])
             await page.keyboard.press(r["key"])
@@ -867,7 +932,7 @@ class Engine:
             await self.announce("scroll", "Scrolling down" if dy >= 0 else "Scrolling up", dy=dy)
             await page.mouse.move(self.view[0] / 2, self.view[1] / 2)
             await page.mouse.wheel(0, dy)
-            await self.settle(0.3)
+            await self.settle(0.15)
         elif op in ("back", "forward", "reload"):
             await self.announce("nav", {"back": "Going back", "forward": "Going forward", "reload": "Reloading the page"}[op])
             await {"back": page.go_back, "forward": page.go_forward, "reload": page.reload}[op](timeout=15000)
@@ -906,7 +971,7 @@ class Engine:
                 return {"ok": False, "error": why}
             await self.announce("nav", f"Opening {host_of(url)}", url=url[:300])
             await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await self.settle(0.6)
+            await self.settle(0.3)
         elif op == "closetab":
             await self.announce("nav", "Closing the tab")
             await page.close()

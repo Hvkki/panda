@@ -669,11 +669,42 @@ html:has(.sheet-backdrop), html:has(.sheet-backdrop) body { overscroll-behavior-
 .bp-progress { position: absolute; left: 0; bottom: 0; height: 2px; width: 0; background: var(--accent); opacity: 0; }
 .bp-address.loading .bp-progress { opacity: 1; animation: progress 1.6s var(--ease) infinite; }
 @keyframes progress { 0% { width: 0; left: 0; } 60% { width: 70%; left: 10%; } 100% { width: 10%; left: 100%; } }
-.bp-tabs { min-height: 32px; padding: 4px 11px; font-variant-numeric: tabular-nums; }
-.bp-tabmenu { display: flex; flex-direction: column; margin: 0 10px 8px; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; animation: rise .15s var(--ease); }
-.bp-tabmenu button { display: flex; align-items: center; gap: 8px; text-align: left; padding: 9px 12px; font-size: 0.86em; border-bottom: 1px solid var(--line); }
-.bp-tabmenu button:last-child { border-bottom: 0; }
-.bp-tabmenu button.active { background: var(--accent-soft); }
+.bp-tabs { width: 38px; height: 36px; }
+.bp-tabs-count { display: grid; place-items: center; min-width: 20px; height: 20px; padding: 0 3px; border: 2px solid currentColor; border-radius: 6px;
+  font-size: .72em; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1; }
+.bp-tabs.on .bp-tabs-count { background: var(--text); color: var(--panel); border-color: var(--text); }
+/* Tab row: tablets and computers only; phones use the tab grid. */
+.bp-strip { display: none; align-items: flex-end; gap: 2px; padding: 0 10px; min-height: 38px; overflow-x: auto; scrollbar-width: none; }
+.bp-strip::-webkit-scrollbar { display: none; }
+@media (min-width: 700px) { .bp-strip { display: flex; } }
+.bp-strip-tab { display: flex; align-items: center; flex: 0 1 200px; min-width: 96px; height: 34px; border-radius: 11px 11px 0 0; color: var(--text-2);
+  transition: background .15s; }
+.bp-strip-tab:hover { background: var(--bg-2); }
+.bp-strip-tab.active { background: var(--bg-2); color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
+.bp-strip-main { flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; height: 100%; padding: 0 4px 0 11px; font-size: .8em; text-align: left; }
+.bp-strip-main:disabled { opacity: 1; cursor: default; }
+.bp-strip-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bp-strip-x { display: grid; place-items: center; width: 24px; height: 24px; margin-right: 5px; border-radius: 50%; flex: none; color: var(--muted); }
+.bp-strip-x:hover:not(:disabled) { background: var(--line); color: var(--text); }
+.bp-strip-new { width: 32px; height: 32px; flex: none; margin: 0 0 1px 2px; }
+/* Tab grid (from the tab counter), like Chrome's tab overview. */
+.bp-tabgrid { position: absolute; inset: 0; z-index: 5; display: flex; flex-direction: column; background: var(--panel); animation: fade .15s; }
+.bp-tabgrid-head { display: flex; align-items: center; gap: 10px; padding: 8px 10px 8px 16px; font-weight: 600; }
+.bp-tabgrid-head > span:first-child { flex: none; }
+.bp-tabgrid-head .muted { flex: 1; min-width: 0; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bp-tabgrid-head > span:first-child + .btn { margin-left: auto; }
+.bp-tabgrid-list { flex: 1; overflow-y: auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; padding: 4px 14px 16px; align-content: start; }
+.bp-tabcard { position: relative; border-radius: 14px; border: 1px solid var(--line); background: var(--bg-2); overflow: hidden; animation: rise .18s var(--ease); }
+.bp-tabcard.active { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.bp-tabcard-main { display: flex; flex-direction: column; width: 100%; text-align: left; }
+.bp-tabcard-main:disabled { opacity: .7; }
+.bp-tabcard-top { display: flex; align-items: center; gap: 6px; padding: 8px 34px 7px 10px; font-size: .78em; font-weight: 600; min-width: 0; }
+.bp-tabcard-top span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bp-tabcard-pic { display: grid; place-items: center; aspect-ratio: 3 / 4; background: #fff; color: var(--muted); overflow: hidden; }
+.bp-tabcard-pic img { width: 100%; height: 100%; object-fit: cover; object-position: top; }
+.bp-tabcard-host { padding: 5px 10px 7px; font-size: .72em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bp-tabcard-x { position: absolute; top: 4px; right: 4px; display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; color: var(--muted); }
+.bp-tabcard-x:hover:not(:disabled) { background: var(--line); color: var(--text); }
 .bp-body { position: relative; flex: 1; min-height: 120px; display: flex; }
 .bp-stage { flex: 1; min-width: 0; container-type: size; display: grid; place-items: center; padding: 10px;
   background: radial-gradient(circle at 50% 30%, #2a2622, #171513); }

@@ -23,7 +23,7 @@ const SPECIAL = ["Enter", "Backspace", "Tab", "Escape", "ArrowUp", "ArrowDown", 
 export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserLink; online: boolean; onClose: () => void; docked: boolean }) {
   const t = useT();
   const snap = useBrowserSnapshot(link);
-  const { status, frame, dims, actions } = snap;
+  const { status, frame, dims, actions, thumbs } = snap;
   const [address, setAddress] = useState("");
   const [tabsOpen, setTabsOpen] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
@@ -147,6 +147,12 @@ export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserL
     : status?.action || (status?.busy ? "Working…" : lastAction && Date.now() - lastAction.t < 20000 ? lastAction.c : "Panda's browser — watching live.");
   const focus = mine ? status?.focus : null;
   const secure = (status?.url || "").startsWith("https://");
+  // Tabs work without Take over whenever Panda isn't using the browser.
+  const tabsOk = online && (mine || !status?.busy);
+  const tabs = status?.tabs?.length ? status.tabs : [{ i: 0, u: status?.url || "", t: status?.title || "", active: true }];
+  const tabName = (tb: { u: string; t?: string }) => tb.t || hostOf(tb.u) || "New tab";
+  const openTabs = () => { if (!tabsOpen) send({ t: "tabs" }); setTabsOpen(!tabsOpen); };
+  const newTab = () => { send({ t: "newtab" }); setTabsOpen(false); };
 
   return (
     <div ref={panel} className={`browser-panel ${docked ? "docked" : ""} ${full ? "full" : ""} ctl-${control}`} role="dialog" aria-label="Panda's browser">
@@ -166,6 +172,17 @@ export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserL
         </button>
       </div>
 
+      <div className="bp-strip" role="tablist" aria-label="Tabs">
+        {tabs.map((tb) => (
+          <div key={tb.id ?? tb.i} className={`bp-strip-tab ${tb.active ? "active" : ""}`} role="tab" aria-selected={tb.active}>
+            <button className="bp-strip-main" disabled={!tabsOk || tb.active} onClick={() => send({ t: "tab", i: tb.i })} title={tb.u}>
+              <IconGlobe size={13} /><span>{tabName(tb)}</span></button>
+            <button className="bp-strip-x" disabled={!tabsOk} onClick={() => send({ t: "closetab", i: tb.i })} aria-label={`Close ${tabName(tb)}`}><IconX size={13} /></button>
+          </div>
+        ))}
+        <button className="icon-btn bp-strip-new" disabled={!tabsOk} onClick={newTab} aria-label="New tab" title="New tab"><IconPlus size={16} /></button>
+      </div>
+
       <form className="bp-url" onSubmit={(e) => { e.preventDefault(); if (mine && address.trim()) send({ t: "nav", url: address.trim() }); editing.current = false; (document.activeElement as HTMLElement)?.blur(); }}>
         <button type="button" className="icon-btn" disabled={!mine} onClick={() => send({ t: "back" })} aria-label="Back"><IconArrowLeft size={18} /></button>
         <button type="button" className="icon-btn" disabled={!mine} onClick={() => send({ t: "forward" })} aria-label="Forward"><IconArrowRight size={18} /></button>
@@ -177,18 +194,9 @@ export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserL
             onFocus={(e) => { editing.current = true; e.target.select(); }} onBlur={() => (editing.current = false)} onChange={(e) => setAddress(e.target.value)} />
           <span className="bp-progress" />
         </div>
-        <button type="button" className="chip bp-tabs" onClick={() => setTabsOpen((v) => !v)} aria-label="Tabs">{status?.tabs.length || 1}</button>
+        <button type="button" className={`icon-btn bp-tabs ${tabsOpen ? "on" : ""}`} onClick={openTabs} aria-label={`${tabs.length} tabs`} title="Tabs">
+          <span className="bp-tabs-count">{tabs.length > 99 ? ":D" : tabs.length}</span></button>
       </form>
-      {tabsOpen && (
-        <div className="bp-tabmenu">
-          {(status?.tabs || []).map((tb) => (
-            <button key={tb.i} className={tb.active ? "active" : ""} disabled={!mine} onClick={() => { send({ t: "tab", i: tb.i }); setTabsOpen(false); }}>
-              <IconGlobe size={13} /> {tb.u.replace(/^https?:\/\//, "").slice(0, 60) || "New tab"}
-            </button>
-          ))}
-          <button disabled={!mine} onClick={() => { send({ t: "newtab" }); setTabsOpen(false); }}><IconPlus size={13} /> New tab</button>
-        </div>
-      )}
 
       <div className="bp-body">
         <div className={`bp-stage ${kbdOpen && mine ? "kb" : ""}`} ref={stage}>
@@ -232,6 +240,32 @@ export function BrowserPanel({ link, online, onClose, docked }: { link: BrowserL
               </button>
             ))}
           </aside>
+        )}
+        {tabsOpen && (
+          <div className="bp-tabgrid" role="dialog" aria-label="Tabs">
+            <div className="bp-tabgrid-head">
+              <span>{tabs.length} {tabs.length === 1 ? "tab" : "tabs"}</span>
+              {!tabsOk && <span className="muted small">{online ? "Wait until Panda is done, or take over" : "Start Panda to use tabs"}</span>}
+              <button className="btn small" disabled={!tabsOk} onClick={newTab}><IconPlus size={15} /> New tab</button>
+              <button className="icon-btn" onClick={() => setTabsOpen(false)} aria-label="Close tabs"><IconX size={18} /></button>
+            </div>
+            <div className="bp-tabgrid-list">
+              {tabs.map((tb) => {
+                const pic = tb.active ? frame : thumbs[String(tb.id)];
+                return (
+                  <div key={tb.id ?? tb.i} className={`bp-tabcard ${tb.active ? "active" : ""}`}>
+                    <button className="bp-tabcard-main" disabled={!tabsOk && !tb.active}
+                      onClick={() => { if (!tb.active) send({ t: "tab", i: tb.i }); setTabsOpen(false); }}>
+                      <span className="bp-tabcard-top"><IconGlobe size={12} /><span>{tabName(tb)}</span></span>
+                      <span className="bp-tabcard-pic">{pic ? <img src={pic} alt="" /> : <IconGlobe size={26} />}</span>
+                      <span className="bp-tabcard-host muted">{hostOf(tb.u) || "New tab"}</span>
+                    </button>
+                    <button className="bp-tabcard-x" disabled={!tabsOk} onClick={() => send({ t: "closetab", i: tb.i })} aria-label={`Close ${tabName(tb)}`}><IconX size={14} /></button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
         )}
         {replay && (
           <button className="bp-replay" onClick={() => setReplay(null)} aria-label="Close the step screen">

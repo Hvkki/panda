@@ -5,7 +5,8 @@ import { supabase } from "./supabase";
 export type BrowserStatus = {
   url: string;
   title: string;
-  tabs: { i: number; u: string; active: boolean }[];
+  /** Open tabs. id stays the same while the tab is open; i is its place in the list. t: page title. */
+  tabs: { i: number; id?: number; u: string; t?: string; active: boolean }[];
   control: "agent" | "user" | "needs_user";
   message: string;
   busy: boolean;
@@ -33,6 +34,7 @@ export type BrowserSnapshot = {
   dims: { w: number; h: number };// page size of that frame, in CSS px
   lastSeen: number;              // when the engine last spoke
   actions: BrowserAction[];      // newest last, at most 40
+  thumbs: Record<string, string>;// tab id -> data URL of a small picture of that tab
 };
 
 type Size = { vw: number; vh: number };
@@ -45,7 +47,7 @@ type Size = { vw: number; vh: number };
  * kept in the user's settings. Frames flow only while at least one viewer is registered.
  */
 export class BrowserLink {
-  private snap: BrowserSnapshot = { status: null, frame: null, dims: { w: 1024, h: 720 }, lastSeen: 0, actions: [] };
+  private snap: BrowserSnapshot = { status: null, frame: null, dims: { w: 1024, h: 720 }, lastSeen: 0, actions: [], thumbs: {} };
   private listeners = new Set<() => void>();
   private chan: RealtimeChannel | null = null;
   private viewers = new Map<number, Size | undefined>();
@@ -68,6 +70,10 @@ export class BrowserLink {
     ch.on("broadcast", { event: "frame" }, ({ payload }) => this.onFrame(payload));
     ch.on("broadcast", { event: "status" }, ({ payload }) => this.set({ status: payload as BrowserStatus, lastSeen: Date.now() }));
     ch.on("broadcast", { event: "action" }, ({ payload }) => this.onAction(payload as BrowserAction));
+    ch.on("broadcast", { event: "thumbs" }, ({ payload }) => {
+      const raw = (payload as { thumbs?: Record<string, string> }).thumbs || {};
+      this.set({ thumbs: Object.fromEntries(Object.entries(raw).map(([k, v]) => [k, `data:image/jpeg;base64,${v}`])) });
+    });
     ch.subscribe();
     this.chan = ch;
     this.timer = window.setInterval(() => { if (this.viewers.size) this.hello(); }, 8000);
@@ -139,7 +145,7 @@ export function useBrowserLink(topic: string | undefined): BrowserLink | null {
   return link;
 }
 
-const EMPTY: BrowserSnapshot = { status: null, frame: null, dims: { w: 1024, h: 720 }, lastSeen: 0, actions: [] };
+const EMPTY: BrowserSnapshot = { status: null, frame: null, dims: { w: 1024, h: 720 }, lastSeen: 0, actions: [], thumbs: {} };
 const noop = () => () => {};
 
 /** Re-render on every frame/status/action (for the views that show the browser). */
