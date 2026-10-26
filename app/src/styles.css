@@ -444,10 +444,16 @@ select { padding: 8px 30px 8px 11px; border-radius: 10px; border: 1px solid var(
 
 /* ── model sheet ─────────────────────────────────────────────── */
 .sheet-backdrop { position: fixed; inset: 0; z-index: 40; background: rgba(20, 14, 8, 0.36); display: flex; align-items: flex-end; justify-content: center; animation: fade .18s; }
-.sheet { width: min(520px, 100%); max-height: 86vh; overflow-y: auto; background: var(--panel); border-radius: 24px 24px 0 0;
+.sheet { width: min(520px, 100%); max-height: 86vh; overflow-y: auto; overscroll-behavior: contain; will-change: transform; background: var(--panel); border-radius: 24px 24px 0 0;
   padding: 8px 8px max(14px, env(safe-area-inset-bottom)); animation: sheet-up 0.24s var(--ease); box-shadow: var(--shadow-lg); }
 @media (min-width: 700px) { .sheet-backdrop { align-items: center; } .sheet { border-radius: 24px; } }
 @keyframes sheet-up { from { transform: translateY(30px); opacity: 0; } }
+/* While a sheet is open, a swipe down closes it instead of reloading the page (Chrome pull-to-refresh). */
+html:has(.sheet-backdrop), html:has(.sheet-backdrop) body { overscroll-behavior-y: none; }
+.sheet { touch-action: pan-y; }
+.sheet-backdrop.closing { animation: fade-out .24s forwards; pointer-events: none; }
+.sheet-handle-btn { display: block; width: 100%; padding: 6px 0 4px; cursor: grab; }
+.sheet-handle-btn .sheet-handle { display: block; }
 .sheet-handle { width: 40px; height: 4px; border-radius: 4px; background: var(--line-2); margin: 6px auto 8px; }
 .sheet-row { display: flex; align-items: center; justify-content: space-between; width: 100%; text-align: left; padding: 11px 14px; min-height: 54px; border-radius: 13px; }
 .sheet-row:hover, .sheet-row.selected { background: var(--bg-2); }
