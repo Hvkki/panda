@@ -243,7 +243,7 @@ function Shell({ userId, email }: { userId: string; email: string }) {
       {panel === "settings" && <SettingsModal email={email} userId={userId} worker={worker} online={online}
         initialTab={settingsTab} onClose={() => setPanel(null)} />}
       {panel === "search" && <SearchModal chats={listed} onOpen={open} onClose={() => setPanel(null)} />}
-      {panel === "notifications" && <NotificationsModal items={notifs} onClose={() => setPanel(null)} />}
+      {panel === "notifications" && <NotificationsModal items={notifs} online={online} onClose={() => setPanel(null)} />}
     </div>
     </BrowserContext.Provider>
   );

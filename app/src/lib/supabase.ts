@@ -105,7 +105,7 @@ export type Notification = {
   text: string;
   source: string;
   read: boolean;
-  meta: { title?: string; kind?: string };
+  meta: { title?: string; kind?: string; slug?: string; decision?: string; [k: string]: unknown };
   created_at: string;
 };
 

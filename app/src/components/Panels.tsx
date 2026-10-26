@@ -5,6 +5,7 @@ import { useT } from "../lib/i18n";
 import { ALL_MODELS, EFFORTS } from "../lib/models";
 import { IconBell, IconCoins, IconCrew, IconGear, IconSliders, IconSparkle, IconUsers, IconX } from "./Icons";
 import { disablePush, enablePush, pushState } from "../lib/push";
+import { gw } from "../lib/commands";
 import { CrewSettingsPanel } from "./CrewSettings";
 import { UsagePanel } from "./Usage";
 import type { Worker } from "./SessionChip";
@@ -256,7 +257,59 @@ export function SearchModal({ chats, onOpen, onClose }: { chats: Chat[]; onOpen:
 
 /* ── Notifications (scheduled task results) ──────────────────────────────── */
 
-export function NotificationsModal({ items, onClose }: { items: Notification[]; onClose: () => void }) {
+/** The pending-skill slug a "skill awaiting review" notification is about, or "". */
+function pendingSkillSlug(n: Notification): string {
+  if (!/awaiting review/i.test(n.meta.title || "")) return "";
+  if (n.meta.slug) return n.meta.slug;
+  // Older rows carry no slug: Crew's body starts with **auto/<slug>**.
+  return n.text.match(/\*\*auto\/([a-z0-9][a-z0-9_-]*)\*\*/i)?.[1] || "";
+}
+
+/** Approve / Deny buttons for a skill Kiro Crew wrote and wants checked first. */
+function SkillReview({ n, online }: { n: Notification; online: boolean }) {
+  const slug = pendingSkillSlug(n);
+  const [decision, setDecision] = useState(n.meta.decision || "");
+  const [busy, setBusy] = useState("");
+  const [err, setErr] = useState("");
+  if (!slug) return null;
+  const decide = async (act: "approve" | "dismiss") => {
+    setBusy(act); setErr("");
+    try {
+      await gw("POST", `/api/skills/-/pending/${encodeURIComponent(slug)}/${act}`, {});
+      done(act === "approve" ? "approved" : "denied");
+    } catch (e) {
+      const msg = (e as Error).message || "";
+      // Already approved, denied or expired elsewhere: say so instead of failing.
+      if (/404|not found|no such|not pending/i.test(msg)) done("gone");
+      else setErr(msg || "That didn't work.");
+    } finally { setBusy(""); }
+  };
+  const done = (d: string) => {
+    setDecision(d);
+    supabase.from("notifications").update({ meta: { ...n.meta, decision: d } }).eq("id", n.id).then(() => {});
+  };
+  if (decision) {
+    const label = decision === "approved" ? "Approved. Panda can use this skill now."
+      : decision === "denied" ? "Denied. The skill was thrown away." : "Already handled.";
+    return <div className={`notif-decision ${decision}`}>{label}</div>;
+  }
+  return (
+    <>
+      <div className="notif-actions">
+        <button className="btn primary small-btn" disabled={!online || !!busy} onClick={() => decide("approve")}>
+          {busy === "approve" ? "Approving…" : "Approve"}
+        </button>
+        <button className="btn small-btn danger" disabled={!online || !!busy} onClick={() => decide("dismiss")}>
+          {busy === "dismiss" ? "Denying…" : "Deny"}
+        </button>
+      </div>
+      {!online && <div className="muted small">Start Panda to approve or deny.</div>}
+      {err && <div className="notif-error small">{err}</div>}
+    </>
+  );
+}
+
+export function NotificationsModal({ items, online, onClose }: { items: Notification[]; online: boolean; onClose: () => void }) {
   const t = useT();
   useEffect(() => {
     const unread = items.filter((n) => !n.read).map((n) => n.id);
@@ -270,6 +323,7 @@ export function NotificationsModal({ items, onClose }: { items: Notification[]; 
           <div key={n.id} className={`notif ${n.read ? "" : "unread"}`}>
             <div className="notif-title">{n.meta.title || n.source}</div>
             <div className="notif-text">{n.text}</div>
+            <SkillReview n={n} online={online} />
             <div className="muted small">{new Date(n.created_at).toLocaleString()}</div>
           </div>
         ))}

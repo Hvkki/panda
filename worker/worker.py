@@ -2489,7 +2489,9 @@ def mirror_notifications(sb: Supabase, gw: Gateway, seen: set):
             "owner": OWNER, "source": str(n.get("source") or n.get("kind") or "crew")[:40],
             "text": scrub(body)[:8000],
             "meta": {"ts": ts, "title": scrub(n.get("title") or "")[:300], "kind": n.get("kind"),
-                     "priority": n.get("priority"), "job_id": n.get("job_id")}})
+                     "priority": n.get("priority"), "job_id": n.get("job_id"),
+                     # pending-skill rows: lets the app's Approve / Deny buttons name the candidate
+                     "slug": str((n.get("meta") or {}).get("slug") or "")[:80] or None}})
         push(sb, OWNER, (n.get("title") or "Panda").replace("Cron: ", "⏰ ")[:60], body, "./?panel=notifications")
         try:
             gw.call("POST", "/api/notifications/ack", {"ts": ts})
