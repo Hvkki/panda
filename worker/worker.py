@@ -800,12 +800,16 @@ def extract_archive(archive: str, home: str, roots: list) -> tuple:
 
 
 _files_sync = {"sig": None}
+_files_restore = {"failed": False}  # a run whose restore failed must never overwrite the good saved copy
 _files_lock = threading.Lock()
 
 
 def files_snapshot(sb: "Supabase", reason: str) -> dict | None:
     """Save the owner's work files. Skips the upload when nothing changed since the last save."""
     if not FILES_ENABLED:
+        return None
+    if _files_restore["failed"]:
+        log("files: not saved -- this run could not restore them, so saving would replace the good copy")
         return None
     with _files_lock:
         entries, skipped = select_files(HOME, FILES_ROOTS, exclude=(WORK,))
@@ -869,6 +873,7 @@ def restore_files(sb: "Supabase") -> str:
         return "restored"
     except Exception as exc:
         log("files could not be restored:", scrub(exc)[:200])
+        _files_restore["failed"] = True
         return "failed"
     finally:
         with contextlib.suppress(OSError):
@@ -3614,7 +3619,6 @@ def main():
                 set_sess(status="stopped", stopped_at=now_iso(), info=SESSION_INFO)
                 return
         restored = restore(sb)
-        files_state = restore_files(sb)
         # The app's system prompt lives in Storage so it can be edited without a redeploy.
         os.makedirs(f"{HOME}/.kiro/crew", exist_ok=True)
         if sb.download("config/prompt.md", f"{HOME}/.kiro/crew/prompt.md"):
@@ -3623,6 +3627,10 @@ def main():
         os.makedirs(WORKDIR, exist_ok=True)
         install_skills(sb)
         setup_drive()
+        # After the Drive login and the drive tool are in place: big saves live in Google Drive, and
+        # restoring before them failed on every run, so ~/dev, ~/work and ~/outputs came back empty.
+        files_state = restore_files(sb)
+        setup_drive()  # the restored ~/.panda may hold an older drive.json
         try:
             sync_secrets(sb)
         except Exception as exc:
