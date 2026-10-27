@@ -67,3 +67,4 @@ export const IconSpinner = ({ size = 16 }: P) => (
   </svg>
 );
 export const IconCode = (p: P) => <S {...p}><path d="m8 7-5 5 5 5M16 7l5 5-5 5M13.5 4l-3 16" /></S>;
+export const IconFilm = (p: P) => <S {...p}><rect x="3" y="4" width="18" height="16" rx="2.5" /><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4" /></S>;

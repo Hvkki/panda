@@ -12,6 +12,7 @@ import { NotificationsModal, SearchModal, SettingsModal, type SettingsTab } from
 import { Logo } from "./components/Logo";
 import { IconGlobe, IconPlus, IconSidebar } from "./components/Icons";
 import { FilesPage } from "./components/Files";
+import { VideoPage } from "./components/VideoTab";
 import { BrowserPanel } from "./components/BrowserPanel";
 import { BrowserContext, isAlive, useBrowserLink, useBrowserSelect } from "./lib/browser";
 import { ProjectsPage } from "./components/Projects";
@@ -19,7 +20,7 @@ import { CustomizePage } from "./components/Customize";
 import { DeveloperPage } from "./components/Developer";
 import type { Attachment } from "./lib/files";
 
-export type View = "chat" | "projects" | "files" | "customize" | "developer";
+export type View = "chat" | "projects" | "files" | "video" | "customize" | "developer";
 
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
@@ -203,7 +204,7 @@ function Shell({ userId, email }: { userId: string; email: string }) {
       <main className="main">
         <header className="topbar">
           <button className="icon-btn" onClick={() => setSideOpen((v) => !v)} aria-label="Sidebar"><IconSidebar /></button>
-          <div className="topbar-title">{view === "chat" ? active?.title || "" : view === "developer" ? "Developer" : ""}</div>
+          <div className="topbar-title">{view === "chat" ? active?.title || "" : view === "developer" ? "Developer" : view === "video" ? "Video" : ""}</div>
           {(browserLive || browserOpen) && browser && (
             <button className={`icon-btn browser-btn ${browserBusy ? "busy" : ""} ${needsYou ? "needs" : ""}`}
               onClick={() => setBrowserOpen((v) => !v)} aria-label="Panda's browser" title="Panda's browser"><IconGlobe /></button>
@@ -216,6 +217,8 @@ function Shell({ userId, email }: { userId: string; email: string }) {
             onStartChat={startChat} draft={draft} onDraft={(model, effort) => setDraft({ model, effort })} online={online} />
         ) : view === "files" ? (
           <FilesPage onOpenChat={open} />
+        ) : view === "video" ? (
+          <VideoPage userId={userId} online={online} />
         ) : view === "customize" ? (
           <CustomizePage online={online} onAsk={askPanda} />
         ) : view === "developer" ? (

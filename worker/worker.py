@@ -209,7 +209,7 @@ def install_skills(sb: "Supabase"):
 # Skill helpers as real commands. The skills used to tell the agent to define a shell function
 # (`pb() { python3 …; }`), and Kiro Crew refuses to auto-approve a command that redefines a program
 # name: the step then waited for an approval nobody saw, and the chat seemed to stop answering.
-SKILL_COMMANDS = {"pb": "panda-browser/pb.py", "drive": "panda-drive/drive.py"}
+SKILL_COMMANDS = {"pb": "panda-browser/pb.py", "drive": "panda-drive/drive.py", "pvideo": "panda-video/video.py"}
 
 
 def install_skill_commands():
@@ -1101,6 +1101,89 @@ def _stt_install():
 
 def start_stt():
     threading.Thread(target=_stt_install, daemon=True).start()
+
+
+# ── video: MiniMax H3 on the owner's Modal app (engine: skills/panda-video/video.py) ──
+MODAL_PKG = "modal==1.6.2"  # the client the panda-h3 app was deployed with
+VIDEO = {"engine": None, "state": "off", "error": "", "slot": "", "lock": threading.Lock()}
+
+
+def video_llm(gw: "Gateway"):
+    """Prompt writer: one short turn on a small private Crew slot (kirocrew-lite, Sonnet, low effort)."""
+    def ask(text: str) -> str:
+        with VIDEO["lock"]:
+            created = gw.call("POST", "/api/chat/slots", {"name": "Video prompt writer", "agent": "kirocrew-lite"})
+            slot = created.get("key") or created.get("id") or created.get("slot") or created.get("name")
+            if not slot:
+                raise RuntimeError("no writer slot")
+            try:
+                for path, body in ((f"/api/chat/slots/{slot}/model", {"model": "claude-sonnet-5.5"}),
+                                   (f"/api/chat/slots/{slot}/reasoning-effort", {"reasoning_effort": "low"})):
+                    try:
+                        gw.call("POST", path, body)
+                    except Exception:
+                        pass
+                out, done = {"text": ""}, threading.Event()
+
+                def run():
+                    try:
+                        for c in gw.stream_chat(slot, text):
+                            if not isinstance(c, dict):
+                                continue
+                            if c.get("type") == "chunk":
+                                out["text"] += chunk_text(c)
+                            elif c.get("type") == "assistant" and c.get("content"):
+                                out["text"] = c["content"] if len(c["content"]) >= len(out["text"]) else out["text"]
+                            elif c.get("type") in ("permission", "error"):
+                                break  # a writer never needs tools; give up and use the template
+                    finally:
+                        done.set()
+                threading.Thread(target=run, daemon=True).start()
+                if not done.wait(120):
+                    _safe(gw.call, "POST", f"/api/chat/slots/{slot}/stop", {})
+                    raise TimeoutError("the writer took too long")
+                return out["text"]
+            finally:
+                _safe(gw.call, "DELETE", f"/api/chat/slots/{slot}")
+    return ask
+
+
+def _video_install(sb: "Supabase", gw: "Gateway"):
+    VIDEO["state"] = "installing"
+    try:
+        try:
+            import modal  # noqa: F401
+        except ImportError:
+            sh(f"{sys.executable} -m pip install -q {MODAL_PKG}", timeout=900, check=True)
+        path = f"{HOME}/.kiro/crew/skills/panda-video"
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import video as pvideo  # noqa: PLC0415  (skills/panda-video/video.py)
+        eng = pvideo.Engine(sb, SB_URL, lambda: OWNER, log=log, llm=video_llm(gw),
+                            notify=lambda title, body: push(sb, OWNER, title, body, "./?v=video"))
+        eng.start()
+        VIDEO.update(engine=eng, state="ready")
+        log("video engine ready")
+    except Exception as exc:
+        VIDEO.update(state="failed", error=_reason(exc)[:200])
+        log("video engine failed:", exc)
+
+
+def start_video(sb: "Supabase", gw: "Gateway"):
+    threading.Thread(target=_video_install, args=(sb, gw), daemon=True).start()
+
+
+def video_command(op: str, args: dict) -> dict:
+    if VIDEO["state"] == "installing":
+        deadline = time.time() + 150
+        while VIDEO["state"] == "installing" and time.time() < deadline:
+            time.sleep(1)
+    eng = VIDEO["engine"]
+    if not eng:
+        raise RuntimeError("video is not ready yet" + (f": {VIDEO['error']}" if VIDEO["error"] else ""))
+    fn = {"video.prompt": eng.write_prompt, "video.estimate": eng.estimate, "video.submit": eng.submit,
+          "video.cancel": eng.cancel, "video.delete": eng.delete}[op]
+    return fn(args)
 
 
 def speech_to_text(args: dict) -> dict:
@@ -2502,6 +2585,8 @@ def run_command(sb: Supabase, gw: Gateway, cmd: dict):
             result = browser_forget(sb)
         elif op == "stt":
             result = speech_to_text(args)
+        elif op in ("video.prompt", "video.estimate", "video.submit", "video.cancel", "video.delete"):
+            result = video_command(op, args)
         elif op == "ping":
             result = {"ok": True, "uptime_secs": round(time.time() - T0), "crew": CREW_VERSION["v"]}
         else:
@@ -2646,6 +2731,7 @@ def main():
         gw = Gateway()
         # Kiro Crew settings changed in the app, re-applied in case the snapshot predates them.
         apply_overrides(gw, user_settings(sb, OWNER).get("crewOverrides"))
+        start_video(sb, gw)
         stop_evt = threading.Event()
         threading.Thread(target=command_loop, args=(sb, gw, stop_evt), daemon=True).start()
         threading.Thread(target=thinking_listener, args=(gw, stop_evt), daemon=True).start()

@@ -13,6 +13,8 @@ Why it is cheap:
     A job that lands on a warm container pays only its own sampling time.
   * A failed job stops the container right after it (no idle GPU), and every job has a hard
     time cap besides Modal's 20-minute timeout.
+  * The GPU waits only 20 s for the next job. Seeds and back-to-back jobs are already queued, so
+    they still share one warm container; an idle 2-minute wait cost more ($0.12) than a cold start.
 """
 from __future__ import annotations
 
@@ -152,7 +154,7 @@ def _interrupt():
 
 
 @app.cls(image=gpu_image, gpu=GPU, volumes={MODELS: VOL}, cpu=4.0, memory=49152,
-         timeout=20 * 60, scaledown_window=120, max_containers=1)
+         timeout=20 * 60, scaledown_window=20, max_containers=1)
 class H3:
     @modal.enter()
     def start(self):
