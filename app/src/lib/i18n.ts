@@ -2,7 +2,7 @@ import { useSettings } from "./settings";
 
 const en = {
   morning: "Morning", afternoon: "Afternoon", evening: "Evening", night: "Up late",
-  placeholder: "Ask anything, or type / for commands", newChat: "New chat", search: "Search",
+  placeholder: "Ask anything, or type / for commands", newChat: "New chat", incognito: "Incognito chat", incognitoNote: "Incognito: Panda won't remember this chat, and it's deleted when you leave it.", search: "Search",
   chats: "Chats", pinned: "Pinned", settings: "Settings", signOut: "Log out",
   start: "Start", stop: "Stop", starting: "Starting…", restarting: "Restarting…", stopping: "Saving…", running: "Online",
   offline: "Offline", queued: "Queued — Panda will answer when it's online", queuedBusy: "Waiting — Panda is finishing other chats first",
@@ -21,7 +21,7 @@ type Dict = typeof en;
 
 const it: Dict = {
   morning: "Buongiorno", afternoon: "Buon pomeriggio", evening: "Buonasera", night: "Ancora sveglio",
-  placeholder: "Chiedi qualsiasi cosa, o scrivi / per i comandi", newChat: "Nuova chat", search: "Cerca",
+  placeholder: "Chiedi qualsiasi cosa, o scrivi / per i comandi", newChat: "Nuova chat", incognito: "Chat in incognito", incognitoNote: "Incognito: Panda non ricorderà questa chat, e verrà eliminata quando la lasci.", search: "Cerca",
   chats: "Chat", pinned: "Fissate", settings: "Impostazioni", signOut: "Esci",
   start: "Avvia", stop: "Ferma", starting: "Avvio…", restarting: "Riavvio…", stopping: "Salvataggio…", running: "Online",
   offline: "Offline", queued: "In coda — Panda risponderà appena online", queuedBusy: "In attesa — Panda sta finendo altre chat",
@@ -39,7 +39,7 @@ const it: Dict = {
 
 const uk: Dict = {
   morning: "Доброго ранку", afternoon: "Доброго дня", evening: "Добрий вечір", night: "Ще не спиш",
-  placeholder: "Запитай будь-що або введи / для команд", newChat: "Новий чат", search: "Пошук",
+  placeholder: "Запитай будь-що або введи / для команд", newChat: "Новий чат", incognito: "Інкогніто-чат", incognitoNote: "Інкогніто: Panda не запам'ятає цей чат, і його буде видалено, коли ви вийдете.", search: "Пошук",
   chats: "Чати", pinned: "Закріплені", settings: "Налаштування", signOut: "Вийти",
   start: "Запуск", stop: "Стоп", starting: "Запуск…", restarting: "Перезапуск…", stopping: "Збереження…", running: "Онлайн",
   offline: "Офлайн", queued: "У черзі — Panda відповість, щойно буде онлайн", queuedBusy: "Чекає — Panda спершу завершує інші чати",

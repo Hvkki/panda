@@ -77,8 +77,28 @@ def ensure_engine():
     sys.exit("The browser could not start. See ~/.panda/browser-engine.log")
 
 
+def owner() -> str:
+    """Which agent is calling: the nearest kiro-cli chat process above us. Each chat and each helper
+    runs in its own one, so each gets its own browser tab. Empty when not run by an agent."""
+    if os.environ.get("PANDA_BROWSER_OWNER"):
+        return os.environ["PANDA_BROWSER_OWNER"][:40]
+    pid = os.getppid()
+    for _ in range(12):
+        try:
+            cmd = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")[0].decode(errors="replace")
+            if os.path.basename(cmd).startswith("kiro-cli"):
+                return f"pid:{pid}"
+            pid = int(next(l.split()[1] for l in open(f"/proc/{pid}/status") if l.startswith("PPid:")))
+        except (OSError, StopIteration, ValueError):
+            break
+        if pid <= 1:
+            break
+    return ""
+
+
 def call(req: dict, timeout=900) -> dict:
     ensure_engine()
+    req = {**req, "owner": owner()}
     data = json.dumps(req).encode()
     r = urllib.request.Request(BASE + "/do", data=data, headers={"Content-Type": "application/json"})
     return json.load(urllib.request.urlopen(r, timeout=timeout))

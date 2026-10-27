@@ -233,6 +233,8 @@ class Engine:
         self.xvfb: subprocess.Popen | None = None  # the virtual screen Chromium draws on
         self.pending_fit: tuple | None = None  # a panel resize that came while Panda was busy
         self.tab_ids: dict = {}            # page -> stable tab id (indexes shift when a tab closes)
+        self.owner_pages: dict = {}        # agent (its kiro-cli process) -> its own tab, so chats don't share one
+        self.wired: set = set()            # pages whose events are hooked up already
         self.next_tab = 1
         self.thumbs: dict[int, str] = {}   # tab id -> small JPEG of how it looked, for the tab overview
 
@@ -351,6 +353,10 @@ class Engine:
         self.page = page
         self.focus = None
         await self._emulate()
+        if page in self.wired:  # switching back to a known tab: its events are hooked up already
+            await self._restart_screencast()
+            return await self.push_status()
+        self.wired.add(page)
         page.on("dialog", lambda d: asyncio.create_task(d.accept() if d.type in ("alert", "beforeunload") else d.dismiss()))
         page.on("download", lambda d: asyncio.create_task(self._download(d)))
         page.on("close", lambda: asyncio.create_task(self._page_closed(page)))
@@ -384,6 +390,9 @@ class Engine:
         if self.closing or page.context is not self.ctx:
             return
         self.thumbs.pop(self.tab_ids.pop(page, 0), None)
+        self.wired.discard(page)
+        for o in [o for o, p in self.owner_pages.items() if p is page]:
+            del self.owner_pages[o]
         if self.page is not page:  # a background tab closed: only the list changes
             return await self.push_status(force=True)
         try:
@@ -391,6 +400,34 @@ class Engine:
             await self._adopt(pages[-1] if pages else await self.ctx.new_page())
         except Exception as exc:
             log("could not recover from closed tab:", str(exc)[:100])
+
+    async def _owner_page(self, owner: str):
+        """Give each agent its own tab: the first time it browses it takes a free tab, or opens one."""
+        p = self.owner_pages.get(owner)
+        if p is None or p.is_closed():
+            taken = [x for o, x in self.owner_pages.items() if o != owner and not x.is_closed()]
+            cur = self.page
+            p = cur if cur and not cur.is_closed() and cur not in taken else await self.ctx.new_page()
+            self.owner_pages[owner] = p
+        if p is not self.page:
+            await self._adopt(p)  # the viewer follows the agent that is acting
+
+    async def _drop_gone_owners(self):
+        """An agent whose process ended (chat closed, helper done) gives its tab back; the last tab stays."""
+        for o, p in list(self.owner_pages.items()):
+            pid = o.split(":", 1)[1] if o.startswith("pid:") else ""
+            alive = True
+            if pid.isdigit():
+                try:
+                    os.kill(int(pid), 0)
+                except OSError:
+                    alive = False
+            if alive:
+                continue
+            del self.owner_pages[o]
+            if not p.is_closed() and len([x for x in self.ctx.pages if not x.is_closed()]) > 1:
+                with contextlib.suppress(Exception):
+                    await p.close()
 
     async def _download(self, d):
         OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -422,6 +459,7 @@ class Engine:
                 await self._stop_screencast()
             if n % 22 == 0:  # ~every 45 s
                 await self.save_state()
+                await self._drop_gone_owners()
             if n % 5 == 0:  # ~every 10 s, viewer or not, so the app can show "Panda is browsing"
                 await self.push_status(force=True)
 
@@ -857,8 +895,17 @@ class Engine:
             self.busy = True
             self.last_agent_ts = time.time()
             await self.push_status(force=True)
+            owner = str(req.get("owner") or "")[:40]
             try:
-                return await self._do(op, req)
+                if owner and op not in ("forget", "save"):
+                    await self._owner_page(owner)
+                out = await self._do(op, req)
+                # A tab the agent switched to, opened, or that its click popped up is now its tab
+                # (unless another agent owns it).
+                if owner and self.page and not self.page.is_closed() and \
+                        all(p is not self.page for o, p in self.owner_pages.items() if o != owner):
+                    self.owner_pages[owner] = self.page
+                return out
             except Exception as exc:
                 return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:300]}",
                         **{k: v for k, v in (await self.summary(snap=False)).items() if k in ("url", "title")}}
@@ -999,6 +1046,8 @@ class Engine:
             await self.save_state()
         elif op == "forget":
             STATE_PATH.unlink(missing_ok=True)
+            self.owner_pages.clear()
+            self.wired.clear()
             await self._new_context(None)
             return {"ok": True, "note": "all browser logins and cookies were deleted"}
         elif op == "save":

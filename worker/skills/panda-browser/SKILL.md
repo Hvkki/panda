@@ -24,6 +24,9 @@ pb shot report.png              # save a screenshot to ~/outputs (appears as a f
 that command can't be auto-approved and the step hangs.
 
 
+Each chat and each helper agent gets its own tab automatically, so parallel chats never fight
+over one page. `pb tabs` shows every tab; stay in yours unless the user asks otherwise.
+
 `pb open red panda facts` (words, not an address) searches Google; `pb newtab` opens Google.
 The page is always the site's desktop version, also when the user watches on a phone.
 

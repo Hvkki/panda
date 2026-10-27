@@ -10,7 +10,7 @@ import { Composer, type SendMeta } from "./components/Composer";
 import { SessionChip, useWorker } from "./components/SessionChip";
 import { NotificationsModal, SearchModal, SettingsModal, type SettingsTab } from "./components/Panels";
 import { Logo } from "./components/Logo";
-import { IconGlobe, IconPlus, IconSidebar } from "./components/Icons";
+import { IconGlobe, IconIncognito, IconPlus, IconSidebar } from "./components/Icons";
 import { FilesPage } from "./components/Files";
 import { VideoPage } from "./components/VideoTab";
 import { BrowserPanel } from "./components/BrowserPanel";
@@ -129,7 +129,17 @@ function Shell({ userId, email }: { userId: string; email: string }) {
 
   // The Developer chat lives in the Developer tab only, not in the chat list.
   const devId = settings.developerChatId;
-  const listed = useMemo(() => (devId ? chats.filter((c) => c.id !== devId) : chats), [chats, devId]);
+  // Incognito chats never show in the list; the open one stays reachable while you're in it.
+  const listed = useMemo(() => chats.filter((c) => c.id !== devId && (c.agent !== "incognito" || c.id === activeId)),
+    [chats, devId, activeId]);
+  const [incognito, setIncognito] = useState(false);
+  // Leaving an incognito chat deletes it with its messages; one left behind by a closed app goes on the next load.
+  useEffect(() => {
+    const gone = chats.filter((c) => c.agent === "incognito" && c.id !== activeId);
+    if (!gone.length) return;
+    supabase.from("chats").delete().in("id", gone.map((c) => c.id)).then(() => {});
+    setChats((p) => p.filter((c) => !gone.includes(c)));
+  }, [activeId, chats]);
   const active = listed.find((c) => c.id === activeId) || null;
 
   const ensureWorker = useCallback(async () => {
@@ -154,9 +164,11 @@ function Shell({ userId, email }: { userId: string; email: string }) {
   const startChat = async (text: string, attachments: Attachment[] = [], inProject: string | null = null, meta?: SendMeta) => {
     const title = text.replace(/\s+/g, " ").slice(0, 48) + (text.length > 48 ? "…" : "");
     const { data, error } = await supabase.from("chats")
-      .insert({ owner: userId, title, model: draft.model, effort: draft.effort, project_id: inProject }).select().single();
+      .insert({ owner: userId, title, model: draft.model, effort: draft.effort, project_id: inProject,
+        ...(incognito && !inProject ? { agent: "incognito" } : {}) }).select().single();
     if (error || !data) return alert(error?.message || "Could not create chat");
     setChats((prev) => [data as Chat, ...prev]);
+    setIncognito(false);
     setActiveId(data.id);
     setView("chat");
     await sendMessage(data as Chat, text, attachments, meta);
@@ -229,10 +241,13 @@ function Shell({ userId, email }: { userId: string; email: string }) {
           <ChatView key={active.id} chat={active} onModel={setModel} onSendMessage={sendMessage} online={online}
             onCommand={(n) => appCommand(n)} />
         ) : (
-          <div className={`home ${typing ? "typing" : ""}`}>
+          <div className={`home ${typing ? "typing" : ""} ${incognito ? "incognito" : ""}`}>
+            <button className={`icon-btn home-incognito ${incognito ? "on" : ""}`} onClick={() => setIncognito((v) => !v)}
+              aria-pressed={incognito} aria-label={t("incognito")} title={t("incognito")}><IconIncognito /></button>
             <div className="home-hero">
               <div className="home-mark"><Logo size={64} animated look={typing ? "down" : null} /></div>
-              <h1 className="greeting serif">{t(greetingKey())}{name ? `, ${capitalize(name)}` : ""}</h1>
+              <h1 className="greeting serif">{incognito ? t("incognito") : <>{t(greetingKey())}{name ? `, ${capitalize(name)}` : ""}</>}</h1>
+              {incognito && <p className="muted incognito-note">{t("incognitoNote")}</p>}
             </div>
             <div className="chat-bottom home-bottom">
               <Composer key={prefill} initialText={prefill} model={draft.model} effort={draft.effort} online={online}

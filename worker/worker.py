@@ -1252,14 +1252,18 @@ def ensure_slot(sb: Supabase, gw: Gateway, chat: dict, settings: dict) -> tuple[
     # is not path-safe (contains anything outside [A-Za-z0-9._-]).
     bad_key = bool(slot) and not re.fullmatch(r"[A-Za-z0-9._-]+", slot)
     if not slot or bad_key or (slot not in READY_SLOTS and slot not in live_slots(gw)):
-        agent = chat["agent"] or AGENT
+        # An incognito chat (the app marks it agent="incognito") runs on the normal agent in Crew's
+        # incognito mode: memory is read but never written, and its log is not kept.
+        incognito = chat.get("agent") == "incognito"
+        agent = AGENT if incognito else (chat["agent"] or AGENT)
         # Crew slugifies the name into the slot KEY, and that key goes into URL paths
         # (/api/chat/slots/{slot}/...). A free-form title that is a URL ("https://m.youtube.com/...")
         # slugs into a key the /side sub-route can't match -> 404. Name the slot by the stable chat id,
         # which is already a clean uuid-like token, so the derived key is always path-safe.
         slot_name = f"panda-{chat['id']}"[:60]
         created = gw.call("POST", "/api/chat/slots",
-                          {"name": slot_name, **({"agent": agent} if agent else {})})
+                          {"name": slot_name, **({"agent": agent} if agent else {}),
+                           **({"memory_mode": "incognito"} if incognito else {})})
         new = created.get("key") or created.get("id") or created.get("slot") or created.get("name")
         if not new:
             raise RuntimeError(f"slot create returned no key: {list(created)}")

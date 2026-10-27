@@ -43,6 +43,7 @@ export type Chat = {
   id: string;
   owner: string;
   title: string;
+  agent?: string;
   model: string;
   effort: string;
   pinned: boolean;

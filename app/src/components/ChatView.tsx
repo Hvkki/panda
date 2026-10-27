@@ -153,6 +153,7 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
           stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
         }}>
         <div className="chat-inner">
+          {chat.agent === "incognito" && <div className="incognito-banner">{t("incognitoNote")}</div>}
           {loading ? <div className="chat-loading"><span /><span /><span /></div> :
             messages.map((m) => (
               <MessageView key={m.id} m={m} isLast={m.id === lastAssistant?.id}

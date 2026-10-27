@@ -69,12 +69,15 @@ export function CrewSettingsPanel({ online }: { online: boolean }) {
   const load = () => {
     setLoading(true);
     setErr("");
-    crewSettings().then((d) => {
-      setData(d);
-      try { localStorage.setItem(CACHE_KEY, JSON.stringify(d)); } catch { /* too big for this browser: fine */ }
-    }).catch((e) => setErr((e as Error).message)).finally(() => setLoading(false));
+    crewSettings().then((d) => setData(d)).catch((e) => setErr((e as Error).message)).finally(() => setLoading(false));
   };
   useEffect(() => { if (online) load(); }, [online]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Keep the cached copy in step with every change, saves included: a reload used to show the value
+  // from before the last save (e.g. verbosity back to answer_only) until the fresh list arrived.
+  useEffect(() => {
+    if (!data) return;
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch { /* too big for this browser: fine */ }
+  }, [data]);
 
   const byPath = useMemo(() => new Map((data?.items || []).map((i) => [i.p, i])), [data]);
   const groups = useMemo(() => {

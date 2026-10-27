@@ -1143,3 +1143,11 @@ html:has(.sheet-backdrop), html:has(.sheet-backdrop) body { overscroll-behavior-
 .helper-body { margin: 2px 8px 8px 36px; display: grid; gap: 4px; }
 .helper-label { font-size: .68em; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
 .helper-text { margin: 0 0 4px; font-size: .84em; color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; }
+
+/* Incognito chats */
+.home { position: relative; }
+.home-incognito { position: absolute; top: 12px; right: 12px; }
+.home-incognito.on { background: var(--ink); color: var(--bg); }
+.incognito-note { max-width: 420px; text-align: center; margin: 8px auto 0; }
+.incognito-banner { margin: 8px auto 16px; padding: 8px 14px; border-radius: 12px; font-size: 13px; text-align: center;
+  border: 1px dashed currentColor; opacity: .75; max-width: 520px; }

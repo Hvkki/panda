@@ -4,6 +4,7 @@ const S = ({ size = 20, children }: P & { children: React.ReactNode }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
     strokeLinecap="round" strokeLinejoin="round" aria-hidden>{children}</svg>
 );
+export const IconIncognito = (p: P) => <S {...p}><path d="M3 11h18M5 11l2-6h10l2 6" /><circle cx="7" cy="16" r="3" /><circle cx="17" cy="16" r="3" /><path d="M10 16h4" /></S>;
 export const IconPlus = (p: P) => <S {...p}><path d="M12 5v14M5 12h14" /></S>;
 export const IconSearch = (p: P) => <S {...p}><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></S>;
 export const IconSidebar = (p: P) => <S {...p}><rect x="3" y="4" width="18" height="16" rx="3" /><path d="M9 4v16" /></S>;
