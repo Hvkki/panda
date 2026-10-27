@@ -212,6 +212,11 @@ def install():
                              "tool_search", "session", "@kirocrew-cron", "@kirocrew-core"]}, f)
     sh("kirocrew setup --agent-only")
     sh("kirocrew config set agent.sandbox_allow_unsandboxed_exec true")
+    # Tool Search: by default Crew only hides tool specs once they pass 5% of the window / 50k tokens, so
+    # all ~80 Crew tools (~40k+ tokens) were sent with every new chat. 0/0 = always load them on demand.
+    sh("kirocrew config set agent.tool_search true")
+    sh("kirocrew config set agent.tool_search_min_pct 0")
+    sh("kirocrew config set agent.tool_search_min_tokens 0")
     # Cheap model for background work: auto-titles, memory consolidation, heartbeats
     # all run Kiro Crew's "background" role. GLM-5 keeps those nearly free.
     sh("kirocrew config set agent.role_models '{\"background\": \"glm-5\"}'")
