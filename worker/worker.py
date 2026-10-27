@@ -1005,7 +1005,8 @@ def context_usage(gw: "Gateway", slot: str, since: float, streamed: dict | None)
     for _ in range(12):  # up to ~3 s for the websocket reading
         with THINK_LOCK:
             d = CTX.get(slot)
-        if d and d.get("at", 0) >= since:
+        if d and d.get("at", 0) >= since and not (float(d.get("pct") or 0) <= 0 and streamed
+                                                   and float(streamed.get("pct") or 0) > 0):
             return clean(d)
         time.sleep(0.25)
     if streamed and isinstance(streamed.get("pct"), (int, float)):
@@ -1104,6 +1105,14 @@ def chunk_text(c: dict) -> str:
     return ""
 
 
+_COMPACTION_PREFIXES = ("✅ Conversation compacted", "Conversation compacted:", "✅ Compacted:")
+
+
+def is_compaction_notice(text) -> bool:
+    """Crew's own compaction receipt (it carries the whole internal summary): never the answer."""
+    return isinstance(text, str) and text.lstrip().startswith(_COMPACTION_PREFIXES)
+
+
 def _row_text(m: dict) -> str:
     v = m.get("content") or m.get("text") or ""
     return v if isinstance(v, str) else json.dumps(v)
@@ -1128,6 +1137,8 @@ def turn_result(gw: Gateway, slot: str, want_stats: bool = True) -> dict:
         text, stats, errors = "", None, []
         for m in msgs[last_user + 1:]:
             role = m.get("role")
+            if (m.get("meta") or {}).get("kind") in ("compaction", "session_reload") or is_compaction_notice(_row_text(m)):
+                continue  # Crew's own notices, not the answer
             if role in ("assistant", "agent", "bot"):
                 text = _row_text(m) or text
                 st = (m.get("meta") or {}).get("turn_stats")
@@ -2232,6 +2243,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                     log("stream push failed:", type(exc).__name__)
 
     seg_break = False  # a tool ran since the last text: the next text starts a new paragraph
+    compacted = False  # Crew compacted the context during this turn
     threading.Thread(target=flusher, daemon=True).start()
     if not cmd:
         with BUSY_LOCK:
@@ -2256,7 +2268,10 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                 state["last"] = 0.0  # show the new step in the app right away
             elif kind == "context_usage":
                 try:
-                    usage = json.loads(c.get("content") or "{}")
+                    reading = json.loads(c.get("content") or "{}")
+                    # A compaction mid-turn sends a bogus 0 % reading: keep the last real one.
+                    if not (isinstance(reading.get("pct"), (int, float)) and reading["pct"] <= 0 and usage):
+                        usage = reading
                 except ValueError:
                     pass
             elif kind == "error":
@@ -2264,6 +2279,11 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             elif is_thinking(c):
                 with THINK_LOCK:
                     THINK[slot] = THINK.get(slot, "") + (c.get("content") or c.get("text") or "")
+            elif is_compaction_notice(chunk_text(c) if kind == "chunk" else c.get("content")):
+                # Crew's own "✅ Conversation compacted: <summary>" — an internal summary, not the answer.
+                tools.append("context compacted")
+                seg_break = bool(text)
+                compacted = True
             elif kind == "chunk":
                 piece = chunk_text(c)
                 if piece and seg_break:
@@ -2443,7 +2463,9 @@ def followup_step(sb: Supabase, gw: Gateway):
         except Exception:
             continue
         text = "\n\n".join(t for t in (_row_text(m) for m in rows if isinstance(m, dict)
-                                       and m.get("role") in ("assistant", "agent", "bot")) if t.strip())
+                                       and m.get("role") in ("assistant", "agent", "bot")
+                                       and (m.get("meta") or {}).get("kind") not in ("compaction", "session_reload"))
+                if t.strip() and not is_compaction_notice(t))
         w["seen"] = total
         if not text.strip():
             sb.rest("DELETE", "messages", params={"id": f"eq.{w['row']}"})
