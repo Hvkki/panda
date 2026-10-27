@@ -29,7 +29,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 HOME = os.path.expanduser("~")
 STATE_DIR = os.path.join(HOME, ".panda", "video")
@@ -40,13 +40,16 @@ SECRETS_ENV = os.path.join(HOME, ".panda", "secrets.env")
 OUTPUTS = os.path.join(HOME, "outputs")
 
 APP_NAME, CLS_NAME, PROGRESS_DICT = "panda-h3", "H3", "panda-h3-progress"
+VIDEO_APPS = ("panda-h3", "h3-")  # Modal apps that made videos (h3-batch / h3-video were the first tests)
 FILES_BUCKET = "panda-files"
 
 # Modal prices (modal.com/pricing): RTX PRO 6000 $3.03/h, CPU $0.0000131 per core-second,
 # memory $0.00000222 per GiB-second. The renderer asks for 4 cores and 48 GiB.
 GPU_USD_S = 3.03 / 3600
 USD_PER_SEC = GPU_USD_S + 4 * 0.0000131 + 48 * 0.00000222   # ~= $0.001 a second, $3.60 an hour
-DEFAULT_BUDGET = 10.0    # USD a month unless the owner sets another cap in the Video tab
+MODAL_CREDIT = 30.0      # Modal Starter: $30 of free compute every month (resets on the 1st, UTC)
+DEFAULT_BUDGET = MODAL_CREDIT   # stop line for ALL Modal use this month, read from Modal's own billing
+USAGE_TTL = 600          # re-read Modal's billing every 10 minutes (it lags by up to an hour anyway)
 FPS = 24
 
 # Sizes H3 was trained around; drafts stay above 0.4 MP so faces don't go soft when upscaled.
@@ -138,6 +141,80 @@ def clean_prompt(text: str) -> str:
 def has_fields(prompt: str) -> bool:
     p = prompt.lower()
     return all(f in p for f in ("integrated_multimodal_description", "overall_soundscape", "non_diegetic_music"))
+
+
+# ── autopilot: the director picks everything from one idea ──────────────────
+DIRECTOR_RULES = """You direct one short AI video for the MiniMax H3 model. From the user's idea, choose the settings and write the prompt.
+Reply with ONE JSON object and nothing else (no code fence):
+{"title": "...", "ratio": "...", "secs": 0, "style": "...", "audio": true, "why": "...", "prompt": "..."}
+- title: 2-5 words, in the user's language.
+- ratio: "9:16" for people, animals, one subject, social clips; "16:9" for landscapes, chases, things moving sideways, wide scenes; "1:1" for products, objects, loops.
+- secs: 4-6 for one action, 7-10 for a tiny story in 2-3 shots. Whole number.
+- style: one of STYLE_IDS, or "" when none fits.
+- audio: false only when the user wants silence.
+- why: one short sentence in the user's language that explains the choices, like a director to a friend.
+- prompt: exactly three lines joined by \\n, each a label, a colon, then text:
+integrated_multimodal_description: ...
+overall_soundscape: ...
+non_diegetic_music: ...
+Prompt rules:""" + WRITER_RULES.split("Rules:", 1)[1]
+
+RATIO_RX = {"16:9": r"\b(landscape|panorama|wide|road|race|chase|drone|ocean|sea|city|skyline|car|train|horizon)\b",
+            "1:1": r"\b(product|logo|bottle|watch|perfume|shoe|loop|icon|cup|phone)\b"}
+
+
+def director_prompt(idea: str, has_picture: bool) -> str:
+    rules = DIRECTOR_RULES.replace("STYLE_IDS", ", ".join(f'"{k}"' for k in STYLES))
+    extra = ("\nThe user gave a start picture: the clip begins on it, so spend the words on motion, camera and sound, "
+             "not on what it looks like. Pick the ratio closest to a phone photo (9:16) unless the idea says otherwise."
+             if has_picture else "")
+    return f"{rules}{extra}\n\nIdea from the user (any language; the prompt is always English):\n{idea.strip()[:1500]}"
+
+
+def parse_direction(text: str) -> dict:
+    """The director's JSON, checked field by field. Raises ValueError when nothing usable came back."""
+    m = re.search(r"\{[\s\S]*\}", text or "")
+    if not m:
+        raise ValueError("no JSON")
+    d = json.loads(m.group(0))
+    out = {"title": re.sub(r"\s+", " ", str(d.get("title") or "")).strip()[:60],
+           "ratio": d.get("ratio") if d.get("ratio") in ("9:16", "16:9", "1:1") else "9:16",
+           "secs": int(min(10, max(3, round(float(d.get("secs") or 5))))),
+           "style": d.get("style") if d.get("style") in STYLES else "",
+           "audio": d.get("audio") is not False,
+           "why": re.sub(r"\s+", " ", str(d.get("why") or "")).strip()[:240],
+           "prompt": clean_prompt(str(d.get("prompt") or "").replace("\\n", "\n"))}
+    if not has_fields(out["prompt"]):
+        out["prompt"] = ""
+    return out
+
+
+def guess_direction(idea: str, has_picture: bool) -> dict:
+    """No director model: still sensible choices from the words of the idea."""
+    low = idea.lower()
+    ratio = "9:16" if has_picture else next((r for r, rx in RATIO_RX.items() if re.search(rx, low)), "9:16")
+    style = next((k for k in STYLES if k in low), "aura" if "aura" in low else "cinematic")
+    return {"title": re.sub(r"\s+", " ", idea).strip()[:40], "ratio": ratio, "secs": 5, "style": style,
+            "audio": True, "why": "", "prompt": ""}
+
+
+def check_clip(mp4: str, secs: float) -> dict:
+    """Cheap look at a finished clip: is it mostly black, or frozen? (ffmpeg filters, no model)."""
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", mp4, "-vf",
+                            "blackdetect=d=0.4:pix_th=0.08,freezedetect=n=0.002:d=1.5", "-an", "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=90)
+        log = r.stderr
+        black = sum(float(x) for x in re.findall(r"black_duration:([\d.]+)", log))
+        frozen = sum(float(x) for x in re.findall(r"freeze_duration: ?([\d.]+)", log))
+        starts = [float(x) for x in re.findall(r"freeze_start: ?([\d.]+)", log)]
+        ends = re.findall(r"freeze_end: ?([\d.]+)", log)
+        if len(starts) > len(ends):  # still frozen when the clip ends: ffmpeg never prints that duration
+            frozen += max(0.0, float(secs) - starts[-1])
+        bad = black > 0.6 * secs or frozen > 0.7 * secs
+        return {"black": round(black, 1), "frozen": round(frozen, 1), "ok": not bad}
+    except Exception as exc:  # a broken check must never fail the video
+        return {"ok": True, "error": str(exc)[:80]}
 
 
 # ── sizes, frames, estimate ─────────────────────────────────────────────────
@@ -282,7 +359,19 @@ def modal_mod():
         return modal
 
 
+def _f(row, key: str):
+    """A Modal billing row: a dict in some client versions, an object in others."""
+    return row.get(key) if isinstance(row, dict) else getattr(row, key, None)
+
+
 # ── the engine (runs inside worker.py) ──────────────────────────────────────
+RUN_ACTIVE = ("directing", "filming")
+
+
+class RunCancelled(Exception):
+    pass
+
+
 class Engine:
     """One per worker. `sb` is worker.py's Supabase client; owner() returns who pressed Start."""
 
@@ -292,6 +381,9 @@ class Engine:
         self.llm = llm                # llm(prompt) -> text, or None
         self.lock = threading.RLock()
         self.jobs: list[dict] = []
+        self.runs: list[dict] = []    # autopilot runs: one idea -> director -> draft -> final
+        self.usage_cache: dict | None = None
+        self.usage_lock = threading.Lock()
         self.loaded_for = ""
         self.dirty_at = 0.0
         self.saved_at = 0.0
@@ -317,12 +409,14 @@ class Engine:
         if self.loaded_for == owner:
             return
         tmp = tempfile.mktemp(suffix=".json")
-        jobs, stats = [], None
+        jobs, runs, stats = [], [], None
         try:
             if self.sb.download(self._path("jobs.json"), tmp, bucket=FILES_BUCKET):
                 with open(tmp) as f:
                     d = json.load(f)
-                jobs, stats = d.get("jobs") or [], d.get("stats")
+                jobs, runs, stats = d.get("jobs") or [], d.get("runs") or [], d.get("stats")
+                if d.get("modal") and not self.usage_cache:
+                    self.usage_cache = {**d["modal"], "stale": True}
         except Exception as exc:
             self.log("video: jobs.json unreadable:", str(exc)[:120])
         finally:
@@ -331,7 +425,7 @@ class Engine:
         if stats and not os.path.exists(STATS_FILE):
             save_stats(stats)  # the estimate's learning survives a fresh machine
         with self.lock:
-            self.jobs, self.loaded_for = jobs, owner
+            self.jobs, self.runs, self.loaded_for = jobs, runs, owner
 
     def gpu(self) -> dict | None:
         try:
@@ -344,13 +438,15 @@ class Engine:
         if not force and time.time() - self.saved_at < 1.5:
             self.dirty_at = self.dirty_at or time.time()
             return
-        busy = any(j.get("status") in ("queued", "rendering") for j in self.jobs)
+        busy = any(j.get("status") in ("queued", "rendering") for j in self.jobs) or any(
+            r.get("status") in RUN_ACTIVE for r in self.runs)
         gpu = self.gpu() if busy or force else None
         with self.lock:
             self.dirty_at = time.time()
             self.saved_at = time.time()
-            body = {"v": 1, "at": time.time(), "jobs": self.jobs[-300:], "stats": load_stats(),
-                    "rate_usd_s": round(USD_PER_SEC, 6), "budget": self.budget(), "spent": self.spent(),
+            body = {"v": 2, "at": time.time(), "jobs": self.jobs[-300:], "runs": self.runs[-60:],
+                    "stats": load_stats(), "rate_usd_s": round(USD_PER_SEC, 6), "budget": self.budget(),
+                    "spent": self.spent(), **({"modal": self.usage_view()} if self.usage_cache else {}),
                     **({"gpu": gpu} if gpu else {})}
             data = json.dumps(body, separators=(",", ":")).encode()
         try:
@@ -361,6 +457,10 @@ class Engine:
 
     def flusher(self):
         while not self.stop.wait(1.0):
+            if not self.usage_cache or time.time() - float(self.usage_cache.get("at") or 0) > USAGE_TTL:
+                self.pool.submit(self.usage, True)  # off this thread: a slow Modal call must not stall saves
+                if self.usage_cache:
+                    self.usage_cache["at"] = time.time()  # one refresh in flight at a time
             if self.dirty_at and time.time() - self.saved_at > 1.5:
                 self.save(force=True)
             try:
@@ -376,6 +476,9 @@ class Engine:
             for j in self.jobs:  # the last machine stopped mid-render: pick the jobs back up
                 if j.get("status") in ("queued", "rendering"):
                     self._run(j)
+            for r in self.runs:  # and the autopilot runs that were steering them
+                if r.get("status") in RUN_ACTIVE:
+                    threading.Thread(target=self._autopilot, args=(r,), daemon=True).start()
         except Exception as exc:
             self.log("video: start failed:", str(exc)[:160])
         threading.Thread(target=self.flusher, daemon=True).start()
@@ -389,11 +492,94 @@ class Engine:
             return {}
 
     def budget(self) -> float:
-        v = self.settings().get("videoBudget")
+        """The owner's stop line for this month's Modal spend (Modal's $30 free credit unless they set less)."""
+        v = self.settings().get("modalCap")
         try:
-            return float(v) if v is not None else DEFAULT_BUDGET
+            return max(0.0, float(v)) if v is not None else DEFAULT_BUDGET
         except (TypeError, ValueError):
             return DEFAULT_BUDGET
+
+    def usage(self, force: bool = False) -> dict:
+        """What Modal itself says this month cost, from its billing API, cached for USAGE_TTL.
+
+        Modal books compute by the hour and only reports whole hours, so clips that finished after the
+        last hour it counted are added from Panda's own records ("not counted yet")."""
+        cached = self.usage_cache
+        if cached and not force and not cached.get("stale") and time.time() - float(cached.get("at") or 0) < USAGE_TTL:
+            return cached
+        if not self.usage_lock.acquire(blocking=False):
+            return cached or {}
+        try:
+            modal = modal_mod()
+            bill = modal.Workspace.from_context().billing
+            summary = bill.summary()
+            adj = {str(k).lower(): float(v) for k, v in (summary.adjustments or {}).items()}
+            billed = float(summary.billed_cost or 0)
+            used = round(-adj.get("credits", 0.0) + billed, 4)
+            now = datetime.now(timezone.utc)
+            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            # Modal reports whole intervals only: whole days before today, whole hours today.
+            rows = [r for r in bill.report(start=month_start, resolution="d") if _f(r, "interval_start") < today]
+            rows += bill.report(start=today, resolution="h")
+            seen = [_f(r, "interval_start") for r in rows if float(_f(r, "cost") or 0) > 0]
+            last = max(seen) if seen else None
+            counted_to = (last + (timedelta(hours=1) if last and last >= today else timedelta(days=1))).timestamp() \
+                if last else month_start.timestamp()
+            panda = sum(float(_f(r, "cost") or 0) for r in rows
+                        if str(_f(r, "description") or "").startswith(VIDEO_APPS))
+            self.usage_cache = {"at": time.time(), "used": used, "billed": round(billed, 4),
+                                "credit": MODAL_CREDIT, "panda": round(panda, 4),
+                                "other": round(max(0.0, used - panda), 4), "counted_to": counted_to,
+                                "month": now.strftime("%Y-%m"), "source": "modal"}
+            self.dirty_at = self.dirty_at or time.time()
+        except Exception as exc:
+            self.log("video: Modal billing unreadable:", str(exc)[:160])
+            if not cached:  # no bill yet: Panda's own count, marked as a guess
+                self.usage_cache = {"at": time.time(), "used": self.spent(), "credit": MODAL_CREDIT,
+                                    "panda": self.spent(), "other": 0.0, "counted_to": time.time(),
+                                    "month": month_key(time.time()), "source": "panda", "error": str(exc)[:120]}
+            else:
+                cached.pop("stale", None)
+        finally:
+            self.usage_lock.release()
+        return self.usage_cache or {}
+
+    def usage_now(self, args: dict) -> dict:
+        self.usage(force=bool(args.get("force")))
+        self.save(force=True)
+        return self.usage_view()
+
+    def unbilled(self, since: float) -> float:
+        """Panda clips Modal hasn't put on the bill yet (they finished after the last hour it counted)."""
+        with self.lock:
+            return round(sum(float(j.get("cost") or 0) for j in self.jobs
+                             if float(j.get("finished") or 0) >= since), 4)
+
+    def usage_view(self) -> dict:
+        u = dict(self.usage_cache or {})
+        if not u:
+            return {}
+        if u.get("month") != month_key(time.time()):  # a new month started since the last read
+            u.update(used=0.0, panda=0.0, other=0.0, billed=0.0)
+        u["pending"] = self.unbilled(float(u.get("counted_to") or 0)) if u.get("source") == "modal" else 0.0
+        u["booked"] = round(self.committed(), 4)
+        u["now"] = round(float(u.get("used") or 0) + u["pending"], 4)
+        u["cap"] = self.budget()
+        u["left"] = round(max(0.0, min(u["cap"], u["credit"]) - u["now"] - u["booked"]), 4)
+        u.pop("stale", None)
+        return u
+
+    def guard(self, need: float, what: str = "this video"):
+        """Refuse anything that would take this month's Modal spend past the owner's stop line."""
+        self.usage()
+        u = self.usage_view() or {"now": self.spent(), "booked": self.committed(), "cap": self.budget()}
+        cap = u["cap"]
+        if u["now"] + u["booked"] + need > cap:
+            left = max(0.0, cap - u["now"] - u["booked"])
+            booked = f" and ${u['booked']:.2f} booked" if u["booked"] else ""
+            raise ValueError(f"Not enough Modal credit left: ${u['now']:.2f} of ${cap:.0f} used this month{booked}, "
+                             f"{what} needs up to ${need:.2f} (${left:.2f} left). It resets on the 1st.")
 
     def spent(self, month: str | None = None) -> float:
         month = month or month_key(time.time())
@@ -447,7 +633,8 @@ class Engine:
         self.load()
         return {**p, "seeds": seeds, "est": one, "total_usd": round(usd, 3), "total_high": round(high, 3),
                 "total_secs": round(secs), "warm": warm, "budget": self.budget(), "spent": self.spent(),
-                "committed": round(self.committed(), 3), "rate_usd_h": round(USD_PER_SEC * 3600, 2)}
+                "committed": round(self.committed(), 3), "rate_usd_h": round(USD_PER_SEC * 3600, 2),
+                "modal": self.usage_view()}
 
     def submit(self, args: dict, source: str = "tab") -> dict:
         prompt = clean_prompt(str(args.get("prompt") or ""))
@@ -457,16 +644,14 @@ class Engine:
             prompt = template_prompt(prompt, float(args.get("secs") or 5), str(args.get("style") or ""),
                                      args.get("mode") or "clip")
         info = self.estimate(args)
-        budget, spent, committed = info["budget"], info["spent"], info["committed"]
-        if budget >= 0 and spent + committed + info["total_high"] > budget:
-            raise ValueError(f"Over your monthly video budget: ${spent + committed:.2f} of ${budget:.2f} used or booked, "
-                             f"this needs up to ${info['total_high']:.2f}. Raise the budget in the Video tab.")
+        if not args.get("_guarded"):  # an autopilot run checked its whole plan already
+            self.guard(info["total_high"])
         base_seed = int(args.get("seed") or secrets.randbelow(2**31))
         group = secrets.token_hex(4)
         made = []
         for k in range(info["seeds"]):
             jid = time.strftime("%y%m%d-%H%M%S-") + secrets.token_hex(2)
-            job = {"id": jid, "group": group, "created": time.time(), "source": source,
+            job = {"id": jid, "group": group, "created": time.time(), "source": source, "run": args.get("run") or "",
                    "chat_id": args.get("chat_id"), "title": str(args.get("title") or args.get("idea") or "")[:80],
                    "idea": str(args.get("idea") or "")[:1500], "style": args.get("style") or "",
                    "prompt": prompt, "ratio": args.get("ratio") or ("1:1" if info["mode"] == "orbit" else "9:16"),
@@ -526,6 +711,169 @@ class Engine:
         self.load()
         with self.lock:
             return next((j for j in self.jobs if j.get("id") == jid), None)
+
+    # ── autopilot: one idea in, a finished film out ─────────────────────────
+    def auto(self, args: dict, source: str = "tab") -> dict:
+        idea = str(args.get("idea") or "").strip()
+        if not idea:
+            raise ValueError("Tell Panda the idea first.")
+        self.load()
+        kind = "quick" if args.get("plan") == "quick" else "full"
+        # Before anything is spent: the whole plan at the longest clip the director may pick.
+        self.guard(self._plan_high({"ratio": "16:9", "secs": 8}, kind), "this film")
+        run = {"id": "r" + time.strftime("%y%m%d-%H%M%S-") + secrets.token_hex(2), "created": time.time(),
+               "source": "chat" if source == "chat" else "tab", "chat_id": args.get("chat_id"),
+               "idea": idea[:1500], "first": str(args.get("first") or ""), "plan": kind, "status": "directing",
+               "step": "director", "title": re.sub(r"\s+", " ", idea)[:60], "log": [], "jobs": [], "phases": {}}
+        with self.lock:
+            self.runs.append(run)
+        self._say(run, "director", "Reading your idea")
+        threading.Thread(target=self._autopilot, args=(run,), daemon=True).start()
+        return {"run": run}
+
+    def auto_cancel(self, args: dict) -> dict:
+        run = self.find_run(str(args.get("id") or ""))
+        if not run:
+            raise ValueError("no such film")
+        if run.get("status") in RUN_ACTIVE:
+            run["cancel"] = True
+            for jid in run.get("jobs") or []:
+                job = self.find(jid)
+                if job and job.get("status") in ("queued", "rendering"):
+                    self.cancel({"id": jid})
+            run.update(status="cancelled", finished=time.time())
+            self._say(run, "cancelled", "Stopped")
+        return {"ok": True}
+
+    def auto_dismiss(self, args: dict) -> dict:
+        run = self.find_run(str(args.get("id") or ""))
+        if run and run.get("status") not in RUN_ACTIVE:
+            run["hidden"] = True
+            self.save(force=True)
+        return {"ok": True}
+
+    def find_run(self, rid: str) -> dict | None:
+        self.load()
+        with self.lock:
+            return next((r for r in self.runs if r.get("id") == rid), None)
+
+    def _plan_high(self, choice: dict, kind: str) -> float:
+        base = {"mode": "clip", "ratio": choice.get("ratio") or "9:16", "secs": choice.get("secs") or 5}
+        high = estimate(plan({**base, "quality": "draft"}), warm=self.warm())["usd_high"]
+        if kind == "full":
+            high += estimate(plan({**base, "quality": "final"}), warm=True)["usd_high"]
+        return round(high, 3)
+
+    def _say(self, run: dict, step: str, text: str):
+        run["step"] = step
+        run.setdefault("log", []).append({"t": round(time.time(), 1), "step": step, "text": text[:240]})
+        run["log"] = run["log"][-30:]
+        self.dirty_at = self.dirty_at or time.time()
+        try:
+            with open(os.path.join(STATUS, f"run-{run['id']}.json"), "w") as f:
+                json.dump(run, f)
+        except Exception:
+            pass
+
+    def direct(self, idea: str, has_picture: bool) -> dict:
+        """The director: ratio, length, style, sound and the H3 prompt, from the idea alone."""
+        if self.llm:
+            try:
+                d = parse_direction(self.llm(director_prompt(idea, has_picture)))
+                if not d["prompt"]:
+                    d["prompt"] = self.write_prompt({"idea": idea, "secs": d["secs"], "ratio": d["ratio"],
+                                                     "style": d["style"], "first": has_picture})["prompt"]
+                return {**d, "by": "director"}
+            except Exception as exc:
+                self.log("video: director failed, guessing:", str(exc)[:160])
+        d = guess_direction(idea, has_picture)
+        return {**d, "prompt": template_prompt(idea, d["secs"], d["style"]), "by": "guess"}
+
+    def _autopilot(self, run: dict):
+        try:
+            if not run.get("choice"):
+                run["status"] = "directing"
+                self._say(run, "director", "Picking the shape, length, look and sound")
+                d = self.direct(run["idea"], bool(run.get("first")))
+                if run.get("cancel"):
+                    raise RunCancelled()
+                run["choice"] = {k: d[k] for k in ("ratio", "secs", "style", "audio")}
+                run.update(title=d["title"] or run["title"], why=d["why"], prompt=d["prompt"], by=d["by"],
+                           est_high=self._plan_high(run["choice"], run["plan"]))
+                style = d["style"].replace("aura", "aura edit") or "natural look"
+                self._say(run, "script", f"Wrote the script: {d['ratio']}, {d['secs']} s, {style}"
+                                         f"{'' if d['audio'] else ', silent'}")
+            c = run["choice"]
+            spec = {"mode": "clip", "ratio": c["ratio"], "secs": c["secs"], "style": c["style"], "audio": c["audio"],
+                    "idea": run["idea"], "prompt": run["prompt"], "first": run.get("first") or "", "seeds": 1,
+                    "title": run["title"], "run": run["id"], "chat_id": run.get("chat_id")}
+            run["status"] = "filming"
+            draft = self._film(run, {**spec, "quality": "draft"}, "draft")
+            best = draft
+            if run["plan"] == "full":
+                self._say(run, "final", "Filming the final in full quality, same take")
+                best = self._film(run, {**spec, "quality": "final", "seed": draft["seed"], "from": draft["id"]}, "final")
+            cost = sum(float((self.find(j) or {}).get("cost") or 0) for j in run["jobs"])
+            run.update(status="done", finished=time.time(), best=best["id"], cost=round(cost, 4))
+            self._say(run, "done", "Ready to watch")
+            if self.notify:
+                self.notify("Your film is ready", f"{run['title']} · ${cost:.2f}")
+        except RunCancelled:
+            run.update(status="cancelled", finished=run.get("finished") or time.time())
+            if run.get("step") != "cancelled":
+                self._say(run, "cancelled", "Stopped")
+        except BaseException as exc:  # noqa: BLE001  the tab must hear about any failure
+            run.update(status="failed", finished=time.time(), error=human_error(exc))
+            self._say(run, "failed", run["error"])
+            self.log("video autopilot failed:", run["id"], str(exc)[:300])
+        finally:
+            self.save(force=True)
+
+    def _film(self, run: dict, spec: dict, phase: str) -> dict:
+        """Film one phase, check it, and take it again once if it failed or came out black or frozen."""
+        tries = run.setdefault("tries", {})
+        phases = run.setdefault("phases", {})
+        while True:
+            if run.get("cancel"):
+                raise RunCancelled()
+            job = self.find(phases[phase]) if phases.get(phase) else None
+            if not job:
+                if phase == "draft":
+                    self._say(run, "draft", "Filming a quick draft" + (", new take" if tries.get(phase) else ""))
+                out = self.submit(spec, source=run["source"])
+                job = out["jobs"][0]
+                job["phase"] = phase
+                phases[phase] = job["id"]
+                run["jobs"].append(job["id"])
+                self.save(force=True)
+            while job.get("status") in ("queued", "rendering"):
+                if run.get("cancel"):
+                    self.cancel({"id": job["id"]})
+                    raise RunCancelled()
+                time.sleep(1.5)
+            n = tries.get(phase, 0)
+            if job["status"] == "cancelled":
+                raise RunCancelled()
+            if job["status"] == "done":
+                chk = job.get("check") or {}
+                if chk.get("ok", True) or n >= 1:
+                    if phase == "draft" and "black" in chk:
+                        self._say(run, "check", "Checked the draft: it moves and it's not dark" if chk["ok"]
+                                  else "The new take is still a bit still, keeping it")
+                    return job
+                why = "came out dark" if chk.get("black", 0) >= chk.get("frozen", 0) else "barely moved"
+                self._say(run, phase, f"The {phase} {why}, so Panda films a new take")
+                spec = {k: v for k, v in spec.items() if k != "seed"}
+            else:  # failed: one more go, shorter if the GPU ran out of memory
+                if n >= 1:
+                    raise RuntimeError(job.get("error") or "the video failed")
+                shorter = "memory" in (job.get("error") or "").lower() and spec["secs"] > 3
+                if shorter:
+                    spec = {**spec, "secs": max(3, int(spec["secs"]) - 2)}
+                self._say(run, phase, f"The {phase} didn't work ({(job.get('error') or 'error').rstrip('.')}). "
+                                      f"Trying once more{', a bit shorter' if shorter else ''}")
+            tries[phase] = n + 1
+            phases.pop(phase, None)
 
     # rendering
     def _run(self, job: dict):
@@ -633,6 +981,8 @@ class Engine:
             jpg = os.path.join(tmpdir, "p.jpg")
             subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(min(1.0, job["secs"] / 3)), "-i", mp4,
                             "-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "4", jpg], timeout=60)
+            if job.get("run"):  # the autopilot looks at its own drafts before going on
+                job["check"] = check_clip(mp4, float(job.get("secs") or 5))
             name = f"{job['id']}.mp4"
             self._put(name, video, "video/mp4")
             job["video"] = self._path(name)
@@ -658,7 +1008,7 @@ class Engine:
                    cost=round(billed * USD_PER_SEC, 4), size=len(video))
         save_stats(learn(load_stats(), job, timings, cold))
         self._finish(job, "done")
-        if self.notify:
+        if self.notify and not job.get("run"):  # an autopilot run sends one message, at its end
             self.notify("Your video is ready", f"{job.get('title') or 'Video'} · ${job['cost']:.2f}")
 
     def _finish(self, job: dict, status: str, error: str = ""):
@@ -696,8 +1046,12 @@ class Engine:
                 continue
             rid = req.pop("request_id", name[:-5])
             try:
-                out = self.submit(req, source="chat")
-                res = {"ok": True, "jobs": [j["id"] for j in out["jobs"]], "total_usd": out["total_usd"]}
+                if req.pop("op", "") == "auto":
+                    run = self.auto(req, source="chat")["run"]
+                    res = {"ok": True, "run": run["id"]}
+                else:
+                    out = self.submit(req, source="chat")
+                    res = {"ok": True, "jobs": [j["id"] for j in out["jobs"]], "total_usd": out["total_usd"]}
             except Exception as exc:
                 res = {"ok": False, "error": str(exc)[:400]}
             with open(os.path.join(STATUS, f"req-{rid}.json"), "w") as f:
@@ -727,9 +1081,18 @@ def _cli():
         s.add_argument("--style", default="", choices=("",) + tuple(STYLES))
         s.add_argument("--title", default="")
         s.add_argument("--wait", action="store_true", help="wait and copy the clips to ~/outputs")
+    au = sub.add_parser("auto", help="autopilot: one idea in, Panda directs, films a draft, then the final")
+    au.add_argument("--idea", required=True)
+    au.add_argument("--plan", default="full", choices=("full", "quick"), help="quick = draft only")
+    au.add_argument("--first", default="", help="start picture (local path)")
+    au.add_argument("--wait", action="store_true", help="wait and copy the film to ~/outputs")
     st = sub.add_parser("status")
     st.add_argument("ids", nargs="*")
     a = ap.parse_args()
+
+    if a.cmd == "auto":
+        _cli_auto(a)
+        return
 
     if a.cmd == "status":
         ids = a.ids or sorted((n[:-5] for n in os.listdir(STATUS) if not n.startswith("req-")), reverse=True)[:5]
@@ -798,6 +1161,66 @@ def _cli():
                     print(f"done {jid}: {dest} · ${j.get('cost') or 0:.2f}")
                 else:
                     print(f"{j.get('status')} {jid}: {j.get('error', '')}")
+
+
+def _spool(req: dict) -> dict:
+    if not os.path.isdir(SPOOL):
+        sys.exit("The video engine isn't running (Panda must be on).")
+    rid = secrets.token_hex(6)
+    with open(os.path.join(SPOOL, f"{rid}.json"), "w") as f:
+        json.dump({**req, "request_id": rid}, f)
+    res_path = os.path.join(STATUS, f"req-{rid}.json")
+    for _ in range(60):
+        if os.path.exists(res_path):
+            break
+        time.sleep(1)
+    else:
+        sys.exit("The video engine didn't pick the job up.")
+    with open(res_path) as f:
+        res = json.load(f)
+    os.remove(res_path)
+    if not res.get("ok"):
+        sys.exit(res.get("error") or "refused")
+    return res
+
+
+def _cli_auto(a):
+    res = _spool({"op": "auto", "idea": a.idea, "plan": a.plan, "first": os.path.abspath(a.first) if a.first else "",
+                  "chat_id": os.environ.get("PANDA_CHAT_ID") or None})
+    rid = res["run"]
+    print(f"autopilot {rid} started · watch it in the Video tab")
+    if not a.wait:
+        return
+    path, said = os.path.join(STATUS, f"run-{rid}.json"), 0
+    while True:
+        time.sleep(3)
+        try:
+            with open(path) as f:
+                run = json.load(f)
+        except (FileNotFoundError, ValueError):
+            continue
+        for line in run.get("log", [])[said:]:
+            print("·", line["text"], flush=True)
+        said = len(run.get("log", []))
+        if run.get("status") not in RUN_ACTIVE:
+            break
+    if run["status"] != "done":
+        sys.exit(f"{run['status']}: {run.get('error') or ''}")
+    os.makedirs(OUTPUTS, exist_ok=True)
+    for jid in run.get("jobs") or []:
+        try:
+            with open(os.path.join(STATUS, jid + ".json")) as f:
+                j = json.load(f)
+        except (FileNotFoundError, ValueError):
+            continue
+        local = j.get("local")
+        if not local or not os.path.exists(local):
+            continue
+        if jid == run.get("best"):
+            dest = os.path.join(OUTPUTS, safe_title(j) + ".mp4")
+            shutil.copy(local, dest)
+            print(f"done: {dest} · {run.get('title')} · total ${run.get('cost') or 0:.2f}")
+        os.remove(local)  # only the best take goes into the reply
 
 
 if __name__ == "__main__":

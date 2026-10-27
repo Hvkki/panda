@@ -11,6 +11,21 @@ the Video tab, goes into one queue on one GPU. Finished clips also appear in the
 
 Run `pvideo` as-is (it is a real command). Never define a `pvideo()` function or alias.
 
+## 0. Autopilot (default for "make me a video of …")
+
+```bash
+pvideo auto --idea "a pelican riding a bicycle along the sea" --wait            # draft, check, then final
+pvideo auto --idea "..." --plan quick --wait                                    # draft only, cheapest
+pvideo auto --idea "..." --first ~/uploads/photo.jpg --wait                     # starts on a picture
+```
+
+Panda's director picks the shape, length, style and sound, writes the script, films a draft, checks
+it (dark or frozen gets one new take), then films the final with the same seed. A failure is retried
+once. `--wait` prints each step and copies the best take to `~/outputs/`; name that file in your reply.
+Pass the user's own words as `--idea`, in any language. It refuses when the plan would go past the
+owner's Modal credit ($30 a month, read from Modal's bill): tell the user the reason it printed.
+Use the manual steps below only when the user wants exact control (a set length, ratio or script).
+
 ## 1. Write the prompt (always English, always this layout)
 
 ```
@@ -36,7 +51,7 @@ pvideo make --prompt ~/work/clip.txt --quality draft --ratio 9:16 --secs 5 --tit
   Offer the final after they like the draft.
 - `--seeds 2` makes two versions of the draft to pick from (the second one is cheaper: warm GPU).
 - Ask before running when the estimate's `usd_high` is above $0.50, or when the user did not ask
-  for a video in this message. The Video tab's monthly budget is enforced: if `make` refuses,
+  for a video in this message. The owner's Modal credit stop line is enforced: if `make` refuses,
   tell the user the reason it printed.
 - Modes: `--mode clip` (text, optional `--first start.png`), `--mode frames --first a.png --last b.png`,
   `--mode orbit --first photo.png` (3 s, 768x768, full 360°).

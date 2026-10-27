@@ -24,7 +24,8 @@ export type Settings = {
   /** The Developer chat: the only chat that may change Panda and use the developer env variables. */
   developerChatId: string;
   /** Monthly cap for Modal video spend, USD. The worker refuses jobs above it. */
-  videoBudget: number;
+  /** Stop line for this month's Modal spend (all apps), checked against Modal's own bill. */
+  modalCap: number;
 };
 
 export const DEFAULTS: Settings = {
@@ -46,7 +47,7 @@ export const DEFAULTS: Settings = {
   browserTopic: "",
   crewOverrides: {},
   developerChatId: "",
-  videoBudget: 10,
+  modalCap: 30,
 };
 
 type Ctx = { settings: Settings; update: (patch: Partial<Settings>) => void; loaded: boolean };

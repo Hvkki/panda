@@ -20,10 +20,28 @@ export type VideoJob = {
   stage: VideoStage; step: number; pct: number; eta?: number; started?: number; finished?: number;
   error?: string; cost?: number; billed_secs?: number; video?: string; poster?: string; size?: number;
   cold?: boolean; timings?: { total?: number; container_up?: number; stages?: Record<string, number> };
+  run?: string; phase?: "draft" | "final"; check?: { ok: boolean; black?: number; frozen?: number };
 };
 
-export type JobsFile = { v: number; at: number; jobs: VideoJob[]; budget: number; spent: number; rate_usd_s: number;
-  stats?: Stats; gpu?: { state?: string; t?: number; gpu?: string } };
+/** Modal's own bill for this month (worker reads it every 10 min). All dollars. */
+export type ModalUsage = { at: number; used: number; credit: number; panda: number; other: number; pending: number;
+  booked: number; now: number; cap: number; left: number; month: string; source: "modal" | "panda"; counted_to: number;
+  billed?: number; error?: string };
+
+export type RunStep = "director" | "script" | "draft" | "check" | "final" | "done" | "failed" | "cancelled";
+/** Autopilot: one idea -> the director picks everything -> draft -> check -> final. */
+export type VideoRun = {
+  id: string; created: number; source: "tab" | "chat"; idea: string; first?: string; plan: "full" | "quick";
+  status: "directing" | "filming" | "done" | "failed" | "cancelled"; step: RunStep; title: string;
+  log: { t: number; step: RunStep; text: string }[]; jobs: string[]; phases?: { draft?: string; final?: string };
+  choice?: { ratio: VideoRatio; secs: number; style: string; audio: boolean }; why?: string; prompt?: string;
+  by?: "director" | "guess"; est_high?: number; best?: string; cost?: number; error?: string; finished?: number;
+  hidden?: boolean;
+};
+export const runActive = (r: VideoRun) => r.status === "directing" || r.status === "filming";
+
+export type JobsFile = { v: number; at: number; jobs: VideoJob[]; runs?: VideoRun[]; budget: number; spent: number;
+  rate_usd_s: number; modal?: ModalUsage; stats?: Stats; gpu?: { state?: string; t?: number; gpu?: string } };
 
 export type VideoSpec = {
   mode: VideoMode; quality: VideoQuality; ratio: VideoRatio; secs: number; seeds: number; style: string;
@@ -42,6 +60,11 @@ export const videoSubmit = (s: VideoSpec) =>
   runCommand<{ jobs: VideoJob[]; total_usd: number; total_high: number }>("video.submit", s, 90000);
 export const videoCancel = (id: string) => runCommand<{ ok: boolean }>("video.cancel", { id }, 40000);
 export const videoDelete = (id: string) => runCommand<{ ok: boolean }>("video.delete", { id }, 40000);
+export const videoAuto = (a: { idea: string; plan: "full" | "quick"; first?: string }) =>
+  runCommand<{ run: VideoRun }>("video.auto", a, 60000);
+export const videoAutoCancel = (id: string) => runCommand<{ ok: boolean }>("video.auto_cancel", { id }, 40000);
+export const videoAutoDismiss = (id: string) => runCommand<{ ok: boolean }>("video.auto_dismiss", { id }, 40000);
+export const videoUsage = () => runCommand<ModalUsage>("video.usage", { force: true }, 60000);
 
 /** The gallery file the worker keeps in Storage. Readable even while Panda is off. */
 let jobsUrl: { url: string; at: number } | null = null;

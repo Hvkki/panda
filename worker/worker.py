@@ -1667,7 +1667,9 @@ def video_command(op: str, args: dict) -> dict:
     if not eng:
         raise RuntimeError("video is not ready yet" + (f": {VIDEO['error']}" if VIDEO["error"] else ""))
     fn = {"video.prompt": eng.write_prompt, "video.estimate": eng.estimate, "video.submit": eng.submit,
-          "video.cancel": eng.cancel, "video.delete": eng.delete}[op]
+          "video.cancel": eng.cancel, "video.delete": eng.delete, "video.auto": eng.auto,
+          "video.auto_cancel": eng.auto_cancel, "video.auto_dismiss": eng.auto_dismiss,
+          "video.usage": eng.usage_now}[op]
     return fn(args)
 
 
@@ -3088,7 +3090,8 @@ def run_command(sb: Supabase, gw: Gateway, cmd: dict):
             result = browser_forget(sb)
         elif op == "stt":
             result = speech_to_text(args)
-        elif op in ("video.prompt", "video.estimate", "video.submit", "video.cancel", "video.delete"):
+        elif op in ("video.prompt", "video.estimate", "video.submit", "video.cancel", "video.delete", "video.auto",
+                    "video.auto_cancel", "video.auto_dismiss", "video.usage"):
             result = video_command(op, args)
         elif op == "ping":
             result = {"ok": True, "uptime_secs": round(time.time() - T0), "crew": CREW_VERSION["v"]}

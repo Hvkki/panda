@@ -3,6 +3,7 @@ import * as V from "../lib/video";
 import { signedUrl } from "../lib/files";
 import { useSettings } from "../lib/settings";
 import { PelicanBike, type PelicanStage } from "./PelicanBike";
+import { AutopilotDesk, CreditMeter, CreditSheet, RunCard } from "./VideoAutopilot";
 import { IconArrowRight, IconEdit, IconImage, IconRetry, IconSparkle, IconTrash, IconX } from "./Icons";
 import "./VideoTab.css";
 
@@ -55,7 +56,9 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
   const [busy, setBusy] = useState<"" | V.VideoQuality>("");
   const [err, setErr] = useState("");
   const [open, setOpen] = useState<string>("");
-  const [editBudget, setEditBudget] = useState<string | null>(null);
+  const [sheet, setSheet] = useState(false);
+  const [pilot, setPilot] = useState<"auto" | "manual">(() => (localStorage.getItem("panda.video.pilot") as "manual") || "auto");
+  useEffect(() => { localStorage.setItem("panda.video.pilot", pilot); }, [pilot]);
   const [ideaIx, setIdeaIx] = useState(0);
   const [, setTick] = useState(0);
   const fileRef = useRef<V.JobsFile | null>(null);
@@ -78,7 +81,8 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
         if (alive && f) setFile(f);
       } catch { /* keep the last copy */ }
       if (!alive) return;
-      const hot = (fileRef.current?.jobs || []).some(V.active) || Date.now() < hotUntil.current;
+      const hot = (fileRef.current?.jobs || []).some(V.active) || (fileRef.current?.runs || []).some(V.runActive)
+        || Date.now() < hotUntil.current;
       timer = window.setTimeout(tick, document.hidden ? 30000 : hot ? 2000 : 20000);
     };
     tick();
@@ -95,13 +99,20 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
 
   const jobs = useMemo(() => [...(file?.jobs || [])].sort((a, b) => b.created - a.created), [file]);
   // The clip being filmed first, then the line in the order it was sent.
-  const running = jobs.filter(V.active).sort((a, b) =>
+  const byId = useMemo(() => new Map(jobs.map((j) => [j.id, j])), [jobs]);
+  const runs = useMemo(() => [...(file?.runs || [])].filter((r) => !r.hidden)
+    .sort((a, b) => Number(V.runActive(b)) - Number(V.runActive(a)) || b.created - a.created).slice(0, 4), [file]);
+  // Autopilot films show their own render inside their card; "On set" keeps the rest.
+  const running = jobs.filter((j) => V.active(j) && !(j.run && runs.some((r) => r.id === j.run))).sort((a, b) =>
     (a.status === "rendering" ? 0 : 1) - (b.status === "rendering" ? 0 : 1) || a.created - b.created);
   const finished = jobs.filter((j) => !V.active(j));
   const month = new Date().toISOString().slice(0, 7);
   const spent = jobs.filter((j) => new Date(j.created * 1000).toISOString().slice(0, 7) === month)
     .reduce((s, j) => s + (j.cost || 0), 0);
-  const budget = settings.videoBudget ?? 10;
+  const budget = settings.modalCap ?? 30;
+  const [usageNow, setUsageNow] = useState<V.ModalUsage | null>(null);
+  const fileUsage = file?.modal || null;
+  const usage = usageNow && (!fileUsage || usageNow.at >= fileUsage.at) ? usageNow : fileUsage;
   const gpuWarm = !!file?.gpu?.t && Date.now() / 1000 - (file.gpu.t || 0) < 25 && ["ready", "idle", "busy"].includes(file.gpu.state || "");
   const stats = file?.stats || V.DEFAULT_STATS;
   const rate = file?.rate_usd_s || 0.001001;
@@ -174,6 +185,18 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
     }
   }
 
+  async function restart(old: V.VideoRun) {
+    setErr("");
+    try {
+      const res = await V.videoAuto({ idea: old.idea, plan: old.plan, first: old.first || undefined });
+      setFile((f) => (f ? { ...f, runs: [...(f.runs || []), res.run] } : f));
+      hotUntil.current = Date.now() + 30000;
+      setKick((k) => k + 1);
+    } catch (e) {
+      setErr(String((e as Error).message || e));
+    }
+  }
+
   function reuse(j: V.VideoJob) {
     setMode(j.mode); setRatio(j.ratio); setSecs(j.secs); setStyle(j.style); setIdea(j.idea);
     setScript(V.toScript(j.prompt)); setBy("yours"); setOpen("");
@@ -213,30 +236,41 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
           <Reel spinning={running.length > 0} />
           <div>
             <h1 className="serif">Video studio</h1>
-            <p>Idea in, film out. Drafts are cheap; make the final from the take you love.</p>
+            <p>Tell Panda an idea. It directs, films, checks the take and makes the final.</p>
           </div>
         </div>
         <div className="vs-head-side">
           <span className={`vs-gpu ${gpuWarm ? "warm" : ""}`} title={file?.gpu?.gpu || "RTX PRO 6000 on your Modal"}>
             <i />{gpuWarm ? "GPU warm · starts at once" : "GPU asleep · wakes in ~30 s"}
           </span>
-          <button className="vs-budget" onClick={() => setEditBudget(String(budget))} title="Monthly video budget">
-            <span>This month <b>{V.money(spent)}</b> of {V.money(budget)}</span>
-            <span className="vs-meter"><i style={{ width: `${Math.min(100, (spent / Math.max(0.01, budget)) * 100)}%` }} /></span>
-          </button>
+          <CreditMeter usage={usage} cap={budget} onOpen={() => setSheet((v) => !v)} />
         </div>
       </header>
-      {editBudget !== null && (
-        <form className="vs-budget-edit" onSubmit={(e) => { e.preventDefault(); const v = Math.max(0, Number(editBudget) || 0); update({ videoBudget: v }); setEditBudget(null); }}>
-          <label>Monthly budget $<input autoFocus inputMode="decimal" value={editBudget} onChange={(e) => setEditBudget(e.target.value)} /></label>
-          <button className="btn primary" type="submit">Save</button>
-          <button className="btn" type="button" onClick={() => setEditBudget(null)}>Cancel</button>
-          <small>Panda refuses a video that would go over it.</small>
-        </form>
+      {sheet && (
+        <CreditSheet usage={usage} cap={budget} online={online} onClose={() => setSheet(false)}
+          onCap={(v) => { update({ modalCap: v }); setSheet(false); }} onRefreshed={(u) => setUsageNow(u)} />
       )}
+      <div className="ap-switch" role="tablist" aria-label="How to make a video">
+        <button role="tab" aria-selected={pilot === "auto"} className={pilot === "auto" ? "on" : ""} onClick={() => setPilot("auto")}>
+          <b>Autopilot</b><small>idea in, film out</small>
+        </button>
+        <button role="tab" aria-selected={pilot === "manual"} className={pilot === "manual" ? "on" : ""} onClick={() => setPilot("manual")}>
+          <b>Director's chair</b><small>you pick every setting</small>
+        </button>
+        <i className="ap-switch-thumb" aria-hidden />
+      </div>
       {!online && <div className="vs-offline">Panda is off. Your videos are all here; press Start to make new ones.</div>}
 
       <div className="vs-grid">
+        {pilot === "auto" ? (
+          <AutopilotDesk userId={userId} online={online} usage={usage} stats={stats} rate={rate} warm={gpuWarm}
+            onStarted={(run) => {
+              setFile((f) => (f ? { ...f, runs: [...(f.runs || []), run] } : { v: 2, at: Date.now() / 1000, jobs: [], runs: [run], budget, spent, rate_usd_s: rate }));
+              hotUntil.current = Date.now() + 30000;
+              setKick((k) => k + 1);
+              window.setTimeout(() => queueRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 120);
+            }} />
+        ) : (
         <section className="vs-slate" aria-label="New video">
           <div className="vs-slate-top" aria-hidden><span /><span /><span /><span /><span /><span /><span /></div>
           <div className="vs-modes" role="radiogroup" aria-label="Type of video">
@@ -355,9 +389,20 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
           {err && <div className="vs-err" role="alert"><IconX size={14} /> {err}</div>}
           <p className="vs-fine">Prices are estimates for your Modal account (RTX PRO 6000, ${(rate * 3600).toFixed(2)}/h) and learn from every video. MiniMax H3 videos may not be used in the EU, US, UK or South Korea without MiniMax's permission.</p>
         </section>
+        )}
 
         <section className="vs-side">
           <div ref={queueRef} />
+          {runs.length > 0 && (
+            <div className="ap-runs">
+              <h2>Autopilot</h2>
+              {runs.map((r) => (
+                <RunCard key={r.id} run={r} jobs={byId} online={online} onWatch={(id) => setOpen(id)}
+                  onChange={() => { hotUntil.current = Date.now() + 20000; setKick((k) => k + 1); }}
+                  onAgain={(old) => restart(old)} />
+              ))}
+            </div>
+          )}
           {running.length > 0 && (
             <div className="vs-queue">
               <h2>On set</h2>
@@ -377,7 +422,7 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
             <h2>Your videos</h2>
             <span>{finished.filter((j) => j.status === "done").length} clips</span>
           </div>
-          {finished.length === 0 && running.length === 0 ? (
+          {finished.length === 0 && running.length === 0 && runs.length === 0 ? (
             <EmptyReel />
           ) : (
             <div className="vs-gallery">
