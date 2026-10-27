@@ -409,6 +409,23 @@ def _no_locks(info: tarfile.TarInfo):
     return None if info.name.endswith(".lock") else info
 
 
+def tar_add_live(t: tarfile.TarFile, root: str, arcname: str):
+    """Add a directory that other programs are still writing to. kiro-cli creates and deletes session
+    files all the time, so a file listed a moment ago may be gone when it is read: skip it instead of
+    failing the whole snapshot (that error used to crash the worker: '[Errno 2] No such file ...')."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        base = arcname if rel == "." else f"{arcname}/{rel}"
+        for name in sorted(filenames):
+            if name.endswith(".lock"):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                t.add(path, arcname=f"{base}/{name}", recursive=False)
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+
+
 # ── Big state in Supabase Storage: split into parts ─────────────────────────
 # A Free Supabase project refuses any object over 50 MB (the Pro plan allows far more:
 # https://supabase.com/docs/guides/storage/uploads/file-limits), and the Crew snapshot alone is already
@@ -891,7 +908,7 @@ def snapshot(sb: Supabase, reason: str, files: bool = True) -> str:
         for d in EXTRA_DIRS:
             p = f"{HOME}/.kiro/{d}"
             if os.path.isdir(p):
-                t.add(p, arcname=d, filter=_no_locks)
+                tar_add_live(t, p, d)
     blob_save(sb, "latest-kiro.tar.gz", extra)
     log(f"snapshot uploaded ({reason}), {done['size'] // 1024} KiB in {done['parts']} part(s)")
     if files:
@@ -3627,9 +3644,13 @@ def main():
                     log("usage refresh:", type(exc).__name__)
                 last_nt = time.time()
             if time.time() - last_snap > SNAPSHOT_EVERY:
-                with beating(sb, sid):
-                    set_sess(last_snapshot=snapshot(sb, "periodic", files=False))
-                snapshot_files_later(sb, "periodic")
+                # A failed periodic save must never take Panda down; the next one (or the stop) retries.
+                try:
+                    with beating(sb, sid):
+                        set_sess(last_snapshot=snapshot(sb, "periodic", files=False))
+                    snapshot_files_later(sb, "periodic")
+                except Exception as exc:
+                    log("periodic snapshot failed, will retry:", scrub(exc)[:200])
                 last_snap = time.time()
             try:
                 steer_pending(sb, gw)
