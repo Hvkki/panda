@@ -3385,17 +3385,30 @@ def command_loop(sb: Supabase, gw: Gateway, stop: threading.Event):
         stop.wait(1.0)
 
 
+_NOTIF_SENT = {"at": 0.0}
+
+
 def mirror_notifications(sb: Supabase, gw: Gateway, seen: set):
     try:
         data = gw.call("GET", "/api/notifications")
     except Exception as exc:
         log("notifications read failed:", exc)
         return
-    for n in data.get("notifications", []):
+    rows = sorted(data.get("notifications", []), key=lambda n: str(n.get("ts") or ""))
+    for n in rows:
         ts = str(n.get("ts") or n.get("id") or "")
         if not ts or ts in seen or n.get("read"):
             continue
         seen.add(ts)
+        # A reminder job that already told the user (send_message -> an "agent" notification) also
+        # leaves Crew's "cron" result row, which is the job's own narration ("I'll load the
+        # send_message tool... Reminder sent."). Show only the real message.
+        if n.get("kind") == "agent":
+            _NOTIF_SENT["at"] = parse_ts(ts) or time.time()
+        elif n.get("kind") == "cron" and abs((parse_ts(ts) or time.time()) - _NOTIF_SENT["at"]) < 600:
+            with contextlib.suppress(Exception):
+                gw.call("POST", "/api/notifications/ack", {"ts": ts})
+            continue
         # Restored snapshots bring old notifications back; Supabase decides what is new.
         if sb.rest("GET", "notifications", params={"owner": f"eq.{OWNER}", "meta->>ts": f"eq.{ts}",
                                                    "select": "id", "limit": "1"}):
