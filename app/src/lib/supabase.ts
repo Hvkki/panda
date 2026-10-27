@@ -53,6 +53,7 @@ export type Message = {
     attachments?: import("./files").Attachment[];
     /** Sent while Panda was answering; the worker steers it into the running turn. */
     steer?: boolean;
+    stopped?: boolean;
     steered?: "steered" | "queued";
     /** Kiro credits this reply used (Kiro Crew's meteringUsage for the turn). */
     credits?: number;

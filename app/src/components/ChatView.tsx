@@ -66,8 +66,12 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
   const busy = !!streaming || messages.some((m) => m.role === "user" && (m.status === "processing"));
 
   const stop = useCallback(() => {
-    if (streaming) supabase.from("messages").update({ cancel: true }).eq("id", streaming.id).then(() => {});
-  }, [streaming]);
+    if (streaming) { supabase.from("messages").update({ cancel: true }).eq("id", streaming.id).then(() => {}); return; }
+    // Nothing is answering yet (the message still waits in line): take it out of the line.
+    const queued = [...messages].reverse().find((m) => m.role === "user" && m.status === "pending");
+    if (queued) supabase.from("messages").update({ status: "done", meta: { ...queued.meta, stopped: true } })
+      .eq("id", queued.id).eq("status", "pending").then(() => {});
+  }, [streaming, messages]);
 
   const retry = useCallback((m: Message) => {
     const question = messages.find((x) => x.id === m.reply_to);

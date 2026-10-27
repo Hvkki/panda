@@ -2207,8 +2207,20 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                     log("stop call failed:", exc)
 
     def flusher():
-        seen_think = 0
+        seen_think, last_check = 0, 0.0
         while not stream_done.wait(0.4):
+            # "Stop" sets messages.cancel; look for it on its own clock, so it also lands before the
+            # first word and during a long silent tool call (when there is nothing to push).
+            if not cancelled.is_set() and time.time() - last_check >= 1.5:
+                last_check = time.time()
+                try:
+                    row = sb.rest("GET", "messages", params={"id": f"eq.{reply['id']}", "select": "cancel"})
+                    if row and row[0].get("cancel"):
+                        cancelled.set()
+                        log(f"chat {chat['id']}: stop pressed")
+                        gw.call("POST", f"/api/chat/slots/{slot}/stop")
+                except Exception as exc:
+                    log("stop check failed:", type(exc).__name__)
             with THINK_LOCK:
                 n = len(THINK.get(slot, ""))
             if n != seen_think:
@@ -2270,6 +2282,8 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                 break
         if queued_id:
             wait_queued(sb, gw, slot, queued_id, reply["id"], {**meta(), "queued": True}, cancelled)
+        if cancelled.is_set() and "stopped by you" not in tools:
+            tools.append("stopped by you")
         stream_done.set()
         with BUSY_LOCK:
             BUSY_SLOTS.pop(chat["id"], None)
@@ -2416,6 +2430,13 @@ def followup_step(sb: Supabase, gw: Gateway):
                 "content": "", "meta": {"followup": True}})[0]["id"]
             log(f"chat {chat_id}: Panda is answering on its own (helpers finished)")
         if running:
+            try:  # "Stop" on Panda's own follow-up answer
+                row = sb.rest("GET", "messages", params={"id": f"eq.{w['row']}", "select": "cancel"})
+                if row and row[0].get("cancel") and not w.get("stopped"):
+                    w["stopped"] = True
+                    gw.call("POST", f"/api/chat/slots/{w['slot']}/stop")
+            except Exception:
+                pass
             continue  # fill it in when the turn is over
         try:
             rows = (_slot_view(gw, w["slot"], total - w["seen"]).get("messages") or [])[-(total - w["seen"]):]
@@ -2434,7 +2455,7 @@ def followup_step(sb: Supabase, gw: Gateway):
                 "meta": {"followup": True, "files": [r["id"] for _, r, inline in published if not inline]}})
             push(sb, w["owner"], "Panda finished with the helpers", re.sub(r"[#*_`>\[\]]", "", text)[:180],
                  f"./?c={chat_id}")
-        w["row"], w["before"] = None, None
+        w["row"], w["before"], w["stopped"] = None, None, False
 
 
 def followup_loop(sb: Supabase, gw: Gateway, stop: threading.Event):
