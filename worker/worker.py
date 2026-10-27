@@ -983,6 +983,8 @@ THINK = {}          # slot -> accumulated thinking text of the running turn
 THINK_REPLY = {}    # slot -> assistant message id being streamed
 THINK_SENT = {}     # slot -> length already written to Supabase
 THINK_LOCK = threading.Lock()
+SIDE: dict = {}  # side-chat (/btw) run id -> {"slot", "text", "final"?, "error"?, "at"}, from the websocket
+SIDE_LOCK = threading.Lock()
 CTX = {}            # slot -> latest context_usage reading from Crew's websocket
 
 
@@ -1049,6 +1051,18 @@ def thinking_listener(gw: "Gateway", stop: threading.Event):
                     if d.get("slot") and isinstance(d.get("pct"), (int, float)):
                         with THINK_LOCK:
                             CTX[d["slot"]] = {**d, "at": time.time()}
+                elif msg.get("type") == "chat.side_result":
+                    # /btw answers only arrive here: Crew has no GET route for the side chat.
+                    d = msg.get("data") or {}
+                    if d.get("role") == "assistant" and d.get("run_id"):
+                        with SIDE_LOCK:
+                            r = SIDE.setdefault(d["run_id"], {"slot": d.get("slot"), "text": "", "at": time.time()})
+                            if d.get("final"):
+                                r.update(final=str(d.get("content") or r["text"]), error=bool(d.get("is_error")))
+                            else:
+                                r["text"] += str(d.get("content") or "")
+                            for k in [k for k, v in SIDE.items() if time.time() - v["at"] > 1800]:
+                                SIDE.pop(k, None)
             ws.close()
         except Exception as exc:
             log("thinking stream:", type(exc).__name__, str(exc)[:100])
@@ -2948,23 +2962,27 @@ def side_ask(sb: Supabase, gw: Gateway, chat_id: str, question: str, timeout: fl
     slot, _ = ensure_slot(sb, gw, rows[0], user_settings(sb, OWNER))
     q = quote(slot, safe="")  # slot can be an old URL-derived key; keep the path well-formed
     gw.call("POST", f"/api/chat/slots/{q}/side/open", {})
+    t0 = time.time()
+    with SIDE_LOCK:
+        known = set(SIDE)
     r = gw.call("POST", f"/api/chat/slots/{q}/side/turn", {"question": question})
     run_id = r.get("run_id") or ""
-    t0 = time.time()
+    # The answer streams over the dashboard websocket (chat.side_result); thinking_listener
+    # collects it in SIDE. A queued question gets its run id only when it starts: take the first
+    # new side run on this slot.
     while time.time() - t0 < timeout:
-        time.sleep(1.2)
-        st = gw.call("GET", f"/api/chat/slots/{q}/side")
-        msgs = [m for m in (st.get("messages") or []) if isinstance(m, dict)]
-        if not run_id:  # it was queued behind another side question: find the run it got
-            mine = [m for m in msgs if m.get("role") == "user" and (m.get("content") or "").strip() == question]
-            run_id = (mine[-1].get("run_id") or "") if mine else ""
-            continue
-        answer = [m for m in msgs if m.get("run_id") == run_id and m.get("role") == "assistant"]
-        if answer and not st.get("running"):
-            text = "\n\n".join(_row_text(m) for m in answer if _row_text(m))
-            return {"answer": scrub(_ANSI.sub("", text)), "error": any(m.get("is_error") for m in answer)}
-        if not st.get("running") and not answer and time.time() - t0 > 8:
-            return {"answer": "", "error": True, "note": "The side chat ended without an answer."}
+        time.sleep(0.8)
+        with SIDE_LOCK:
+            if not run_id:
+                fresh = [k for k, v in SIDE.items() if k not in known and v.get("slot") == slot]
+                run_id = fresh[0] if fresh else ""
+            got = dict(SIDE.get(run_id) or {}) if run_id else {}
+        if "final" in got:
+            return {"answer": scrub(_ANSI.sub("", got["final"])), "error": got.get("error", False)}
+    with SIDE_LOCK:
+        partial = (SIDE.get(run_id) or {}).get("text", "") if run_id else ""
+    if partial:
+        return {"answer": scrub(_ANSI.sub("", partial)), "error": False}
     return {"answer": "", "error": True, "note": "No answer yet. Try again in a moment."}
 
 
