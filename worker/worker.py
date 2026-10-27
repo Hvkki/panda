@@ -2595,6 +2595,33 @@ def claim_next(sb: Supabase):
     return None
 
 
+def claim_loop(sb: Supabase, gw: Gateway, pool: ThreadPoolExecutor, stop: threading.Event):
+    """Pick up steers and new messages every POLL_SECS, independent of the main loop's chores."""
+    while not stop.is_set():
+        try:
+            steer_pending(sb, gw)
+        except Exception as exc:
+            log("steer check:", type(exc).__name__)
+        try:
+            msg = claim_next(sb)
+        except Exception as exc:  # a network blip: try again next poll, never take Panda down
+            log("claim:", type(exc).__name__)
+            msg = None
+        if not msg:
+            stop.wait(POLL_SECS)
+            continue
+        try:
+            if stop.is_set():
+                raise RuntimeError("stopping")
+            pool.submit(run_message, sb, gw, msg)
+        except RuntimeError:  # stopping: hand the message back so the next run answers it
+            with BUSY_LOCK:
+                BUSY_CHATS.discard(msg["chat_id"])
+            with contextlib.suppress(Exception):
+                sb.rest("PATCH", "messages", params={"id": f"eq.{msg['id']}"}, body={"status": "pending"})
+            return
+
+
 def run_message(sb: Supabase, gw: Gateway, msg: dict):
     dev = False
     try:
@@ -3617,6 +3644,9 @@ def main():
         threading.Thread(target=followup_loop, args=(sb, gw, stop_evt), daemon=True).start()
         threading.Thread(target=thinking_pusher, args=(sb, stop_evt), daemon=True).start()
         pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL_CHATS)
+        # Messages are picked up on their own thread: a slow snapshot or usage refresh in the main loop
+        # used to leave new messages "Queued" for minutes, and a network blip in claim_next crashed the run.
+        threading.Thread(target=claim_loop, args=(sb, gw, pool, stop_evt), daemon=True).start()
         SESSION_INFO.update(restored=restored, files_restored=files_state, startup_secs=round(time.time() - T0), crew=CREW_VERSION["v"])
         SESSION_INFO.pop("handoff_ready", None)
         set_sess(status="running", heartbeat_at=now_iso(), info=SESSION_INFO)
@@ -3650,21 +3680,27 @@ def main():
                 reason = "time guard"
                 break
             if time.time() - last_nt > NOTIFY_SECS:
-                mirror_notifications(sb, gw, seen)
-                approve_background(gw, sb)
-                try:
-                    browser_config(sb)
-                    browser_backup(sb)
-                except Exception as exc:
-                    log("browser sync:", type(exc).__name__)
-                try:
-                    codex_backup(sb)
-                except Exception as exc:
-                    log("codex sync:", type(exc).__name__)
-                try:
-                    refresh_usage(sb, gw)
-                except Exception as exc:
-                    log("usage refresh:", type(exc).__name__)
+                # These can take over a minute together (uploads, usage scrape): keep beating meanwhile,
+                # or the app sees no heartbeat for 90 s and shows Panda as Offline.
+                with beating(sb, sid):
+                    try:
+                        mirror_notifications(sb, gw, seen)
+                        approve_background(gw, sb)
+                    except Exception as exc:
+                        log("notifications:", type(exc).__name__)
+                    try:
+                        browser_config(sb)
+                        browser_backup(sb)
+                    except Exception as exc:
+                        log("browser sync:", type(exc).__name__)
+                    try:
+                        codex_backup(sb)
+                    except Exception as exc:
+                        log("codex sync:", type(exc).__name__)
+                    try:
+                        refresh_usage(sb, gw)
+                    except Exception as exc:
+                        log("usage refresh:", type(exc).__name__)
                 last_nt = time.time()
             if time.time() - last_snap > SNAPSHOT_EVERY:
                 # A failed periodic save must never take Panda down; the next one (or the stop) retries.
@@ -3675,15 +3711,7 @@ def main():
                 except Exception as exc:
                     log("periodic snapshot failed, will retry:", scrub(exc)[:200])
                 last_snap = time.time()
-            try:
-                steer_pending(sb, gw)
-            except Exception as exc:
-                log("steer check:", type(exc).__name__)
-            msg = claim_next(sb)
-            if msg:
-                pool.submit(run_message, sb, gw, msg)
-            else:
-                time.sleep(POLL_SECS)
+            time.sleep(POLL_SECS)
 
         log("stopping:", reason)
         stop_evt.set()

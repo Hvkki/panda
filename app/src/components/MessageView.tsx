@@ -209,7 +209,7 @@ export function ApprovalCard({ m }: { m: Message }) {
 }
 
 /* ── placeholder while the worker picks the message up ─────────────────── */
-export function PendingReply({ queued, model }: { queued: boolean; model?: string }) {
+export function PendingReply({ queued, model, online }: { queued: boolean; model?: string; online?: boolean }) {
   const t = useT();
   return (
     <div className="msg assistant">
@@ -218,7 +218,7 @@ export function PendingReply({ queued, model }: { queued: boolean; model?: strin
         <div className="activity live">
           <div className="step current">
             <span className="step-icon"><IconSpinner size={15} /></span>
-            <span className="step-label">{queued ? t("queued") : "Getting ready…"}</span>
+            <span className="step-label">{queued ? t(online ? "queuedBusy" : "queued") : "Getting ready…"}</span>
           </div>
         </div>
       </div>
