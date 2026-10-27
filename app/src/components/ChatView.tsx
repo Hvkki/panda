@@ -5,6 +5,7 @@ import { fmtCredits } from "../lib/usage";
 import { useT } from "../lib/i18n";
 import { MessageView, PendingReply, commandOf } from "./MessageView";
 import { Composer, type SendMeta } from "./Composer";
+import { Helpers } from "./Helpers";
 import { IconCoins, IconSpinner, IconX } from "./Icons";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -134,6 +135,7 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
                 onOption={(text) => onSendMessage(chat, text)} />
             ))}
           {!loading && waiting && <PendingReply queued={waiting.status === "pending"} model={chat.model} />}
+          {!loading && <Helpers slot={chat.slot_id} online={online} busy={busy} />}
           {!loading && totals.replies > 0 && (
             <div className="chat-total" title="Kiro credits used by Panda's replies in this chat">
               <IconCoins size={13} /> {fmtCredits(totals.credits)} {t("creditsUnit")} · {totals.replies} {totals.replies === 1 ? "reply" : "replies"}

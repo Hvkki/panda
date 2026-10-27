@@ -1121,3 +1121,25 @@ html:has(.sheet-backdrop), html:has(.sheet-backdrop) body { overscroll-behavior-
 /* Browser full screen: fills the whole screen, also where the Fullscreen API is missing (iPhone). */
 .browser-panel.full { position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100dvh !important;
   max-width: none !important; max-height: none !important; border-radius: 0 !important; z-index: 1000; margin: 0 !important; }
+
+/* ── helpers: the sub-agents this chat's Panda started ── */
+.helpers { border: 1px solid var(--line); background: var(--panel); border-radius: 16px; box-shadow: var(--shadow-sm); overflow: hidden; animation: rise .2s var(--ease); }
+.helpers.live { border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); }
+.helpers-head { width: 100%; display: flex; align-items: center; gap: 8px; padding: 10px 14px; font-size: .86em; text-align: left; }
+.helpers-head svg { color: var(--accent); flex: none; }
+.helpers-head span { color: var(--muted); }
+.helpers-chev { margin-left: auto; display: grid; color: var(--muted); transition: transform .2s; }
+.helpers-chev.up { transform: rotate(180deg); }
+.helpers ul { list-style: none; margin: 0; padding: 0 6px 6px; display: grid; gap: 2px; }
+.helper-row { width: 100%; display: grid; grid-template-columns: 20px minmax(0, 1fr); column-gap: 8px; row-gap: 1px; align-items: center;
+  padding: 7px 8px; border-radius: 10px; text-align: left; }
+.helper-row:hover { background: var(--bg-2); }
+.helper-task { font-size: .88em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.helper-row small { grid-column: 2; font-size: .74em; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.helper-dot { grid-row: 1 / 3; width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; background: var(--bg-3); color: var(--muted); }
+.helper.ok .helper-dot { background: var(--ok); color: #fff; }
+.helper.bad .helper-dot { background: var(--danger); color: #fff; }
+.helper.run .helper-dot, .helper.wait .helper-dot { background: var(--accent-soft); color: var(--accent); }
+.helper-body { margin: 2px 8px 8px 36px; display: grid; gap: 4px; }
+.helper-label { font-size: .68em; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.helper-text { margin: 0 0 4px; font-size: .84em; color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; }

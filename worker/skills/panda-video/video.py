@@ -1030,7 +1030,37 @@ class Engine:
         except Exception:
             pass
 
-    # chat agent requests (pvideo)
+    # chat agent requests (pvideo / the Python API below)
+    def agent_op(self, op: str, req: dict) -> dict:
+        """One request from a chat agent. Every op that spends money goes through guard()."""
+        if op == "auto":
+            return {"run": self.auto(req, source="chat")["run"]["id"]}
+        if op == "make":
+            out = self.submit(req, source="chat")
+            return {"jobs": [j["id"] for j in out["jobs"]], "total_usd": out["total_usd"], "total_high": out["total_high"]}
+        if op == "write":
+            return self.write_prompt(req)
+        if op == "estimate":
+            e = self.estimate(req)
+            return {k: e[k] for k in ("mode", "quality", "w", "h", "secs", "frames", "steps", "seeds", "total_usd",
+                                      "total_high", "total_secs", "warm")} | {"left": (e.get("modal") or {}).get("left")}
+        if op == "budget":
+            u = self.usage_now({"force": bool(req.get("force"))}) or {}
+            return {k: u.get(k) for k in ("now", "booked", "cap", "left", "credit", "source", "month")}
+        if op == "cancel":
+            jid = str(req.get("id") or "")
+            return self.auto_cancel({"id": jid}) if jid.startswith("r") else self.cancel({"id": jid})
+        if op == "list":
+            self.load()
+            n = max(1, min(20, int(req.get("n") or 8)))
+            keep = ("id", "status", "stage", "pct", "title", "quality", "mode", "ratio", "secs", "cost", "error", "run")
+            with self.lock:
+                jobs = [{k: j.get(k) for k in keep} for j in sorted(self.jobs, key=lambda j: -j.get("created", 0))[:n]]
+                runs = [{k: r.get(k) for k in ("id", "status", "step", "title", "plan", "best", "cost", "error", "jobs")}
+                        for r in sorted(self.runs, key=lambda r: -r.get("created", 0))[:n]]
+            return {"jobs": jobs, "runs": runs}
+        raise ValueError(f"unknown request: {op}")
+
     def drain_spool(self):
         if not os.path.isdir(SPOOL):
             return
@@ -1046,12 +1076,7 @@ class Engine:
                 continue
             rid = req.pop("request_id", name[:-5])
             try:
-                if req.pop("op", "") == "auto":
-                    run = self.auto(req, source="chat")["run"]
-                    res = {"ok": True, "run": run["id"]}
-                else:
-                    out = self.submit(req, source="chat")
-                    res = {"ok": True, "jobs": [j["id"] for j in out["jobs"]], "total_usd": out["total_usd"]}
+                res = {"ok": True, **self.agent_op(req.pop("op", "") or "make", req)}
             except Exception as exc:
                 res = {"ok": False, "error": str(exc)[:400]}
             with open(os.path.join(STATUS, f"req-{rid}.json"), "w") as f:
@@ -1063,19 +1088,173 @@ def safe_title(job: dict) -> str:
     return re.sub(r"\s+", "-", t).lower() + f"-{job.get('quality', '')}-{job['id'][-4:]}"
 
 
-# ── pvideo: the chat agent's command ────────────────────────────────────────
+
+# ── Agent API: the same calls as `pvideo`, for agents that would rather write Python ──
+#   import sys; sys.path.insert(0, os.path.expanduser("~/.kiro/crew/skills/panda-video")); import video
+#   rid = video.auto("a pelican on a bike")            -> run id;   video.wait_run(rid) -> {"file": ..., ...}
+#   ids = video.make(prompt, quality="draft")["jobs"]  -> job ids;  video.wait_jobs(ids) -> [{"file": ...}]
+#   video.budget(), video.estimate(...), video.write(idea), video.recent(), video.cancel(id)
+# Every call goes through the running engine in Panda's worker, so it needs Panda on, it honours the
+# owner's Modal stop line, and everything made here also shows in the Video tab.
+
+def request(op: str, **args) -> dict:
+    """Hand one request to the engine and return its answer. Raises RuntimeError when it refuses."""
+    if not os.path.isdir(SPOOL):
+        raise RuntimeError("The video engine isn't running (Panda must be on).")
+    rid = secrets.token_hex(6)
+    args.setdefault("chat_id", os.environ.get("PANDA_CHAT_ID") or None)
+    tmp = os.path.join(SPOOL, f".{rid}.tmp")
+    with open(tmp, "w") as f:
+        json.dump({**args, "op": op, "request_id": rid}, f)
+    os.replace(tmp, os.path.join(SPOOL, f"{rid}.json"))  # never half-read by the engine
+    res_path = os.path.join(STATUS, f"req-{rid}.json")
+    for _ in range(180 if op == "write" else 60):
+        if os.path.exists(res_path):
+            break
+        time.sleep(1)
+    else:
+        raise RuntimeError("The video engine didn't pick the request up.")
+    with open(res_path) as f:
+        res = json.load(f)
+    os.remove(res_path)
+    if not res.pop("ok", False):
+        raise RuntimeError(res.get("error") or "refused")
+    return res
+
+
+def _abs(p: str) -> str:
+    return os.path.abspath(os.path.expanduser(p)) if p else ""
+
+
+def _read(path: str) -> dict | None:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def auto(idea: str, plan: str = "full", first: str = "") -> str:
+    """Autopilot: the director picks everything. Returns the run id."""
+    return request("auto", idea=idea, plan=plan, first=_abs(first))["run"]
+
+
+def make(prompt: str, idea: str = "", mode: str = "clip", quality: str = "draft", ratio: str = "9:16", secs: float = 5,
+         seeds: int = 1, first: str = "", last: str = "", style: str = "", title: str = "", seed: int | None = None) -> dict:
+    """One clip (or `seeds` takes) from an H3 prompt or a plain idea. Returns {"jobs": [ids], "total_usd", "total_high"}."""
+    if prompt and os.path.exists(os.path.expanduser(prompt)):
+        with open(os.path.expanduser(prompt)) as f:
+            prompt = f.read()
+    spec = {"prompt": prompt or idea, "idea": idea or prompt[:200], "mode": mode, "quality": quality, "ratio": ratio,
+            "secs": secs, "seeds": seeds, "first": _abs(first), "last": _abs(last), "style": style, "title": title}
+    if seed is not None:
+        spec["seed"] = seed
+    return request("make", **spec)
+
+
+def estimate(**spec) -> dict:
+    """Price before spending: total_usd (likely), total_high (worst case), total_secs, left (credit left)."""
+    return request("estimate", **spec)
+
+
+def write(idea: str, secs: float = 5, ratio: str = "9:16", style: str = "", mode: str = "clip") -> dict:
+    """Panda's prompt writer: idea -> H3 3-field prompt. Returns {"prompt", "by"}."""
+    return request("write", idea=idea, secs=secs, ratio=ratio, style=style, mode=mode)
+
+
+def budget(force: bool = False) -> dict:
+    """This month's Modal money: now (spent), booked (promised to running jobs), cap, left."""
+    return request("budget", force=force)
+
+
+def recent(n: int = 8) -> dict:
+    """Newest jobs and autopilot runs, with status, progress and cost."""
+    return request("list", n=n)
+
+
+def cancel(id: str) -> dict:
+    """Stop a job (id like 261027-...) or a whole autopilot run (id starting with r)."""
+    return request("cancel", id=id)
+
+
+def _deliver(j: dict, keep: bool = True) -> str:
+    """Copy a finished clip to ~/outputs (so the chat shows it as a card) and return the path."""
+    local = j.get("local")
+    if not local or not os.path.exists(local):
+        return ""
+    dest = ""
+    if keep:
+        os.makedirs(OUTPUTS, exist_ok=True)
+        dest = os.path.join(OUTPUTS, safe_title(j) + ".mp4")
+        shutil.copy(local, dest)
+    os.remove(local)
+    return dest
+
+
+def wait_jobs(ids: list[str], on_update=None, timeout: float = 3600) -> list[dict]:
+    """Wait for jobs to finish; returns one {"id", "status", "file", "cost", "error"} per job."""
+    pending, out, seen, end = list(ids), {}, {}, time.time() + timeout
+    while pending and time.time() < end:
+        time.sleep(4)
+        for jid in list(pending):
+            j = _read(os.path.join(STATUS, jid + ".json"))
+            if not j:
+                continue
+            mark = (j.get("status"), j.get("stage"), j.get("pct"))
+            if on_update and seen.get(jid) != mark:
+                on_update(j)
+            seen[jid] = mark
+            if j.get("status") in ("done", "failed", "cancelled"):
+                pending.remove(jid)
+                out[jid] = {"id": jid, "status": j["status"], "file": _deliver(j) if j["status"] == "done" else "",
+                            "cost": j.get("cost") or 0, "error": j.get("error") or ""}
+    for jid in pending:
+        out[jid] = {"id": jid, "status": "waiting", "file": "", "cost": 0, "error": "still rendering; check later"}
+    return [out[i] for i in ids]
+
+
+def wait_run(rid: str, on_step=None, timeout: float = 3600) -> dict:
+    """Wait for an autopilot run. on_step(text) gets each director note. Returns status, title, file, cost, error."""
+    path, said, end, run = os.path.join(STATUS, f"run-{rid}.json"), 0, time.time() + timeout, None
+    while time.time() < end:
+        time.sleep(3)
+        run = _read(path) or run
+        if not run:
+            continue
+        for line in run.get("log", [])[said:]:
+            on_step and on_step(line["text"])
+        said = len(run.get("log", []))
+        if run.get("status") not in RUN_ACTIVE:
+            break
+    if not run:
+        return {"id": rid, "status": "unknown", "file": "", "cost": 0, "error": "no such film"}
+    file = ""
+    if run.get("status") == "done":
+        for jid in run.get("jobs") or []:
+            j = _read(os.path.join(STATUS, jid + ".json"))
+            if j:
+                got = _deliver(j, keep=jid == run.get("best"))  # only the best take goes into the reply
+                file = got or file
+    return {"id": rid, "status": run.get("status") if run.get("status") not in RUN_ACTIVE else "waiting",
+            "title": run.get("title"), "file": file, "cost": run.get("cost") or 0, "error": run.get("error") or "",
+            "choice": run.get("choice"), "why": run.get("why")}
+
+
+# ── pvideo: the chat agent's command (thin shell over the API above) ──
 def _cli():
     ap = argparse.ArgumentParser(prog="pvideo", description="Make videos on the owner's Modal GPU (MiniMax H3).")
+    ap.add_argument("--json", action="store_true", help="print one JSON object instead of text")
     sub = ap.add_subparsers(dest="cmd", required=True)
     for name in ("estimate", "make"):
         s = sub.add_parser(name)
-        s.add_argument("--prompt", help="H3 3-field prompt, or a file path holding it")
+        s.add_argument("--prompt", default="", help="H3 3-field prompt, or a file path holding it")
         s.add_argument("--idea", default="")
         s.add_argument("--mode", default="clip", choices=MODES)
         s.add_argument("--quality", default="draft", choices=tuple(QUALITY))
         s.add_argument("--ratio", default="9:16", choices=("9:16", "16:9", "1:1"))
         s.add_argument("--secs", type=float, default=5)
         s.add_argument("--seeds", type=int, default=1)
+        s.add_argument("--seed", type=int, default=None, help="reuse a seed (e.g. the draft's) for the final")
         s.add_argument("--first", default="", help="start picture (local path)")
         s.add_argument("--last", default="", help="end picture (local path)")
         s.add_argument("--style", default="", choices=("",) + tuple(STYLES))
@@ -1086,141 +1265,101 @@ def _cli():
     au.add_argument("--plan", default="full", choices=("full", "quick"), help="quick = draft only")
     au.add_argument("--first", default="", help="start picture (local path)")
     au.add_argument("--wait", action="store_true", help="wait and copy the film to ~/outputs")
+    wr = sub.add_parser("write", help="idea -> H3 prompt (Panda's writer)")
+    wr.add_argument("--idea", required=True)
+    wr.add_argument("--secs", type=float, default=5)
+    wr.add_argument("--ratio", default="9:16", choices=("9:16", "16:9", "1:1"))
+    wr.add_argument("--style", default="", choices=("",) + tuple(STYLES))
+    wr.add_argument("--mode", default="clip", choices=MODES)
+    wr.add_argument("--out", default="", help="also save the prompt to this file")
+    sub.add_parser("budget", help="Modal money this month: spent, booked, cap, left")
+    ls = sub.add_parser("list", help="newest jobs and autopilot runs")
+    ls.add_argument("-n", type=int, default=8)
+    ca = sub.add_parser("cancel", help="stop a job or a whole autopilot run")
+    ca.add_argument("id")
+    wt = sub.add_parser("wait", help="wait for a job or run started earlier (ids starting with r are runs)")
+    wt.add_argument("ids", nargs="+")
     st = sub.add_parser("status")
     st.add_argument("ids", nargs="*")
     a = ap.parse_args()
+    say = (lambda *x: None) if a.json else (lambda *x: print(*x, flush=True))
+    try:
+        out = _cli_run(a, say)
+    except RuntimeError as exc:
+        if a.json:
+            print(json.dumps({"ok": False, "error": str(exc)}))
+            sys.exit(1)
+        sys.exit(str(exc))
+    if a.json:
+        print(json.dumps({"ok": True, **out}, default=str))
 
-    if a.cmd == "auto":
-        _cli_auto(a)
-        return
 
+def _cli_run(a, say) -> dict:
     if a.cmd == "status":
-        ids = a.ids or sorted((n[:-5] for n in os.listdir(STATUS) if not n.startswith("req-")), reverse=True)[:5]
+        ids = a.ids or sorted((n[:-5] for n in os.listdir(STATUS) if not n.startswith(("req-", "run-"))), reverse=True)[:5]
+        rows = []
         for jid in ids:
-            try:
-                with open(os.path.join(STATUS, jid + ".json")) as f:
-                    j = json.load(f)
-                print(f"{jid}: {j.get('status')} {j.get('stage')} {j.get('pct', 0)}% cost ${j.get('cost') or 0:.2f}"
-                      f"{' — ' + j['error'] if j.get('error') else ''}")
-            except FileNotFoundError:
-                print(f"{jid}: unknown")
-        return
-
-    prompt = a.prompt or ""
-    if prompt and os.path.exists(prompt):
-        with open(prompt) as f:
-            prompt = f.read()
-    spec = {"prompt": prompt or a.idea, "idea": a.idea or prompt[:200], "mode": a.mode, "quality": a.quality,
-            "ratio": a.ratio, "secs": a.secs, "seeds": a.seeds, "first": os.path.abspath(a.first) if a.first else "",
-            "last": os.path.abspath(a.last) if a.last else "", "style": a.style, "title": a.title,
-            "chat_id": os.environ.get("PANDA_CHAT_ID") or None}
+            j = _read(os.path.join(STATUS, jid + ".json")) or _read(os.path.join(STATUS, f"run-{jid}.json")) or {}
+            rows.append({"id": jid, **{k: j.get(k) for k in ("status", "stage", "step", "pct", "cost", "error")}})
+            say(f"{jid}: {j.get('status', 'unknown')} {j.get('stage') or j.get('step') or ''} {j.get('pct') or 0}%"
+                f" cost ${j.get('cost') or 0:.2f}{' — ' + j['error'] if j.get('error') else ''}")
+        return {"items": rows}
+    if a.cmd == "budget":
+        b = budget(force=True)
+        say(f"Modal this month: ${b.get('now') or 0:.2f} spent, ${b.get('booked') or 0:.2f} booked, "
+            f"${b.get('left') or 0:.2f} left of ${b.get('cap') or 0:.0f}")
+        return b
+    if a.cmd == "list":
+        r = recent(a.n)
+        for run in r["runs"]:
+            say(f"film {run['id']}: {run['status']} ({run.get('step')}) · {run.get('title')} · ${run.get('cost') or 0:.2f}")
+        for j in r["jobs"]:
+            say(f"clip {j['id']}: {j['status']} {j.get('pct') or 0}% · {j.get('title')} · {j.get('quality')} "
+                f"{j.get('ratio')} {j.get('secs')} s · ${j.get('cost') or 0:.2f}")
+        return r
+    if a.cmd == "cancel":
+        cancel(a.id)
+        say(f"stopped {a.id}")
+        return {"id": a.id}
+    if a.cmd == "write":
+        w = write(a.idea, a.secs, a.ratio, a.style, a.mode)
+        if a.out:
+            with open(os.path.expanduser(a.out), "w") as f:
+                f.write(w["prompt"])
+            w["file"] = _abs(a.out)
+        say(w["prompt"])
+        return w
+    if a.cmd == "wait":
+        runs = [i for i in a.ids if i.startswith("r")]
+        jobs = [i for i in a.ids if not i.startswith("r")]
+        res = [wait_run(r, on_step=lambda t: say("·", t)) for r in runs] + wait_jobs(jobs)
+        for r in res:
+            say(f"{r['status']} {r['id']}: {r['file'] or r['error']} · ${r['cost'] or 0:.2f}")
+        return {"results": res}
+    if a.cmd == "auto":
+        rid = auto(a.idea, a.plan, a.first)
+        say(f"autopilot {rid} started · watch it in the Video tab")
+        if not a.wait:
+            return {"run": rid}
+        r = wait_run(rid, on_step=lambda t: say("·", t))
+        if r["status"] != "done":
+            raise RuntimeError(f"{r['status']}: {r['error']}")
+        say(f"done: {r['file']} · {r['title']} · total ${r['cost']:.2f}")
+        return r
+    spec = {k: getattr(a, k) for k in ("prompt", "idea", "mode", "quality", "ratio", "secs", "seeds", "first", "last",
+                                        "style", "title")}
     if a.cmd == "estimate":
-        p = plan(spec)
-        e1, e2 = estimate(p), estimate(p, warm=True)
-        n = min(4, max(1, a.seeds))
-        print(json.dumps({"size": f"{p['w']}x{p['h']}", "frames": p["frames"], "steps": p["steps"],
-                          "usd": round(e1["usd"] + e2["usd"] * (n - 1), 3),
-                          "usd_high": round(e1["usd_high"] + e2["usd_high"] * (n - 1), 3),
-                          "secs": e1["secs"] + e2["secs"] * (n - 1)}))
-        return
-    if not os.path.isdir(SPOOL):
-        sys.exit("The video engine isn't running (Panda must be on).")
-    rid = secrets.token_hex(6)
-    with open(os.path.join(SPOOL, f"{rid}.json"), "w") as f:
-        json.dump({**spec, "request_id": rid}, f)
-    res_path = os.path.join(STATUS, f"req-{rid}.json")
-    for _ in range(60):
-        if os.path.exists(res_path):
-            break
-        time.sleep(1)
-    else:
-        sys.exit("The video engine didn't pick the job up.")
-    with open(res_path) as f:
-        res = json.load(f)
-    if not res.get("ok"):
-        sys.exit(res.get("error") or "refused")
-    print(f"queued {', '.join(res['jobs'])} · about ${res['total_usd']:.2f} · watch it in the Video tab")
+        e = estimate(**{**spec, "prompt": spec["prompt"] or spec["idea"], "first": _abs(a.first), "last": _abs(a.last)})
+        say(json.dumps(e))
+        return e
+    res = make(**spec, seed=a.seed)
+    say(f"queued {', '.join(res['jobs'])} · about ${res['total_usd']:.2f} · watch it in the Video tab")
     if not a.wait:
-        return
-    pending = set(res["jobs"])
-    while pending:
-        time.sleep(4)
-        for jid in list(pending):
-            try:
-                with open(os.path.join(STATUS, jid + ".json")) as f:
-                    j = json.load(f)
-            except (FileNotFoundError, ValueError):
-                continue
-            if j.get("status") in ("done", "failed", "cancelled"):
-                pending.discard(jid)
-                if j.get("status") == "done" and j.get("local") and os.path.exists(j["local"]):
-                    os.makedirs(OUTPUTS, exist_ok=True)
-                    dest = os.path.join(OUTPUTS, safe_title(j) + ".mp4")
-                    shutil.copy(j["local"], dest)
-                    os.remove(j["local"])  # the copy in ~/outputs is the one the chat shows
-                    print(f"done {jid}: {dest} · ${j.get('cost') or 0:.2f}")
-                else:
-                    print(f"{j.get('status')} {jid}: {j.get('error', '')}")
-
-
-def _spool(req: dict) -> dict:
-    if not os.path.isdir(SPOOL):
-        sys.exit("The video engine isn't running (Panda must be on).")
-    rid = secrets.token_hex(6)
-    with open(os.path.join(SPOOL, f"{rid}.json"), "w") as f:
-        json.dump({**req, "request_id": rid}, f)
-    res_path = os.path.join(STATUS, f"req-{rid}.json")
-    for _ in range(60):
-        if os.path.exists(res_path):
-            break
-        time.sleep(1)
-    else:
-        sys.exit("The video engine didn't pick the job up.")
-    with open(res_path) as f:
-        res = json.load(f)
-    os.remove(res_path)
-    if not res.get("ok"):
-        sys.exit(res.get("error") or "refused")
-    return res
-
-
-def _cli_auto(a):
-    res = _spool({"op": "auto", "idea": a.idea, "plan": a.plan, "first": os.path.abspath(a.first) if a.first else "",
-                  "chat_id": os.environ.get("PANDA_CHAT_ID") or None})
-    rid = res["run"]
-    print(f"autopilot {rid} started · watch it in the Video tab")
-    if not a.wait:
-        return
-    path, said = os.path.join(STATUS, f"run-{rid}.json"), 0
-    while True:
-        time.sleep(3)
-        try:
-            with open(path) as f:
-                run = json.load(f)
-        except (FileNotFoundError, ValueError):
-            continue
-        for line in run.get("log", [])[said:]:
-            print("·", line["text"], flush=True)
-        said = len(run.get("log", []))
-        if run.get("status") not in RUN_ACTIVE:
-            break
-    if run["status"] != "done":
-        sys.exit(f"{run['status']}: {run.get('error') or ''}")
-    os.makedirs(OUTPUTS, exist_ok=True)
-    for jid in run.get("jobs") or []:
-        try:
-            with open(os.path.join(STATUS, jid + ".json")) as f:
-                j = json.load(f)
-        except (FileNotFoundError, ValueError):
-            continue
-        local = j.get("local")
-        if not local or not os.path.exists(local):
-            continue
-        if jid == run.get("best"):
-            dest = os.path.join(OUTPUTS, safe_title(j) + ".mp4")
-            shutil.copy(local, dest)
-            print(f"done: {dest} · {run.get('title')} · total ${run.get('cost') or 0:.2f}")
-        os.remove(local)  # only the best take goes into the reply
+        return res
+    done = wait_jobs(res["jobs"], on_update=lambda j: None)
+    for r in done:
+        say(f"{r['status']} {r['id']}: {r['file'] or r['error']} · ${r['cost'] or 0:.2f}")
+    return {**res, "results": done}
 
 
 if __name__ == "__main__":
