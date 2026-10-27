@@ -2294,6 +2294,8 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
         sb.rest("PATCH", "messages", params={"id": f"eq.{reply['id']}"},
                 body={"content": final, "thinking": scrub(thinking), "status": "done", "meta": done_meta})
         sb.rest("PATCH", "messages", params={"id": f"eq.{msg['id']}"}, body={"status": "done"})
+        if (not cmd and USED_HELPERS.search("\n".join(tools))) or chat["id"] in FOLLOW:
+            watch_followups(sb, gw, chat, slot)
         USAGE_STATE["poke"] = True  # refresh the account total soon
         log(f"answered message {msg['id']} ({len(final)} chars, {len(thinking)} thinking, "
             f"{done_meta.get('credits', '?')} credits)")
@@ -2337,6 +2339,96 @@ def approve_background(gw: Gateway, sb: Supabase):
 BUSY_CHATS: set = set()
 BUSY_LOCK = threading.Lock()
 BUSY_SLOTS: dict = {}  # chat id -> {"slot", "since"} while that chat's turn is streaming (for steering)
+
+# ── follow-ups: answers Crew writes into a slot with no Panda message behind them ──
+# A chat that starts helpers (spawn_run) ends its turn right away. When they finish, Kiro Crew
+# injects a "[Subagent completion event]" into the same slot and Panda answers it there, but no
+# Panda message asked for it, so nothing carried that answer to the app. The watcher below keeps
+# each such slot's history count; new rows written while the chat is idle in Panda become a new
+# assistant message in the chat (streaming placeholder while Crew is still on it).
+USED_HELPERS = re.compile(r"spawn|sub-?agent|helper|workflow_run", re.I)
+FOLLOW: dict = {}        # chat id -> {"slot", "owner", "seen", "until", "row", "before"}
+FOLLOW_LOCK = threading.Lock()
+FOLLOW_HOURS = 4
+
+
+def _slot_view(gw: Gateway, slot: str, limit: int = 1) -> dict:
+    d = gw.call("GET", f"/api/chat/slots/{slot}?limit={max(1, min(limit, 60))}", timeout=20)
+    return d if isinstance(d, dict) else {}
+
+
+def watch_followups(sb: Supabase, gw: Gateway, chat: dict, slot: str):
+    """Start (or re-arm) watching a chat's slot from its current history length."""
+    try:
+        total = int(_slot_view(gw, slot).get("total") or 0)
+    except Exception as exc:
+        log("follow-up watch:", type(exc).__name__)
+        return
+    with FOLLOW_LOCK:
+        old = FOLLOW.get(chat["id"]) or {}
+        FOLLOW[chat["id"]] = {"slot": slot, "owner": chat["owner"], "seen": total, "row": None, "before": None,
+                              "until": time.time() + FOLLOW_HOURS * 3600}
+    if old.get("row"):  # a follow-up placeholder the new turn overtook: its text is in that turn now
+        _safe(lambda: sb.rest("DELETE", "messages", params={"id": f"eq.{old['row']}"}))
+
+
+def followup_step(sb: Supabase, gw: Gateway):
+    with FOLLOW_LOCK:
+        items = list(FOLLOW.items())
+    with BUSY_LOCK:
+        busy = set(BUSY_SLOTS)
+    for chat_id, w in items:
+        if time.time() > w["until"] and not w["row"]:
+            with FOLLOW_LOCK:
+                FOLLOW.pop(chat_id, None)
+            continue
+        if chat_id in busy or chat_id in BUSY_CHATS:
+            continue  # a Panda turn is running; its end re-arms the count
+        try:
+            view = _slot_view(gw, w["slot"])
+        except Exception:
+            continue
+        total, running = int(view.get("total") or 0), bool(view.get("running"))
+        if total < w["seen"]:  # the slot was cleared or recreated
+            w["seen"] = total
+            continue
+        if total == w["seen"] and not (running and not w["row"]):
+            continue
+        chat = {"id": chat_id, "owner": w["owner"]}
+        if not w["row"]:
+            w["before"] = scan_outputs()
+            w["row"] = sb.rest("POST", "messages", prefer="return=representation", body={
+                "chat_id": chat_id, "owner": w["owner"], "role": "assistant", "status": "streaming",
+                "content": "", "meta": {"followup": True}})[0]["id"]
+            log(f"chat {chat_id}: Panda is answering on its own (helpers finished)")
+        if running:
+            continue  # fill it in when the turn is over
+        try:
+            rows = (_slot_view(gw, w["slot"], total - w["seen"]).get("messages") or [])[-(total - w["seen"]):]
+        except Exception:
+            continue
+        text = "\n\n".join(t for t in (_row_text(m) for m in rows if isinstance(m, dict)
+                                       and m.get("role") in ("assistant", "agent", "bot")) if t.strip())
+        w["seen"] = total
+        if not text.strip():
+            sb.rest("DELETE", "messages", params={"id": f"eq.{w['row']}"})
+        else:
+            published = publish_outputs(sb, chat, w["row"], w["before"] or {}, text)
+            text = scrub(link_files(text, published))
+            sb.rest("PATCH", "messages", params={"id": f"eq.{w['row']}"}, body={
+                "content": text, "status": "done",
+                "meta": {"followup": True, "files": [r["id"] for _, r, inline in published if not inline]}})
+            push(sb, w["owner"], "Panda finished with the helpers", re.sub(r"[#*_`>\[\]]", "", text)[:180],
+                 f"./?c={chat_id}")
+        w["row"], w["before"] = None, None
+
+
+def followup_loop(sb: Supabase, gw: Gateway, stop: threading.Event):
+    while not stop.wait(6):
+        try:
+            followup_step(sb, gw)
+        except Exception as exc:
+            log("follow-up check:", type(exc).__name__)
 
 
 def steer_pending(sb: Supabase, gw: Gateway):
@@ -3414,6 +3506,7 @@ def main():
         stop_evt = threading.Event()
         threading.Thread(target=command_loop, args=(sb, gw, stop_evt), daemon=True).start()
         threading.Thread(target=thinking_listener, args=(gw, stop_evt), daemon=True).start()
+        threading.Thread(target=followup_loop, args=(sb, gw, stop_evt), daemon=True).start()
         threading.Thread(target=thinking_pusher, args=(sb, stop_evt), daemon=True).start()
         pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL_CHATS)
         SESSION_INFO.update(restored=restored, files_restored=files_state, startup_secs=round(time.time() - T0), crew=CREW_VERSION["v"])
