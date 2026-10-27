@@ -74,9 +74,10 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
   }, [streaming, messages]);
 
   const retry = useCallback((m: Message) => {
+    if (busy) return; // one turn at a time in a chat: a retry now would start a second, parallel one
     const question = messages.find((x) => x.id === m.reply_to);
     if (question) onSendMessage(chat, question.content, question.meta.attachments);
-  }, [messages, chat, onSendMessage]);
+  }, [messages, chat, onSendMessage, busy]);
 
   const askSide = useCallback((question: string) => {
     const id = Date.now();
@@ -138,7 +139,7 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
                 onRetry={m.role === "assistant" ? retry : undefined}
                 onOption={(text) => onSendMessage(chat, text)} />
             ))}
-          {!loading && waiting && <PendingReply queued={waiting.status === "pending"} model={chat.model} />}
+          {!loading && waiting && !streaming && <PendingReply queued={waiting.status === "pending"} model={chat.model} />}
           {!loading && <Helpers slot={chat.slot_id} online={online} busy={busy} />}
           {!loading && totals.replies > 0 && (
             <div className="chat-total" title="Kiro credits used by Panda's replies in this chat">

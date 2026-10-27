@@ -2339,9 +2339,16 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
         shot = browser_snapshot(sb, chat, reply["id"], t0) if USED_BROWSER.search("\n".join(tools)) else None
         if shot:
             done_meta["browser"] = shot
-        sb.rest("PATCH", "messages", params={"id": f"eq.{reply['id']}"},
-                body={"content": final, "thinking": scrub(thinking), "status": "done", "meta": done_meta})
-        sb.rest("PATCH", "messages", params={"id": f"eq.{msg['id']}"}, body={"status": "done"})
+        for attempt in range(3):  # a late network blip must not turn a finished answer into an error
+            try:
+                sb.rest("PATCH", "messages", params={"id": f"eq.{reply['id']}"},
+                        body={"content": final, "thinking": scrub(thinking), "status": "done", "meta": done_meta})
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(1.5 * (attempt + 1))
+        _safe(lambda: sb.rest("PATCH", "messages", params={"id": f"eq.{msg['id']}"}, body={"status": "done"}))
         if (not cmd and USED_HELPERS.search("\n".join(tools))) or chat["id"] in FOLLOW:
             watch_followups(sb, gw, chat, slot)
         USAGE_STATE["poke"] = True  # refresh the account total soon
