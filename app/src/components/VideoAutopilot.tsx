@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import * as V from "../lib/video";
 import { signedUrl } from "../lib/files";
 import { PelicanBike, type PelicanStage } from "./PelicanBike";
-import { IconCheck, IconImage, IconRetry, IconX } from "./Icons";
+import { IconCheck, IconImage, IconRetry, IconSend, IconX } from "./Icons";
+import { Logo } from "./Logo";
 
 // ── Autopilot: one idea in. Panda directs, writes, films a draft, checks it, films the final. ──
 
@@ -76,77 +77,90 @@ export function AutopilotDesk(p: {
   }
 
   return (
-    <section className="ap-desk" aria-label="Autopilot">
-      <div className="ap-finder">
-        <i className="ap-corner tl" /><i className="ap-corner tr" /><i className="ap-corner bl" /><i className="ap-corner br" />
-        <div className="ap-finder-top">
-          <span className={`ap-rec ${idea.trim() ? "on" : ""}`}><i />REC</span>
-          <span className="ap-tc">AUTOPILOT</span>
-        </div>
-        <label className="ap-idea">
-          <span className="sr-only">Your idea</span>
-          <textarea rows={3} maxLength={1500} value={idea} onChange={(e) => setIdea(e.target.value)} placeholder={IDEAS[ix]}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); go(); }
-              if (e.key === "Tab" && !idea) { e.preventDefault(); setIdea(IDEAS[ix]); }
-            }} />
-        </label>
-        <div className="ap-finder-foot">
-          {pic ? (
-            <span className="ap-pic">
-              <img src={pic.url} alt="Start picture" />
-              <span>Starts on this picture</span>
-              <button className="icon-btn" onClick={() => setPic(null)} aria-label="Remove the picture"><IconX size={14} /></button>
-            </span>
-          ) : (
-            <label className="ap-addpic">
-              <IconImage size={15} /> Start from a picture
-              <input type="file" accept="image/*" hidden onChange={(e) => { pick(e.target.files?.[0]); e.target.value = ""; }} />
-            </label>
-          )}
-          {!idea && <button className="ap-try" onClick={() => setIdea(IDEAS[ix])}>Use this idea</button>}
-        </div>
-      </div>
+    <div className="ap-compose">
+      {err && <div className="vs-err" role="alert"><IconX size={14} /> {err}</div>}
       {pic && (
         <label className="vs-consent"><input type="checkbox" checked={consent} onChange={(e) => setConsent(e.target.checked)} />
           No real person is shown, or they agreed to be in this video.</label>
       )}
-
-      <div className="ap-plans" role="radiogroup" aria-label="How far Panda goes">
-        <PlanCard on={plan === "full"} onClick={() => setPlan("full")} title="Full film"
-          steps={["Draft", "Check", "Final"]} usd={full.usd} secs={full.secs} />
-        <PlanCard on={plan === "quick"} onClick={() => setPlan("quick")} title="Quick look"
-          steps={["Draft", "Check"]} usd={quick.usd} secs={quick.secs} />
+      <div className="composer ap-composer">
+        {pic && (
+          <span className="ap-pic">
+            <img src={pic.url} alt="Start picture" />
+            <span>Starts on this picture</span>
+            <button className="icon-btn" onClick={() => setPic(null)} aria-label="Remove the picture"><IconX size={14} /></button>
+          </span>
+        )}
+        <label>
+          <span className="sr-only">Your idea</span>
+          <textarea rows={2} maxLength={1500} value={idea} onChange={(e) => setIdea(e.target.value)} placeholder={`Film an idea, e.g. ${IDEAS[ix]}`}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey && !window.matchMedia("(pointer: coarse)").matches) { e.preventDefault(); go(); }
+              if (e.key === "Tab" && !idea) { e.preventDefault(); setIdea(IDEAS[ix]); }
+            }} />
+        </label>
+        <div className="composer-bar">
+          <label className="icon-btn ap-attach" title="Start from a picture" aria-label="Start from a picture">
+            <IconImage size={18} />
+            <input type="file" accept="image/*" hidden onChange={(e) => { pick(e.target.files?.[0]); e.target.value = ""; }} />
+          </label>
+          <div className="ap-planpills" role="radiogroup" aria-label="How far Panda goes">
+            <button role="radio" aria-checked={plan === "full"} className={plan === "full" ? "on" : ""} onClick={() => setPlan("full")}
+              title="Draft, check, final">Full film <em>≈{V.money(full.usd)}</em></button>
+            <button role="radio" aria-checked={plan === "quick"} className={plan === "quick" ? "on" : ""} onClick={() => setPlan("quick")}
+              title="Draft and check only">Quick look <em>≈{V.money(quick.usd)}</em></button>
+          </div>
+          <span className="vs-flex" />
+          <button className="send-btn" onClick={go} disabled={busy || !p.online || !idea.trim()} aria-label="Roll camera"
+            title={`Roll camera · up to ${V.money(worst)}`}>
+            {busy ? <Clapper busy /> : <IconSend size={18} />}
+          </button>
+        </div>
       </div>
-
-      <button className="ap-go" onClick={go} disabled={busy || !p.online || !idea.trim()}>
-        <Clapper busy={busy} />
-        <span>{busy ? "Calling action…" : "Roll camera"}</span>
-        <small>{short ? `needs up to ${V.money(worst)}, only ${V.money(left || 0)} left` : `up to ${V.money(worst)}`}</small>
-      </button>
-      {err && <div className="vs-err" role="alert"><IconX size={14} /> {err}</div>}
-
-      <ol className="ap-decides" aria-label="What Panda decides">
-        <li><b>Shape</b><span>9:16 · 16:9 · 1:1</span></li>
-        <li><b>Length</b><span>3 to 10 s</span></li>
-        <li><b>Look</b><span>style + light</span></li>
-        <li><b>Script</b><span>shots, camera, sound</span></li>
-        <li><b>Check</b><span>dark or frozen? retake</span></li>
-      </ol>
-      <p className="vs-fine">Panda directs on its own and stops if a film would go past your Modal credit. MiniMax H3 videos may not be used in the EU, US, UK or South Korea without MiniMax's permission.</p>
-    </section>
+      <p className="ap-compose-fine">{short ? `Needs up to ${V.money(worst)}, only ${V.money(left || 0)} left on Modal. ` : `Up to ${V.money(worst)} on Modal. `}
+        MiniMax H3 videos may not be used in the EU, US, UK or South Korea without MiniMax's permission.</p>
+    </div>
   );
 }
 
-function PlanCard(p: { on: boolean; onClick: () => void; title: string; steps: string[]; usd: number; secs: number }) {
+/** Panda's first message in an empty Autopilot chat. */
+export function AutopilotHello() {
   return (
-    <button role="radio" aria-checked={p.on} className={`ap-plan ${p.on ? "on" : ""}`} onClick={p.onClick}>
-      <span className="ap-plan-top"><b>{p.title}</b><i className="ap-radio" aria-hidden /></span>
-      <span className="ap-plan-steps">{p.steps.map((s, i) => <span key={s}>{i > 0 && <em aria-hidden>›</em>}{s}</span>)}</span>
-      <span className="ap-plan-price"><b>≈{V.money(p.usd)}</b><small>~{p.secs >= 120 ? `${Math.round(p.secs / 60)} min` : V.duration(p.secs)}</small></span>
-    </button>
+    <div className="msg assistant">
+      <div className="avatar"><Logo size={28} /></div>
+      <div className="msg-body">
+        <div className="prose"><p>Tell me an idea. I direct it, film a draft, check it and make the final. I pick all of this for you:</p></div>
+        <ol className="ap-decides" aria-label="What Panda decides">
+          <li><b>Shape</b><span>9:16 · 16:9 · 1:1</span></li>
+          <li><b>Length</b><span>3 to 10 s</span></li>
+          <li><b>Look</b><span>style + light</span></li>
+          <li><b>Script</b><span>shots, camera, sound</span></li>
+          <li><b>Check</b><span>dark or frozen? retake</span></li>
+        </ol>
+      </div>
+    </div>
   );
 }
+
+/** One film as a chat turn: your idea on the right, Panda's work on the left. */
+export function RunChat(p: Parameters<typeof RunCard>[0]) {
+  const { run } = p;
+  const live = V.runActive(run);
+  const last = run.log[run.log.length - 1]?.text;
+  return (
+    <>
+      <div className="msg user"><div className="bubble">{run.idea}</div></div>
+      <div className="msg assistant">
+        <div className="avatar"><Logo size={28} animated working={live} /></div>
+        <div className="msg-body">
+          {last && run.status !== "directing" && <div className="prose ap-say"><p>{last}</p></div>}
+          <RunCard {...p} chat />
+        </div>
+      </div>
+    </>
+  );
+}
+
 
 function Clapper({ busy }: { busy: boolean }) {
   return (
@@ -166,7 +180,7 @@ const STEPS: { id: V.RunStep; label: string }[] = [
 const ORDER: V.RunStep[] = ["director", "script", "draft", "check", "final", "done"];
 
 export function RunCard(p: { run: V.VideoRun; jobs: Map<string, V.VideoJob>; online: boolean;
-  onWatch: (id: string) => void; onAgain: (r: V.VideoRun) => void; onChange: () => void }) {
+  onWatch: (id: string) => void; onAgain: (r: V.VideoRun) => void; onChange: () => void; chat?: boolean }) {
   const { run } = p;
   const [notes, setNotes] = useState(false);
   const [err, setErr] = useState("");
@@ -189,11 +203,11 @@ export function RunCard(p: { run: V.VideoRun; jobs: Map<string, V.VideoJob>; onl
   }
 
   return (
-    <article className={`ap-run ${run.status}`} aria-live={live ? "polite" : undefined}>
+    <article className={`ap-run ${run.status}${p.chat ? " in-chat" : ""}`} aria-live={live ? "polite" : undefined}>
       <header className="ap-run-head">
         <div>
           <h3 className="serif">{run.title || "Untitled"}</h3>
-          <p>“{run.idea.length > 110 ? run.idea.slice(0, 108) + "…" : run.idea}”</p>
+          {!p.chat && <p>“{run.idea.length > 110 ? run.idea.slice(0, 108) + "…" : run.idea}”</p>}
         </div>
         {live ? <button className="vs-link" onClick={stop} disabled={!p.online}>Stop</button>
           : <button className="icon-btn" onClick={dismiss} disabled={!p.online} aria-label="Hide this film"><IconX size={15} /></button>}

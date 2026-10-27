@@ -3,7 +3,7 @@ import * as V from "../lib/video";
 import { signedUrl } from "../lib/files";
 import { useSettings } from "../lib/settings";
 import { PelicanBike, type PelicanStage } from "./PelicanBike";
-import { AutopilotDesk, CreditMeter, CreditSheet, RunCard } from "./VideoAutopilot";
+import { AutopilotDesk, AutopilotHello, CreditMeter, CreditSheet, RunChat } from "./VideoAutopilot";
 import { IconArrowRight, IconEdit, IconImage, IconRetry, IconSparkle, IconTrash, IconX } from "./Icons";
 import "./VideoTab.css";
 
@@ -102,6 +102,8 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
   const byId = useMemo(() => new Map(jobs.map((j) => [j.id, j])), [jobs]);
   const runs = useMemo(() => [...(file?.runs || [])].filter((r) => !r.hidden)
     .sort((a, b) => Number(V.runActive(b)) - Number(V.runActive(a)) || b.created - a.created).slice(0, 4), [file]);
+  const chatRuns = useMemo(() => [...(file?.runs || [])].filter((r) => !r.hidden).sort((a, b) => a.created - b.created).slice(-12), [file]);
+  const chatEnd = useRef<HTMLDivElement>(null);
   // Autopilot films show their own render inside their card; "On set" keeps the rest.
   const running = jobs.filter((j) => V.active(j) && !(j.run && runs.some((r) => r.id === j.run))).sort((a, b) =>
     (a.status === "rendering" ? 0 : 1) - (b.status === "rendering" ? 0 : 1) || a.created - b.created);
@@ -269,16 +271,28 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
       </div>
       {!online && <div className="vs-offline">Panda is off. Your videos are all here; press Start to make new ones.</div>}
 
-      <div className="vs-grid">
-        {pilot === "auto" ? (
+      {pilot === "auto" ? (
+        <div className="ap-chat">
+          <div className="ap-thread">
+            {chatRuns.length === 0 && <AutopilotHello />}
+            {chatRuns.map((r) => (
+              <RunChat key={r.id} run={r} jobs={byId} online={online} onWatch={(id) => setOpen(id)}
+                onChange={() => { hotUntil.current = Date.now() + 20000; setKick((k) => k + 1); }}
+                onAgain={(old) => restart(old)} />
+            ))}
+            <div ref={chatEnd} />
+          </div>
           <AutopilotDesk userId={userId} online={online} usage={usage} stats={stats} rate={rate} warm={gpuWarm}
             onStarted={(run) => {
               setFile((f) => (f ? { ...f, runs: [...(f.runs || []), run] } : { v: 2, at: Date.now() / 1000, jobs: [], runs: [run], budget, spent, rate_usd_s: rate }));
               hotUntil.current = Date.now() + 30000;
               setKick((k) => k + 1);
-              window.setTimeout(() => queueRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 120);
+              window.setTimeout(() => chatEnd.current?.scrollIntoView({ behavior: "smooth", block: "end" }), 120);
             }} />
-        ) : (
+        </div>
+      ) : (
+      <div className="vs-grid">
+        {(
         <section className="vs-slate" aria-label="New video">
           <div className="vs-slate-top" aria-hidden><span /><span /><span /><span /><span /><span /><span /></div>
           <div className="vs-modes" role="radiogroup" aria-label="Type of video">
@@ -401,16 +415,6 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
 
         <section className="vs-side">
           <div ref={queueRef} />
-          {runs.length > 0 && (
-            <div className="ap-runs">
-              <h2>Autopilot</h2>
-              {runs.map((r) => (
-                <RunCard key={r.id} run={r} jobs={byId} online={online} onWatch={(id) => setOpen(id)}
-                  onChange={() => { hotUntil.current = Date.now() + 20000; setKick((k) => k + 1); }}
-                  onAgain={(old) => restart(old)} />
-              ))}
-            </div>
-          )}
           {running.length > 0 && (
             <div className="vs-queue">
               <h2>On set</h2>
@@ -439,6 +443,7 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
           )}
         </section>
       </div>
+      )}
 
       {openJob && (
         <Screening job={openJob} online={online} onClose={() => setOpen("")} onFinal={() => again(openJob, "final", true)}
