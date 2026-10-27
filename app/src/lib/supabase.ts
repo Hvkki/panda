@@ -6,6 +6,39 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
   realtime: { params: { eventsPerSecond: 20 } },
 });
 
+/** Run `cb` whenever the app comes back: tab/app visible again, window focused, network back. A phone that
+ *  sleeps (or a background tab) drops the live connection, and every change made meanwhile is never sent
+ *  again -- the chat looked frozen until a reload. Callers re-read their data here. Returns a cleanup. */
+export function onResume(cb: () => void): () => void {
+  let last = 0;
+  const fire = () => {
+    if (document.visibilityState !== "visible") return;
+    const now = Date.now();
+    if (now - last < 1500) return; // visible + focus arrive together
+    last = now;
+    cb();
+  };
+  document.addEventListener("visibilitychange", fire);
+  window.addEventListener("focus", fire);
+  window.addEventListener("online", fire);
+  return () => {
+    document.removeEventListener("visibilitychange", fire);
+    window.removeEventListener("focus", fire);
+    window.removeEventListener("online", fire);
+  };
+}
+
+/** For `.subscribe(...)`: re-read when the live channel (re)joins, so events missed while it was down are
+ *  fetched. The first join is skipped -- the caller already loaded. */
+export function onRejoin(load: () => void) {
+  let joined = false;
+  return (status: string) => {
+    if (status !== "SUBSCRIBED") return;
+    if (joined) load();
+    joined = true;
+  };
+}
+
 export type Chat = {
   id: string;
   owner: string;

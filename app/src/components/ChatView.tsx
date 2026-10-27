@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { supabase, type Chat, type Message } from "../lib/supabase";
+import { onRejoin, onResume, supabase, type Chat, type Message } from "../lib/supabase";
 import { sideAsk } from "../lib/commands";
 import { fmtCredits } from "../lib/usage";
 import { useT } from "../lib/i18n";
@@ -29,16 +29,26 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
   const [sides, setSides] = useState<Side[]>([]);
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
+  const reload = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    supabase.from("messages").select("*").eq("chat_id", chat.id).order("id").then(({ data }) => {
-      if (!alive) return;
-      setMessages((data as Message[]) || []);
-      setLoading(false);
-      stick.current = true;
-    });
+    // Full re-read: the first load, and again whenever the live link may have missed changes.
+    const load = (first = false) => supabase.from("messages").select("*").eq("chat_id", chat.id).order("id")
+      .then(({ data, error }) => {
+        if (!alive || error || !data) { if (alive && first) setLoading(false); return; }
+        const rows = data as Message[];
+        // A re-read can land just after a newer live update of a reply still being written: keep the longer text.
+        setMessages((prev) => first ? rows : rows.map((r) => {
+          const p = prev.find((m) => m.id === r.id);
+          return p && r.status === "streaming" && p.status === "streaming" &&
+            (p.content || "").length > (r.content || "").length ? p : r;
+        }));
+        setLoading(false);
+        if (first) stick.current = true;
+      });
+    load(true);
     const ch = supabase.channel(`chat-${chat.id}`)
       .on("postgres_changes", { event: "*", schema: "public", table: "messages", filter: `chat_id=eq.${chat.id}` },
         (p) => {
@@ -52,8 +62,10 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
             return next;
           });
         })
-      .subscribe();
-    return () => { alive = false; supabase.removeChannel(ch); };
+      .subscribe(onRejoin(() => load()));
+    const off = onResume(() => load());
+    reload.current = () => load();
+    return () => { alive = false; supabase.removeChannel(ch); off(); reload.current = null; };
   }, [chat.id]);
 
   // Keep the view pinned to the bottom while streaming, unless the user scrolled up.
@@ -64,6 +76,15 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
 
   const streaming = messages.find((m) => m.role === "assistant" && (m.status === "streaming" || m.status === "waiting"));
   const busy = !!streaming || messages.some((m) => m.role === "user" && (m.status === "processing"));
+
+  // Safety net while Panda answers: a live link can drop silently with no error at all, so re-read every
+  // few seconds until the answer is done. Nothing runs when the chat is idle.
+  const inFlight = busy || messages.some((m) => m.role === "user" && m.status === "pending");
+  useEffect(() => {
+    if (!inFlight) return;
+    const id = window.setInterval(() => { if (!document.hidden) reload.current?.(); }, 6000);
+    return () => window.clearInterval(id);
+  }, [inFlight]);
 
   const stop = useCallback(() => {
     if (streaming) { supabase.from("messages").update({ cancel: true }).eq("id", streaming.id).then(() => {}); return; }

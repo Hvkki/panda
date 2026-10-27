@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { sessionAction, supabase, type WorkerSession } from "../lib/supabase";
+import { onRejoin, onResume, sessionAction, supabase, type WorkerSession } from "../lib/supabase";
 import { useT } from "../lib/i18n";
 import { IconPower } from "./Icons";
 
@@ -25,14 +25,20 @@ export function useWorker(userId: string) {
     };
     const load = () => supabase.from("worker_sessions").select("*").eq("owner", userId)
       .order("started_at", { ascending: false }).limit(3)
-      .then(({ data }) => setW(compute((data as WorkerSession[]) ?? [])));
+      .then(({ data, error }) => {
+        // A failed read (phone just woke, sign-in token still refreshing) is not "no session": keep what we had.
+        // It used to show "not started" while Panda was running.
+        if (error || !data) return;
+        setW(compute(data as WorkerSession[]));
+      });
     load();
     const ch = supabase.channel("worker")
       .on("postgres_changes", { event: "*", schema: "public", table: "worker_sessions", filter: `owner=eq.${userId}` },
         () => load())
-      .subscribe();
+      .subscribe(onRejoin(load));
     const timer = window.setInterval(load, 30000); // heartbeats age out even without events
-    return () => { supabase.removeChannel(ch); window.clearInterval(timer); };
+    const off = onResume(load);
+    return () => { supabase.removeChannel(ch); window.clearInterval(timer); off(); };
   }, [userId]);
   return w;
 }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
-import { sessionAction, supabase, type Chat, type Notification } from "./lib/supabase";
+import { onRejoin, onResume, sessionAction, supabase, type Chat, type Notification } from "./lib/supabase";
 import { SettingsProvider, useSettings } from "./lib/settings";
 import { greetingKey, useT } from "./lib/i18n";
 import { Login } from "./components/Login";
@@ -96,8 +96,9 @@ function Shell({ userId, email }: { userId: string; email: string }) {
     load();
     const ch = supabase.channel("chats")
       .on("postgres_changes", { event: "*", schema: "public", table: "chats", filter: `owner=eq.${userId}` }, load)
-      .subscribe();
-    return () => { supabase.removeChannel(ch); };
+      .subscribe(onRejoin(load));
+    const off = onResume(load);
+    return () => { supabase.removeChannel(ch); off(); };
   }, [userId]);
 
   // Notifications (scheduled task results) + browser notification when a new one lands.
