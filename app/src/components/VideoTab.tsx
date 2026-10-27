@@ -126,6 +126,14 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
     first: first?.path, last: last?.path, title: idea.trim().slice(0, 70),
   });
 
+  // A stale worker (started before a feature shipped) answers "unknown op …". Say what to do.
+  const showErr = (e: unknown) => {
+    const msg = String((e as Error)?.message || e);
+    setErr(/unknown op/i.test(msg)
+      ? "Panda needs a restart to use this. Press Stop, then Start, then reload."
+      : msg);
+  };
+
   async function write() {
     setErr("");
     if (!idea.trim()) { setErr("Type an idea first."); return; }
@@ -135,7 +143,7 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
       setScript(V.toScript(r.prompt));
       setBy(r.by);
     } catch (e) {
-      setErr(String((e as Error).message || e));
+      showErr(e);
     } finally {
       setWriting(false);
     }
@@ -162,7 +170,7 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
       setKick((k) => k + 1);
       window.setTimeout(() => queueRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 120);
     } catch (e) {
-      setErr(String((e as Error).message || e));
+      showErr(e);
     } finally {
       setBusy("");
     }
@@ -181,7 +189,7 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
       setKick((k) => k + 1);
       window.setTimeout(() => queueRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 120);
     } catch (e) {
-      setErr(String((e as Error).message || e));
+      showErr(e);
     }
   }
 
@@ -193,7 +201,7 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
       hotUntil.current = Date.now() + 30000;
       setKick((k) => k + 1);
     } catch (e) {
-      setErr(String((e as Error).message || e));
+      showErr(e);
     }
   }
 
@@ -208,11 +216,11 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
     if (!confirm(`Delete “${j.title || "this video"}”?`)) return;
     setFile((f) => (f ? { ...f, jobs: f.jobs.filter((x) => x.id !== j.id) } : f));
     setOpen("");
-    try { await V.videoDelete(j.id); } catch (e) { setErr(String((e as Error).message || e)); setKick((k) => k + 1); }
+    try { await V.videoDelete(j.id); } catch (e) { showErr(e); setKick((k) => k + 1); }
   }
 
   async function stop(j: V.VideoJob) {
-    try { await V.videoCancel(j.id); setKick((k) => k + 1); } catch (e) { setErr(String((e as Error).message || e)); }
+    try { await V.videoCancel(j.id); setKick((k) => k + 1); } catch (e) { showErr(e); }
   }
 
   async function pick(which: "first" | "last", f: File | undefined) {
@@ -223,7 +231,7 @@ export function VideoPage({ userId, online }: { userId: string; online: boolean 
       const ref = { path, url: URL.createObjectURL(f), name: f.name };
       if (which === "first") setFirst(ref); else setLast(ref);
     } catch (e) {
-      setErr(String((e as Error).message || e));
+      showErr(e);
     }
   }
 
