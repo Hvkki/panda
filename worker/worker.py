@@ -218,8 +218,8 @@ def install():
     sh("kirocrew config set agent.tool_search_min_pct 0")
     sh("kirocrew config set agent.tool_search_min_tokens 0")
     # Cheap model for background work: auto-titles, memory consolidation, heartbeats
-    # all run Kiro Crew's "background" role. GLM-5 keeps those nearly free.
-    sh("kirocrew config set agent.role_models '{\"background\": \"glm-5\"}'")
+    # all run Kiro Crew's "background" role. Haiku 5.5 is fast and cheap and writes better than GLM-5.
+    sh("kirocrew config set agent.role_models '{\"background\": \"claude-haiku-5.5\"}'")
     # Libraries the Panda skills use (PDF/DOCX/PPTX, image work, phone push).
     sh(f"{sys.executable} -m pip install -q reportlab python-docx python-pptx pillow pywebpush websocket-client", timeout=600)
 
@@ -1280,6 +1280,22 @@ def ensure_slot(sb: Supabase, gw: Gateway, chat: dict, settings: dict) -> tuple[
     return slot, needs_replay
 
 
+# /compact writes a summary of the chat; a small fast model does that well for a fraction of the credits.
+# Switch the slot to it just for the /compact turn. SLOT_OPTS then no longer matches the chat's model, so
+# the next message's ensure_slot() switches the chat straight back to the model the user picked.
+COMPACT_MODEL = str(CFG.get("compact_model", "claude-haiku-5.5"))
+
+
+def use_compact_model(gw: "Gateway", slot: str):
+    if not COMPACT_MODEL:
+        return
+    try:
+        gw.call("POST", f"/api/chat/slots/{slot}/model", {"model": COMPACT_MODEL})
+        have = SLOT_OPTS.get(slot, (None, None, None))
+        SLOT_OPTS[slot] = (COMPACT_MODEL, None, have[2])  # effort re-applied with the chat model next turn
+    except Exception as exc:
+        log("compact model not applied:", exc)
+
 def replay_prefix(sb: Supabase, chat_id: str, before_id: int, limit: int = 30) -> str:
     rows = sb.rest("GET", "messages", params={
         "chat_id": f"eq.{chat_id}", "id": f"lt.{before_id}", "role": "in.(user,assistant)",
@@ -2169,6 +2185,8 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             PENDING_HINTS.add(slot)
         if cmd in RESET_COMMANDS:
             PROJECT_APPLIED.pop(slot, None)
+        if cmd == "/compact":
+            use_compact_model(gw, slot)
         if needs_replay:
             PENDING_REPLAY.add(slot)
         log(f"chat {chat['id']}: command {cmd}")
