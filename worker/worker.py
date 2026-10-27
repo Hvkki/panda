@@ -1195,10 +1195,19 @@ def ensure_slot(sb: Supabase, gw: Gateway, chat: dict, settings: dict) -> tuple[
     """Return (slot, needs_replay); applies the chat's model, effort and approval mode."""
     slot = chat.get("slot_id")
     needs_replay = False
-    if not slot or (slot not in READY_SLOTS and slot not in live_slots(gw)):
+    # A slot key saved before the fix below can be a slug of the chat's URL title; such a key
+    # breaks /api/chat/slots/{slot}/side and 404s. Force a clean recreate when the stored key
+    # is not path-safe (contains anything outside [A-Za-z0-9._-]).
+    bad_key = bool(slot) and not re.fullmatch(r"[A-Za-z0-9._-]+", slot)
+    if not slot or bad_key or (slot not in READY_SLOTS and slot not in live_slots(gw)):
         agent = chat["agent"] or AGENT
+        # Crew slugifies the name into the slot KEY, and that key goes into URL paths
+        # (/api/chat/slots/{slot}/...). A free-form title that is a URL ("https://m.youtube.com/...")
+        # slugs into a key the /side sub-route can't match -> 404. Name the slot by the stable chat id,
+        # which is already a clean uuid-like token, so the derived key is always path-safe.
+        slot_name = f"panda-{chat['id']}"[:60]
         created = gw.call("POST", "/api/chat/slots",
-                          {"name": (chat["title"] or "chat")[:60], **({"agent": agent} if agent else {})})
+                          {"name": slot_name, **({"agent": agent} if agent else {})})
         new = created.get("key") or created.get("id") or created.get("slot") or created.get("name")
         if not new:
             raise RuntimeError(f"slot create returned no key: {list(created)}")
@@ -2845,13 +2854,14 @@ def side_ask(sb: Supabase, gw: Gateway, chat_id: str, question: str, timeout: fl
     if not question:
         raise ValueError("ask a question after /btw")
     slot, _ = ensure_slot(sb, gw, rows[0], user_settings(sb, OWNER))
-    gw.call("POST", f"/api/chat/slots/{slot}/side/open", {})
-    r = gw.call("POST", f"/api/chat/slots/{slot}/side/turn", {"question": question})
+    q = quote(slot, safe="")  # slot can be an old URL-derived key; keep the path well-formed
+    gw.call("POST", f"/api/chat/slots/{q}/side/open", {})
+    r = gw.call("POST", f"/api/chat/slots/{q}/side/turn", {"question": question})
     run_id = r.get("run_id") or ""
     t0 = time.time()
     while time.time() - t0 < timeout:
         time.sleep(1.2)
-        st = gw.call("GET", f"/api/chat/slots/{slot}/side")
+        st = gw.call("GET", f"/api/chat/slots/{q}/side")
         msgs = [m for m in (st.get("messages") or []) if isinstance(m, dict)]
         if not run_id:  # it was queued behind another side question: find the run it got
             mine = [m for m in msgs if m.get("role") == "user" and (m.get("content") or "").strip() == question]
