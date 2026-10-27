@@ -1,0 +1,57 @@
+/* Pelican on a bicycle: the card shown while a video renders. Same paper look as the drawing panda. */
+.pbk-card { margin: 4px 0 12px; width: min(420px, 100%); padding: 10px 12px 12px; border-radius: var(--r, 14px);
+  background: #FAF9F5; border: 1px solid #E8E1D5; box-sizing: border-box; color: #3D3929; }
+[data-theme="dark"] .pbk-card { border-color: #4a443d; filter: brightness(.94); }
+.pbk { display: block; width: 100%; height: auto; border-radius: 8px; overflow: hidden; }
+.pbk-caption { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-top: 6px;
+  font-size: .88em; color: #5C564C; }
+.pbk-caption span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pbk-caption b { color: #C15F3C; font-variant-numeric: tabular-nums; font-weight: 650; }
+.pbk-bar { height: 4px; margin-top: 6px; border-radius: 99px; background: #EDE6DA; overflow: hidden; }
+.pbk-bar i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #D97757, #E8A07E);
+  transition: width .4s linear; }
+
+/* compact: one row in the job list — small scene left, caption and bar right */
+.pbk-card.pbk-compact { width: 100%; margin: 0; padding: 6px 10px 6px 6px; display: grid; grid-template-columns: 132px 1fr;
+  column-gap: 10px; align-items: center; }
+.pbk-compact .pbk { grid-row: span 2; }
+.pbk-compact .pbk-caption { font-size: .82em; margin-top: 0; align-self: end; }
+.pbk-compact .pbk-bar { align-self: start; }
+
+/* pencil sketch-in on mount */
+.pbk .pbk-line { stroke-dasharray: 1; stroke-dashoffset: 1; animation: pbk-draw .9s cubic-bezier(.3, .6, .3, 1) calc(var(--i, 0) * .07s) both; }
+.pbk .pbk-fill { animation: pbk-fade .5s ease calc(.45s + var(--i, 0) * .07s) both; }
+@keyframes pbk-draw { to { stroke-dashoffset: 0; } }
+@keyframes pbk-fade { from { opacity: 0; } to { opacity: 1; } }
+
+/* moving parts are driven by JS transforms; these give them life */
+.pbk-wheel, .pbk-crank, .pbk-pelican, .pbk-scene { will-change: transform; }
+.pbk-wing { animation: pbk-flutter 1.1s ease-in-out infinite; }
+.pbk .pbk-feather { animation: pbk-draw .9s ease calc(var(--i, 0) * .07s) both, pbk-ruffle .55s ease-in-out 1s infinite alternate; }
+.pbk-beak { animation: pbk-wobble 1.7s ease-in-out infinite; }
+@keyframes pbk-flutter { 0%, 100% { transform: rotate(0deg); } 50% { transform: rotate(-3deg); } }
+@keyframes pbk-ruffle { from { transform: translateX(0); } to { transform: translateX(-1.4px); } }
+@keyframes pbk-wobble { 0%, 100% { transform: rotate(0deg) scaleY(1); } 50% { transform: rotate(1.5deg) scaleY(1.04); } }
+
+/* decoding / saving: one wing up, waving */
+.pbk-card[data-stage="decoding"] .pbk-wing, .pbk-card[data-stage="saving"] .pbk-wing { animation: pbk-wave .7s ease-in-out infinite alternate; }
+@keyframes pbk-wave { from { transform: rotate(-22deg); } to { transform: rotate(-34deg); } }
+
+/* done: stop flourishes, pop the check mark */
+.pbk-done .pbk-wing, .pbk-done .pbk-beak { animation: none; }
+.pbk-check { transform-box: fill-box; transform-origin: center; animation: pbk-pop .45s cubic-bezier(.3, 1.6, .5, 1) both; }
+@keyframes pbk-pop { from { transform: scale(0); } to { transform: scale(1); } }
+
+/* failed: the bike tips over a little and everything goes grey and still */
+.pbk-failed .pbk { filter: grayscale(1) opacity(.75); }
+.pbk-failed .pbk-bike, .pbk-failed .pbk-pelican, .pbk-failed .pbk-legs { transform-box: view-box; transform-origin: 150px 184px;
+  transform: rotate(-7deg); transition: transform .6s ease; }
+.pbk-failed .pbk-wing, .pbk-failed .pbk-beak, .pbk-failed .pbk-feather { animation: none; }
+.pbk-failed .pbk-caption b { color: #8A847A; }
+
+/* "Remove animations" on: keep the wheels and pedalling (JS, calmer), drop the extras only */
+@media (prefers-reduced-motion: reduce) {
+  .pbk-wing, .pbk-beak, .pbk .pbk-feather { animation: none; }
+  .pbk .pbk-line { animation-duration: .01s; animation-delay: 0s; }
+  .pbk .pbk-fill { animation: none; }
+}
