@@ -8,8 +8,8 @@ scheduled tasks, skills, tools, multiple sessions) that runs on `kiro-cli`.
 - **Backend:** Supabase project `ufvskhagspdjslomzwjh` (sign-in, Postgres with row-level
   security, Realtime, Storage, one Edge Function).
 - **Worker:** a Kaggle notebook (`vladraf/kirocrew-worker`) that runs Kiro Crew. You press
-  **Start** in the app. It runs until you press **Stop** or it reaches its 11-hour safety limit.
-  It never starts itself again.
+  **Start** in the app. It runs until you press **Stop**. Shortly before its 11-hour safety limit it
+  hands over to a fresh run by itself (see [docs/architecture.md](docs/architecture.md#hand-off-at-the-time-limit)).
 
 Earlier names: Embra.
 
@@ -61,7 +61,9 @@ Details: [docs/architecture.md](docs/architecture.md).
   [docs/status.md](docs/status.md)). Turn off Supabase → Authentication → Sign In / Providers →
   Email → "Allow new users to sign up". The database trigger `block_signups` refuses only a sixth
   account, so it does not replace that switch.
-- **Kaggle runs start only when a person presses Start.** Do not add automatic restarts.
+- **Kaggle runs start only when a person presses Start, or by the worker's own hand-off** (one successor,
+  for the same account, only after 30 min of running and only while the old run is alive). Do not add other
+  automatic restarts. Pressing Stop never restarts.
 - **The worker runs unsandboxed on Kaggle**, because Kaggle blocks user namespaces. The owner
   accepted that. The app's approval flow is the control on tool use.
 - **Do not claim a UI works from a still screenshot.** Motion, live streams, taps and push

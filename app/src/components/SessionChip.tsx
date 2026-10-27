@@ -9,17 +9,23 @@ export type Worker = { session: WorkerSession | null; alive: boolean };
 export function useWorker(userId: string) {
   const [w, setW] = useState<Worker>({ session: null, alive: false });
   useEffect(() => {
-    const compute = (s: WorkerSession | null): Worker => {
-      if (!s) return { session: null, alive: false };
+    const isAlive = (s: WorkerSession): boolean => {
       const beat = s.heartbeat_at ? (Date.now() - Date.parse(s.heartbeat_at)) / 1000 : Infinity;
       const age = (Date.now() - Date.parse(s.started_at)) / 1000;
-      const alive = (["running", "stopping"].includes(s.status) && beat < 90) ||
-        (["requested", "starting"].includes(s.status) && age < 900);
-      return { session: s, alive };
+      // A successor that is installing and waiting for the old run to finish heartbeats; it may be older than 15 min.
+      return (["running", "stopping"].includes(s.status) && beat < 90) ||
+        (["requested", "starting"].includes(s.status) && (age < 900 || beat < 90));
+    };
+    // During a hand-off the old run and its successor are both alive: show the one that is serving.
+    const compute = (rows: WorkerSession[]): Worker => {
+      if (!rows.length) return { session: null, alive: false };
+      const live = rows.filter(isAlive);
+      const s = live.find((r) => r.status === "running") ?? live[0] ?? rows[0];
+      return { session: s, alive: isAlive(s) };
     };
     const load = () => supabase.from("worker_sessions").select("*").eq("owner", userId)
-      .order("started_at", { ascending: false }).limit(1)
-      .then(({ data }) => setW(compute((data?.[0] as WorkerSession) ?? null)));
+      .order("started_at", { ascending: false }).limit(3)
+      .then(({ data }) => setW(compute((data as WorkerSession[]) ?? [])));
     load();
     const ch = supabase.channel("worker")
       .on("postgres_changes", { event: "*", schema: "public", table: "worker_sessions", filter: `owner=eq.${userId}` },
@@ -36,7 +42,11 @@ export function SessionChip({ worker }: { worker: Worker }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const s = worker.session;
-  const state = !worker.alive ? "off" : s?.stop_requested || s?.status === "stopping" ? "stopping"
+  // A run that restarts itself before Kaggle's time limit is "restarting", never "offline".
+  const restarting = worker.alive && !s?.stop_requested &&
+    ((typeof s?.info?.handoff_from === "string" && s.status !== "running") ||
+      (s?.status === "stopping" && !!s.info?.handoff));
+  const state = !worker.alive ? "off" : restarting ? "starting" : s?.stop_requested || s?.status === "stopping" ? "stopping"
     : s?.status === "running" ? "on" : "starting";
 
   const [, tick] = useState(0);
@@ -60,7 +70,7 @@ export function SessionChip({ worker }: { worker: Worker }) {
     }
   };
 
-  const label = state === "on" ? <><span className="session-word">{t("running")} · </span><span className="session-up">{up}</span></> : state === "starting" ? t("starting")
+  const label = state === "on" ? <><span className="session-word">{t("running")} · </span><span className="session-up">{up}</span></> : state === "starting" ? t(restarting ? "restarting" : "starting")
     : state === "stopping" ? t("stopping") : t("offline");
   return (
     <div className="session">
