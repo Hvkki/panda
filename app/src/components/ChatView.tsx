@@ -157,7 +157,7 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
         )}
         <Composer model={chat.model} effort={chat.effort} onModel={onModel} online={online}
           onSend={(text, att, meta) => onSendMessage(chat, text, att, meta)} onCommand={command}
-          onStop={stop} busy={busy} autoFocus context={context} />
+          onStop={stop} busy={busy} autoFocus context={context} draftKey={chat.id} />
       </div>
     </div>
   );

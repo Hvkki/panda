@@ -120,6 +120,7 @@ function ProjectDetail({ project, userId, chats, onOpenProject, onOpenChat, onSt
       <div className="project-layout">
         <div className="project-main">
           <Composer model={draft.model} effort={draft.effort} onModel={onDraft} online={online}
+            draftKey={`project-${project.id}`}
             onSend={(text, att) => onStartChat(text, att, project.id)} />
           <h3 className="section-title">Chats in this project</h3>
           {projectChats.length === 0 && <p className="muted small">Start a chat above — Panda will use this project's instructions and files.</p>}

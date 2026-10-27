@@ -236,7 +236,7 @@ function Shell({ userId, email }: { userId: string; email: string }) {
             <div className="chat-bottom home-bottom">
               <Composer key={prefill} initialText={prefill} model={draft.model} effort={draft.effort} online={online}
                 onModel={(model, effort) => setDraft({ model, effort })} onTyping={setTyping}
-                onCommand={(n) => appCommand(n)} context={{ pct: 0, reset: true }}
+                onCommand={(n) => appCommand(n)} context={{ pct: 0, reset: true }} draftKey="home"
                 onSend={(text, att, meta) => { setPrefill(""); startChat(text, att, null, meta); }} autoFocus />
             </div>
           </div>

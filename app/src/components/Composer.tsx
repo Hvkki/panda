@@ -25,6 +25,9 @@ type Props = {
   busy?: boolean;
   autoFocus?: boolean;
   initialText?: string;
+  /** When set, the typed text is saved to localStorage under this key and restored on reload,
+   *  so a draft survives closing the app or browser. Cleared on send. */
+  draftKey?: string;
   /** The chat's context window use after the last reply (the ring next to the model). */
   context?: ContextUsage | null;
   onTyping?: (typing: boolean) => void;
@@ -34,10 +37,16 @@ type Props = {
 const GROUP_TITLE = { panda: "commandsPanda", crew: "commandsCrew", shortcut: "commandsShortcuts" } as const;
 
 export function Composer({ model, effort, onModel, onSend, onCommand, onStop, busy, autoFocus, initialText = "",
-  context, onTyping, online = false }: Props) {
+  draftKey, context, onTyping, online = false }: Props) {
   const { settings } = useSettings();
   const t = useT();
-  const [text, setText] = useState(initialText);
+  const draftStore = draftKey ? `panda.draft.${draftKey}` : "";
+  const readDraft = () => {
+    if (!draftStore) return "";
+    try { return localStorage.getItem(draftStore) || ""; } catch { return ""; }
+  };
+  // A one-off prefill (initialText) wins; otherwise restore the saved draft for this chat.
+  const [text, setText] = useState(initialText || readDraft());
   const [files, setFiles] = useState<(Attachment & { uploading?: boolean; error?: string })[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [active, setActive] = useState(0);
@@ -81,6 +90,20 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
   }, [text]);
   useEffect(() => { if (autoFocus) ref.current?.focus(); }, [autoFocus]);
   useEffect(() => { onTyping?.(text.length > 0); }, [text.length > 0]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Save the draft as it is typed, so it survives closing the app or browser; remove it when empty.
+  useEffect(() => {
+    if (!draftStore) return;
+    try {
+      if (text) localStorage.setItem(draftStore, text);
+      else localStorage.removeItem(draftStore);
+    } catch { /* storage full or blocked: a lost draft is not worth crashing the composer */ }
+  }, [text, draftStore]);
+  // Switching to another chat: load that chat's saved draft (unless a prefill was handed in).
+  const firstKey = useRef(true);
+  useEffect(() => {
+    if (firstKey.current) { firstKey.current = false; return; } // initial value already set in useState
+    setText(initialText || readDraft());
+  }, [draftStore]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!notice) return;
     const id = window.setTimeout(() => setNotice(""), 3200);
