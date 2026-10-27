@@ -15,7 +15,7 @@ set -a; . ./panda-api-keys.env; set +a
 - **Read the worker log:** `kaggle kernels output vladraf/kirocrew-worker -p out -o`. Look for
   `running; waiting for messages` and `answered message N`.
 - **A running worker keeps its code.** After any worker change: `./scripts/deploy-worker.sh`,
-  then Stop, then Start.
+  then Stop, then Start (or wait: each hand-off, ~10 h 35 m into a run, starts the latest deployed code).
 
 ## Deploy
 
@@ -27,7 +27,9 @@ set -a; . ./panda-api-keys.env; set +a
   `supabase/migration_002_app.sql`, then `supabase/migration_003_panda.sql`. Safe to re-run.
 - **`session` function:** Supabase dashboard → Edge Functions → `session`. Paste
   `supabase/functions/session/index.ts`. Set the function secrets `KAGGLE_API_TOKEN`,
-  `KAGGLE_KERNEL` and `KAGGLE_DATASET` (values in the keys file).
+  `KAGGLE_KERNEL` and `KAGGLE_DATASET` (values in the keys file). **Redeploy this function for the
+  hand-off**: it adds the `handoff` action; without it the worker cannot start its successor and just stops
+  at the time guard.
 - **One Kaggle notebook (one CPU) per account:** `kirocrew-state/config/kernels.json` maps a user id
   to its notebook, e.g. `{"<user id>": "vladraf/panda-worker-tetiana"}`; unlisted accounts use
   `KAGGLE_KERNEL`. Create the notebook once (a private CPU script with internet and the
@@ -42,6 +44,23 @@ set -a; . ./panda-api-keys.env; set +a
   The signing key lives in `kirocrew-state/config/android/`, never in git; losing it means the
   next APK cannot install over the old one. Its fingerprint is in
   `app/public/.well-known/assetlinks.json`; if that file is not live, the app shows a URL bar.
+
+## Automatic restart (hand-off) and saved files
+
+- **Watch one:** the worker log shows `hand-off: successor <id> requested`, then `ready; waiting for run`
+  on the new run, `successor is ready; no new messages from here on` on the old one, and `files restored`.
+  `worker_sessions.info` has `handoff` / `handoff_from`, `files` (what the last save wrote) and `files_restored`.
+- **Turn it off:** `"auto_restart": false` in `worker.json` (then `python3 scripts/kaggle-dataset-sync.py`),
+  or `PANDA_AUTO_RESTART=0`. Work-file saving has its own switch, `"save_files": false`.
+- **Test cheaply:** a run younger than 30 min is refused by the function (restart-loop guard), so a hand-off
+  cannot be tried with a tiny `max_runtime_secs` below ~1 h. Use `max_runtime_secs: 3300` and
+  `handoff_lead_secs: 1500` (hand-off at 30 min).
+- **If Kaggle cancels the old run when the new version is pushed** (not seen in the docs, untested here): set
+  `"handoff_mode": "sequential"`. The pre-handoff snapshot already limits the loss to a few minutes.
+- **Local checks:** `python3 tools/test_autorestart.py` (file selection, parts, timing, snapshot/restore of a
+  temp HOME; no network).
+- **Restore a bad files snapshot:** delete `latest-files.tar.gz*` from the `kirocrew-state` bucket (and the
+  Drive file `Panda/state/files.tar.gz`); the next run starts with empty work folders.
 
 ## Rotate keys
 

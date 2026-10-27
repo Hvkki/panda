@@ -6,8 +6,13 @@ Lifecycle of one run (started by the user, never by itself):
   3. claim the user's worker_sessions row, heartbeat it
   4. answer pending messages: one Kiro Crew chat slot per Supabase chat, replies streamed
   5. mirror Crew notifications (cron results) into the notifications table
-  6. snapshot every SNAPSHOT_EVERY seconds; on stop_requested or the time guard:
-     final snapshot, mark stopped, shut down. It never starts another run.
+  6. snapshot every SNAPSHOT_EVERY seconds (Crew state, kiro sessions and the owner's work files:
+     ~/dev ~/work ~/outputs ~/projects ~/uploads ~/.panda); on stop_requested: final snapshot,
+     mark stopped, shut down. Pressing Stop never starts another run.
+  7. hand-off: HANDOFF_LEAD before MAX_RUNTIME (auto_restart, on by default) it asks the `session`
+     function for a successor run of the same account. The successor installs, then waits until this
+     run has stopped taking messages, drained, snapshotted and marked itself stopped; only then it
+     restores and serves. Two workers never answer the same account at once.
 
 Config comes from worker.json in an attached private dataset. No secret is printed.
 """
@@ -21,6 +26,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -32,6 +38,7 @@ import traceback
 import mimetypes
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 from urllib.parse import quote
 
 import requests
@@ -74,6 +81,24 @@ HEARTBEAT_SECS = 15
 NOTIFY_SECS = 20
 SNAPSHOT_EVERY = int(CFG.get("snapshot_every_secs", 1800))
 MAX_RUNTIME = int(CFG.get("max_runtime_secs", 11 * 3600))  # stop cleanly before Kaggle's 12 h cap
+
+
+def _flag(value, default: bool) -> bool:
+    """A setting that may arrive as a bool, 0/1 or 'false'/'off'/'no'; None means 'use the default'."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "off", "no")
+    return bool(value)
+
+
+# Hand-off to a fresh Kaggle run before the time guard. On by default. Turn it off with
+# "auto_restart": false in worker.json (the Kaggle dataset) or PANDA_AUTO_RESTART=0 in the environment;
+# the environment wins.
+AUTO_RESTART = _flag(os.environ.get("PANDA_AUTO_RESTART"), _flag(CFG.get("auto_restart"), True))
+HANDOFF_LEAD = max(300, min(int(CFG.get("handoff_lead_secs", 25 * 60)), 40 * 60))
+HANDOFF_LEAD = min(HANDOFF_LEAD, MAX_RUNTIME // 2)       # a short test run still hands off after half its time
+HANDOFF_MODE = "sequential" if CFG.get("handoff_mode") == "sequential" else "overlap"
 AGENT = CFG.get("agent", "")
 
 ENV = dict(os.environ, KIRO_API_KEY=CFG["kiro_api_key"], KIROCREW_ALLOW_UNSANDBOXED="1",
@@ -384,13 +409,457 @@ def _no_locks(info: tarfile.TarInfo):
     return None if info.name.endswith(".lock") else info
 
 
+# ── Big state in Supabase Storage: split into parts ─────────────────────────
+# A Free Supabase project refuses any object over 50 MB (the Pro plan allows far more:
+# https://supabase.com/docs/guides/storage/uploads/file-limits), and the Crew snapshot alone is already
+# ~49 MB. So every snapshot file is stored whole when it is under STATE_PART_BYTES, otherwise as
+# <name>.<generation>.pNNN parts plus a small <name>.parts.json manifest that is written LAST: until it
+# is replaced, a restore still reads the previous complete set.
+MiB = 1 << 20
+STATE_PART_BYTES = max(1, int(CFG.get("state_part_mb", 40))) * MiB
+
+
+def sha256_file(path: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(MiB), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def split_file(path: str, part_bytes: int, out_prefix: str) -> list:
+    """Cut `path` into <out_prefix>.p000, .p001 … of at most part_bytes each; returns their paths."""
+    parts = []
+    with open(path, "rb") as src:
+        while True:
+            p = f"{out_prefix}.p{len(parts):03d}"
+            left, wrote = part_bytes, 0
+            with open(p, "wb") as out:
+                while left > 0:
+                    chunk = src.read(min(MiB, left))
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    left -= len(chunk)
+                    wrote += len(chunk)
+            if wrote == 0 and parts:
+                os.remove(p)
+                break
+            parts.append(p)
+            if left > 0:  # short part: that was the end of the file
+                break
+    return parts
+
+
+def join_parts(parts: list, dest: str) -> str:
+    """Concatenate parts into dest; returns the sha256 of the result."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(dest, "wb") as out:
+        for p in parts:
+            with open(p, "rb") as f:
+                for chunk in iter(lambda: f.read(MiB), b""):
+                    h.update(chunk)
+                    out.write(chunk)
+    return h.hexdigest()
+
+
+def _manifest_name(name: str) -> str:
+    return f"{name}.parts.json"
+
+
+def _manifest_get(sb: "Supabase", name: str) -> dict | None:
+    tmp = f"{WORK}/manifest-{uuid.uuid4().hex}.json"
+    try:
+        if sb.download(state_key(_manifest_name(name)), tmp):
+            data = json.load(open(tmp))
+            return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+    return None
+
+
+def _upload_retry(sb: "Supabase", key: str, path: str, mime: str = "application/gzip", tries: int = 3):
+    for i in range(tries):
+        try:
+            return sb.upload(key, path, mime=mime)
+        except Exception as exc:
+            if i == tries - 1:
+                raise
+            log(f"upload {key.rsplit('/', 1)[-1]} failed ({str(exc)[:80]}); retrying")
+            time.sleep(3 * (i + 1))
+
+
+def _forget_old(sb: "Supabase", name: str, old: dict | None, keep_single: bool, keep_manifest: bool):
+    if old:
+        for n in old.get("parts") or []:
+            sb.delete_object(state_key(n))
+        if old.get("drive"):
+            drive_rm(old["drive"].get("id", ""))
+    if not keep_single:
+        sb.delete_object(state_key(name))
+    if not keep_manifest:
+        sb.delete_object(state_key(_manifest_name(name)))
+
+
+def _put_manifest(sb: "Supabase", name: str, man: dict):
+    mp = f"{WORK}/manifest-{uuid.uuid4().hex}.json"
+    with open(mp, "w") as f:
+        json.dump(man, f)
+    try:
+        _upload_retry(sb, state_key(_manifest_name(name)), mp, mime="application/json")
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(mp)
+
+
+def blob_save(sb: "Supabase", name: str, path: str, part_bytes: int | None = None,
+              extra: dict | None = None) -> dict:
+    """Store `path` as `name` (whole, or in parts when bigger than part_bytes). Returns what was done."""
+    part_bytes = part_bytes or STATE_PART_BYTES
+    size = os.path.getsize(path)
+    old = _manifest_get(sb, name)
+    if size <= part_bytes:
+        _upload_retry(sb, state_key(name), path)
+        _forget_old(sb, name, old, keep_single=True, keep_manifest=False)
+        return {"size": size, "parts": 1}
+    gen = f"{int(time.time())}{uuid.uuid4().hex[:4]}"  # never equal to an earlier generation
+    local = split_file(path, part_bytes, f"{WORK}/blob-{gen}")
+    names = []
+    try:
+        for i, p in enumerate(local):
+            n = f"{name}.{gen}.p{i:03d}"
+            _upload_retry(sb, state_key(n), p)
+            names.append(n)
+            os.remove(p)
+    finally:
+        for p in local:
+            with contextlib.suppress(OSError):
+                os.remove(p)
+    _put_manifest(sb, name, {"v": 1, "size": size, "sha256": sha256_file(path), "parts": names,
+                             "saved_at": now_iso(), **(extra or {})})
+    _forget_old(sb, name, old, keep_single=False, keep_manifest=True)
+    return {"size": size, "parts": len(names)}
+
+
+def blob_save_drive(sb: "Supabase", name: str, path: str, extra: dict | None = None) -> dict | None:
+    """For an archive too big for Storage: put it in Google Drive; Storage keeps only the manifest."""
+    old = _manifest_get(sb, name)
+    got = drive_put(path, "state")
+    if not got:
+        return None
+    size = os.path.getsize(path)
+    _put_manifest(sb, name, {"v": 1, "size": size, "sha256": sha256_file(path), "parts": [],
+                             "drive": {"id": got["id"], "link": got.get("link", "")},
+                             "saved_at": now_iso(), **(extra or {})})
+    _forget_old(sb, name, old, keep_single=False, keep_manifest=True)
+    return {"size": size, "parts": 0, "drive": got["id"]}
+
+
+def blob_load(sb: "Supabase", name: str, dest: str) -> bool:
+    """Fetch what blob_save / blob_save_drive stored (or an old single object). False if there is none."""
+    man = _manifest_get(sb, name)
+    if not man:
+        return sb.download(state_key(name), dest)
+    if man.get("drive"):
+        if not drive_get(man["drive"].get("id", ""), dest):
+            raise RuntimeError("the saved work files are in Google Drive but could not be fetched")
+        sha = sha256_file(dest)
+    else:
+        local = []
+        try:
+            for i, n in enumerate(man.get("parts") or []):
+                p = f"{WORK}/restore-part-{i:03d}"
+                if not sb.download(state_key(n), p):
+                    raise RuntimeError(f"saved part {n} is missing")
+                local.append(p)
+            sha = join_parts(local, dest)
+        finally:
+            for p in local:
+                with contextlib.suppress(OSError):
+                    os.remove(p)
+    if man.get("sha256") and sha != man["sha256"]:
+        with contextlib.suppress(OSError):
+            os.remove(dest)
+        raise RuntimeError(f"{name}: the parts do not add up (checksum differs)")
+    return True
+
+
+# ── The owner's work files: kept across runs ────────────────────────────────
+# Kaggle starts every run on a clean disk. Besides Crew's state, these folders of the home directory are
+# saved (snapshot) and put back before Kiro Crew starts (restore_files).
+FILES_ENABLED = _flag(CFG.get("save_files"), True)
+
+
+def _extra_roots(value) -> list:
+    """Extra home folders from worker.json ("state_extra_roots"); never '..', never credential folders."""
+    out = []
+    for r in value if isinstance(value, list) else []:
+        r = str(r).strip().strip("/")
+        if r and ".." not in r.split("/") and r.split("/")[0] not in (".ssh", ".aws", ".gnupg", ".kiro", ".codex", ".config"):
+            out.append(r)
+    return out
+
+
+FILES_ROOTS = ["dev", "work", "outputs", "projects", "uploads", ".panda"] + _extra_roots(CFG.get("state_extra_roots"))
+FILE_MAX_BYTES = int(CFG.get("state_max_file_mb", 100)) * MiB       # a single file bigger than this is not saved
+FILES_STORAGE_MAX = int(CFG.get("state_storage_max_mb", 200)) * MiB  # bigger archives go to Drive (or are trimmed)
+FILES_BLOB = "latest-files.tar.gz"
+ALWAYS_SKIP_DIRS = {"node_modules", "__pycache__", ".cache"}
+CODE_ROOTS = {"dev", "projects"}                                      # code trees: build output is not saved
+CODE_SKIP_DIRS = {"dist", "build", ".venv", "venv", ".next", ".pytest_cache", ".mypy_cache", ".tox"}
+# ~/.panda also holds machine state the worker rebuilds itself, and secrets that must not sit in Storage
+# unencrypted: the vault copy, the Drive login, Developer variables, browser cookies (saved encrypted
+# elsewhere), the voice libraries (reinstalled), pids and logs.
+PANDA_SKIP_DIRS = {"browser", "stt-lib"}
+PANDA_SKIP_FILES = {"dev.env", "secrets.env", "drive.json", "browser.json", "dev-latest.json", "engine.pid",
+                    "codex-installing", "browser-installing"}
+
+
+class Entry(NamedTuple):
+    arc: str        # path inside the archive, relative to the home directory
+    path: str
+    size: int
+    mtime: int      # whole seconds: that is what a tar archive keeps
+    kind: str       # "dir" | "file" | "link"
+
+
+def _dir_skipped(root: str, depth: int, name: str) -> bool:
+    if name in ALWAYS_SKIP_DIRS:
+        return True
+    if root in CODE_ROOTS and name in CODE_SKIP_DIRS:
+        return True
+    return root == ".panda" and depth == 1 and name in PANDA_SKIP_DIRS
+
+
+def _file_skipped(root: str, depth: int, name: str) -> bool:
+    if name.endswith(".pyc"):
+        return True
+    return root == ".panda" and depth == 1 and (name in PANDA_SKIP_FILES or name.endswith(".log"))
+
+
+def select_files(home: str, roots: list, max_file: int | None = None, exclude: tuple = ()) -> tuple:
+    """What to save. Returns (entries sorted by arc, skipped as [(arc, size, why)]).
+
+    Only regular files, directories and symlinks; never anything under `exclude` (the worker's own
+    scratch folder). A file over max_file is skipped and listed.
+    """
+    max_file = FILE_MAX_BYTES if max_file is None else max_file
+    entries, skipped = [], []
+    excl = tuple(os.path.abspath(e) for e in exclude)
+    for root in roots:
+        base = os.path.join(home, root)
+        if not os.path.isdir(base) or os.path.islink(base):
+            continue
+        top = root.split("/")[0]
+        for dirpath, dirnames, filenames in os.walk(base):
+            rel = os.path.relpath(dirpath, base)
+            depth = 0 if rel == "." else rel.count(os.sep) + 1
+            if any(dirpath == e or dirpath.startswith(e + os.sep) for e in excl):
+                dirnames[:] = []
+                continue
+            try:
+                entries.append(Entry(os.path.relpath(dirpath, home), dirpath, 0, int(os.lstat(dirpath).st_mtime), "dir"))
+            except OSError:
+                dirnames[:] = []
+                continue
+            keep = []
+            for d in sorted(dirnames):
+                full = os.path.join(dirpath, d)
+                if _dir_skipped(top, depth + 1, d):
+                    continue
+                if os.path.islink(full):  # os.walk lists a link to a folder here but does not enter it
+                    entries.append(Entry(os.path.relpath(full, home), full, 0, int(os.lstat(full).st_mtime), "link"))
+                    continue
+                keep.append(d)
+            dirnames[:] = keep
+            for n in sorted(filenames):
+                full = os.path.join(dirpath, n)
+                if _file_skipped(top, depth + 1, n):
+                    continue
+                try:
+                    st = os.lstat(full)
+                except OSError:
+                    continue
+                arc = os.path.relpath(full, home)
+                if stat.S_ISLNK(st.st_mode):
+                    entries.append(Entry(arc, full, 0, int(st.st_mtime), "link"))
+                elif not stat.S_ISREG(st.st_mode):
+                    continue  # sockets, pipes, devices
+                elif st.st_size > max_file:
+                    skipped.append((arc, st.st_size, f"bigger than {max_file // MiB} MB"))
+                else:
+                    entries.append(Entry(arc, full, st.st_size, int(st.st_mtime), "file"))
+    entries.sort(key=lambda e: e.arc)
+    return entries, skipped
+
+
+def files_signature(entries: list) -> str:
+    """Changes when any saved file is added, removed, resized or touched (folders do not count)."""
+    import hashlib
+    h = hashlib.sha1()
+    for e in entries:
+        if e.kind != "dir":
+            h.update(f"{e.arc}|{e.kind}|{e.size}|{e.mtime}\n".encode())
+    return h.hexdigest()
+
+
+def trim_to_budget(entries: list, budget: int) -> tuple:
+    """Drop the oldest files until the files add up to at most `budget` bytes. Returns (kept, dropped)."""
+    total = sum(e.size for e in entries if e.kind == "file")
+    if total <= budget:
+        return entries, []
+    drop = set()
+    for e in sorted((e for e in entries if e.kind == "file"), key=lambda e: (e.mtime, e.arc)):
+        if total <= budget:
+            break
+        drop.add(e.arc)
+        total -= e.size
+    return ([e for e in entries if e.arc not in drop],
+            [(e.arc, e.size, "over the storage budget") for e in entries if e.arc in drop])
+
+
+class _FixedSize:
+    """A file read as exactly `size` bytes: a file that grows or shrinks while it is packed must not
+    corrupt the archive (a missing tail is zeros; the file is saved again at the next snapshot)."""
+
+    def __init__(self, f, size: int):
+        self.f, self.left = f, size
+
+    def read(self, n: int = -1) -> bytes:
+        n = self.left if n is None or n < 0 else min(n, self.left)
+        data = self.f.read(n)
+        if len(data) < n:
+            data += b"\0" * (n - len(data))
+        self.left -= n
+        return data
+
+
+def write_archive(entries: list, dest: str) -> list:
+    """tar.gz of the entries (paths as arc names). Returns the arcs that could not be read."""
+    failed = []
+    with tarfile.open(dest, "w:gz", compresslevel=6) as t:
+        for e in entries:
+            try:
+                ti = t.gettarinfo(e.path, arcname=e.arc)
+                if ti is None:
+                    continue
+                if ti.isreg():
+                    with open(e.path, "rb") as f:
+                        t.addfile(ti, _FixedSize(f, ti.size))
+                else:
+                    t.addfile(ti)
+            except OSError:
+                failed.append(e.arc)
+    return failed
+
+
+def extract_archive(archive: str, home: str, roots: list) -> tuple:
+    """Unpack into `home`. Member by member: one bad member (an absolute link, an unwritable path) is
+    skipped and counted, never fatal. Only members under `roots` are accepted. Returns (extracted, skipped)."""
+    ok = bad = 0
+    top = {r.split("/")[0] for r in roots}
+    with tarfile.open(archive) as t:
+        for m in t:
+            first = m.name.split("/")[0]
+            if first not in top or m.name.startswith("/") or ".." in m.name.split("/"):
+                bad += 1
+                continue
+            try:
+                t.extract(m, home, filter="data")
+                ok += 1
+            except (tarfile.TarError, OSError):
+                bad += 1
+    return ok, bad
+
+
+_files_sync = {"sig": None}
+_files_lock = threading.Lock()
+
+
+def files_snapshot(sb: "Supabase", reason: str) -> dict | None:
+    """Save the owner's work files. Skips the upload when nothing changed since the last save."""
+    if not FILES_ENABLED:
+        return None
+    with _files_lock:
+        entries, skipped = select_files(HOME, FILES_ROOTS, exclude=(WORK,))
+        for arc, size, why in skipped:
+            log(f"files: not saved, {why}: ~/{arc} ({size // MiB} MB)")
+        sig = files_signature(entries)
+        if sig == _files_sync["sig"]:
+            return {"unchanged": True}
+        archive = f"{WORK}/files.tar.gz"
+        drive_ok = os.path.exists(DRIVE_CFG)
+        raw = sum(e.size for e in entries if e.kind == "file")
+        chosen, dropped, budget = entries, [], None
+        try:
+            for _ in range(4):
+                if budget is not None:
+                    chosen, dropped = trim_to_budget(entries, budget)
+                failed = write_archive(chosen, archive)
+                size = os.path.getsize(archive)
+                if size <= FILES_STORAGE_MAX or drive_ok:
+                    break
+                # No Drive for this account: keep fewer files (oldest first) until the archive fits in Storage.
+                budget = int(sum(e.size for e in chosen if e.kind == "file") * FILES_STORAGE_MAX / size * 0.9)
+            for arc, sz, why in dropped:
+                log(f"files: not saved, {why}: ~/{arc} ({sz // MiB} MB)")
+            for arc in failed:
+                log(f"files: could not read ~/{arc}")
+            extra = {"sig": sig, "files": sum(1 for e in chosen if e.kind == "file")}
+            done = where = None
+            if size > FILES_STORAGE_MAX and drive_ok:
+                done, where = blob_save_drive(sb, FILES_BLOB, archive, extra), "Google Drive"
+                if done is None:  # Drive failed: a trimmed copy in Storage beats nothing
+                    chosen, dropped = trim_to_budget(entries, int(raw * FILES_STORAGE_MAX / size * 0.9))
+                    write_archive(chosen, archive)
+                    extra["files"] = sum(1 for e in chosen if e.kind == "file")
+            if done is None:
+                done, where = blob_save(sb, FILES_BLOB, archive, extra=extra), "Storage"
+            _files_sync["sig"] = None if dropped else sig  # a trimmed save is tried again next time
+            info = {"files": extra["files"], "raw_bytes": raw, "archive_bytes": done["size"],
+                    "parts": done["parts"], "where": where, "skipped": len(skipped) + len(dropped)}
+            log(f"files saved ({reason}): {info['files']} files, {raw / MiB:.1f} MB -> {done['size'] / MiB:.1f} MB, "
+                f"{info['parts']} part(s) in {where}, {info['skipped']} skipped")
+            return info
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(archive)
+
+
+def restore_files(sb: "Supabase") -> str:
+    """Put the saved work files back. Runs before Kiro Crew starts; a broken copy never stops Panda."""
+    if not FILES_ENABLED:
+        return "off"
+    tmp = f"{WORK}/restore-files.tar.gz"
+    try:
+        if not blob_load(sb, FILES_BLOB, tmp):
+            log("files: nothing saved yet")
+            return "none"
+        ok, bad = extract_archive(tmp, HOME, FILES_ROOTS)
+        entries, _ = select_files(HOME, FILES_ROOTS, exclude=(WORK,))
+        _files_sync["sig"] = files_signature(entries)
+        log(f"files restored: {ok} items" + (f", {bad} skipped" if bad else ""))
+        return "restored"
+    except Exception as exc:
+        log("files could not be restored:", scrub(exc)[:200])
+        return "failed"
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+
+
 def restore(sb: Supabase) -> str:
     snap = f"{WORK}/restore-crew.tar.gz"
     extra = f"{WORK}/restore-kiro.tar.gz"
-    got = sb.download(state_key("latest-crew.tar.gz"), snap)
+    got = blob_load(sb, "latest-crew.tar.gz", snap)
     if got:
         sh(f"kirocrew restore {snap} --mode replace --force", timeout=900)
-    if sb.download(state_key("latest-kiro.tar.gz"), extra):
+    if blob_load(sb, "latest-kiro.tar.gz", extra):
         with tarfile.open(extra) as t:
             t.extractall(f"{HOME}/.kiro", filter="data")
         for lock in glob.glob(f"{HOME}/.kiro/sessions/cli/*.lock"):
@@ -399,24 +868,40 @@ def restore(sb: Supabase) -> str:
     return "restored" if got else "fresh"
 
 
-def snapshot(sb: Supabase, reason: str) -> str:
+def _save_files_note(sb: Supabase, reason: str):
+    try:
+        info = files_snapshot(sb, reason)
+        if info and not info.get("unchanged"):
+            SESSION_INFO["files"] = info
+    except Exception as exc:  # the chat state is already saved; report it, do not fail the whole stop
+        log("files snapshot failed:", scrub(exc)[:200])
+
+
+def snapshot(sb: Supabase, reason: str, files: bool = True) -> str:
     out = f"{WORK}/snap"
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
     sh(f"kirocrew snapshot {out} --keep 1", timeout=900)
-    files = sorted(glob.glob(f"{out}/*.tar.gz"))
-    if not files:
+    found = sorted(glob.glob(f"{out}/*.tar.gz"))
+    if not found:
         raise RuntimeError("snapshot produced no file")
-    sb.upload(state_key("latest-crew.tar.gz"), files[-1])
+    done = blob_save(sb, "latest-crew.tar.gz", found[-1])
     extra = f"{WORK}/kiro-extra.tar.gz"
     with tarfile.open(extra, "w:gz") as t:
         for d in EXTRA_DIRS:
             p = f"{HOME}/.kiro/{d}"
             if os.path.isdir(p):
                 t.add(p, arcname=d, filter=_no_locks)
-    sb.upload(state_key("latest-kiro.tar.gz"), extra)
-    log(f"snapshot uploaded ({reason}), {os.path.getsize(files[-1]) // 1024} KiB")
+    blob_save(sb, "latest-kiro.tar.gz", extra)
+    log(f"snapshot uploaded ({reason}), {done['size'] // 1024} KiB in {done['parts']} part(s)")
+    if files:
+        _save_files_note(sb, reason)
     return now_iso()
+
+
+def snapshot_files_later(sb: Supabase, reason: str):
+    """Periodic work-file save in the background, so a big copy never holds up the message loop."""
+    threading.Thread(target=_save_files_note, args=(sb, reason), daemon=True).start()
 
 
 def start_gateway() -> subprocess.Popen:
@@ -1213,10 +1698,28 @@ def setup_drive():
     return True
 
 
-def drive_put(path: str) -> dict | None:
+def drive_get(file_id: str, dest: str) -> bool:
+    """Download a Drive file by id to `dest` (the saved work files, when they were too big for Storage)."""
+    if not file_id or not os.path.exists(DRIVE_CFG):
+        return False
+    r = subprocess.run([sys.executable, DRIVE_TOOL, "get", file_id, dest], capture_output=True, text=True, timeout=3600)
+    if r.returncode != 0 or not os.path.isfile(dest):
+        log("drive download failed:", scrub(r.stdout + r.stderr)[-300:])
+        return False
+    return True
+
+
+def drive_rm(file_id: str) -> None:
+    """Move a Drive file to the trash (the previous copy of the saved work files)."""
+    if file_id and os.path.exists(DRIVE_CFG):
+        with contextlib.suppress(Exception):
+            subprocess.run([sys.executable, DRIVE_TOOL, "rm", file_id], capture_output=True, text=True, timeout=300)
+
+
+def drive_put(path: str, folder: str = "outputs") -> dict | None:
     if not os.path.exists(DRIVE_CFG):
         return None
-    r = subprocess.run([sys.executable, DRIVE_TOOL, "put", path, "outputs"], capture_output=True, text=True, timeout=3600)
+    r = subprocess.run([sys.executable, DRIVE_TOOL, "put", path, folder], capture_output=True, text=True, timeout=3600)
     out = r.stdout
     m_id = re.search(r"^Id: (\S+)", out, re.M)
     if r.returncode != 0 or not m_id:
@@ -2612,18 +3115,181 @@ def claim_session(sb: Supabase) -> dict:
                    prefer="return=representation")[0]
 
 
+# ── Hand-off to a fresh Kaggle run ───────────────────────────────────────────
+# Kaggle ends a run at 12 h and the worker stops itself at MAX_RUNTIME. Instead of going offline, about
+# HANDOFF_LEAD earlier it asks the `session` Edge Function for a successor run. The worker has no Kaggle
+# credential of its own (the Kaggle token lives only in that function's secrets), and it does not need one:
+# action "handoff" starts the next run of the SAME account through the same code path as the app's Start.
+#
+# Never two workers on one account:
+#   successor: installs, marks its row info.handoff_ready, then WAITS (heartbeating) until the old run's row is
+#              stopped / error / silent; only then restores the snapshot and serves.
+#   old run:   keeps serving until the successor says it is ready, then stops claiming messages and
+#              commands, finishes turns in flight, snapshots, stops Kiro Crew and marks itself stopped.
+#              At MAX_RUNTIME it stops anyway, ready or not.
+# "sequential" mode (worker.json handoff_mode) does it in the plain order: drain, snapshot, request the
+# successor, exit. It is the fallback if Kaggle ever cancels a running version when a new one is pushed.
+HANDOFF_RETRY_SECS = 120
+HANDOFF_MAX_TRIES = 5
+HANDOFF_WAIT_MAX = HANDOFF_LEAD + 20 * 60   # a successor never waits longer than its predecessor can live
+PRED_STALE_SECS = 180                       # a predecessor with no heartbeat for this long is gone
+
+
+def parse_ts(value) -> float | None:
+    """Epoch seconds from a PostgREST timestamp. Python 3.10 rejects 1-2 digit fractions, so normalise."""
+    if not value:
+        return None
+    s = str(value).strip().replace("Z", "+00:00")
+    s = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], s, count=1)
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def handoff_due(elapsed: float, max_runtime: float, lead: float, tries: int, last_try: float | None, now: float,
+                have_successor: bool = False, retry_secs: float = HANDOFF_RETRY_SECS,
+                max_tries: int = HANDOFF_MAX_TRIES) -> bool:
+    """Is it time to ask for a successor? From (max_runtime - lead) on, once, retried every retry_secs."""
+    if have_successor or tries >= max_tries:
+        return False
+    if elapsed < max_runtime - lead:
+        return False
+    return last_try is None or now - last_try >= retry_secs
+
+
+def predecessor_gone(row: dict | None, now: float, stale_secs: float = PRED_STALE_SECS) -> bool:
+    """May a successor take over? True once the old run's row says stopped / error, was deleted, or has not
+    beaten for stale_secs (the machine died). A 'requested'/'starting' row is not gone."""
+    if row is None:
+        return True
+    status = row.get("status")
+    if status in ("stopped", "error"):
+        return True
+    if status in ("running", "stopping"):
+        beat = parse_ts(row.get("heartbeat_at"))
+        return beat is None or now - beat > stale_secs
+    return False
+
+
+def request_successor(sb: Supabase, sid: str) -> dict:
+    """Ask the session function for the next run of this account. Returns the new worker_sessions row."""
+    r = requests.post(f"{SB_URL}/functions/v1/session", json={"action": "handoff", "session_id": sid},
+                      headers=sb.headers(), timeout=120)
+    try:
+        body = r.json()
+    except ValueError:
+        body = {}
+    if r.status_code >= 400 or body.get("error") or not (body.get("session") or {}).get("id"):
+        raise RuntimeError(f"{r.status_code} {scrub(body.get('error') or r.text)[:200]}")
+    return body["session"]
+
+
+def handoff_step(sb: Supabase, sid: str, ho: dict, set_sess, at_heartbeat: bool) -> str | None:
+    """One look at the hand-off, from the main loop. Returns "handoff" when this run should now drain and stop."""
+    if not AUTO_RESTART:
+        return None
+    now = time.time()
+    if ho["to"] is None:
+        if not handoff_due(now - T0, MAX_RUNTIME, HANDOFF_LEAD, ho["tries"], ho["last"], now):
+            return None
+        ho["tries"] += 1
+        ho["last"] = now
+        if HANDOFF_MODE == "sequential":
+            return "handoff"
+        try:
+            # Insurance: if Kaggle were to cancel this run when the new version is pushed, nothing is lost.
+            with beating(sb, sid):
+                snapshot(sb, "pre-handoff")
+            nxt = request_successor(sb, sid)
+            ho["to"] = nxt["id"]
+            SESSION_INFO["handoff"] = {"to": nxt["id"], "at": now_iso(), "mode": HANDOFF_MODE}
+            set_sess(info=SESSION_INFO)
+            log(f"hand-off: successor {nxt['id']} requested; serving until it is ready")
+        except Exception as exc:
+            log(f"hand-off: could not request the next run ({ho['tries']}/{HANDOFF_MAX_TRIES}):", scrub(exc)[:200])
+        return None
+    if not at_heartbeat:
+        return None
+    rows = sb.rest("GET", "worker_sessions", params={"id": f"eq.{ho['to']}", "select": "status,info"}) or []
+    nxt = rows[0] if rows else {}
+    if nxt.get("status") in ("error", "stopped") or not rows:
+        log("hand-off: the successor ended before it was ready; will ask again")
+        ho["to"] = None
+        SESSION_INFO.pop("handoff", None)
+        return None
+    if nxt.get("status") == "starting" and (nxt.get("info") or {}).get("handoff_ready"):
+        log("hand-off: successor is ready; no new messages from here on")
+        return "handoff"
+    return None
+
+
+def wait_for_predecessor(sb: Supabase, sid: str, pred: str, set_sess) -> str:
+    """Successor side: install is done; wait until the old run has stopped. Returns "go" or "stop"."""
+    SESSION_INFO["handoff_ready"] = True
+    SESSION_INFO["handoff_ready_at"] = now_iso()
+    set_sess(info=SESSION_INFO, heartbeat_at=now_iso())
+    log(f"hand-off: ready; waiting for run {pred} to stop")
+    t0, last_hb = time.time(), 0.0
+    while True:
+        now = time.time()
+        if now - last_hb > HEARTBEAT_SECS:
+            row = (sb.rest("GET", "worker_sessions", params={"id": f"eq.{sid}", "select": "stop_requested"}) or [{}])[0]
+            if row.get("stop_requested"):
+                return "stop"
+            set_sess(heartbeat_at=now_iso())
+            last_hb = now
+        rows = sb.rest("GET", "worker_sessions",
+                       params={"id": f"eq.{pred}", "select": "status,heartbeat_at"}) or []
+        if predecessor_gone(rows[0] if rows else None, time.time()):
+            log(f"hand-off: run {pred} is done after {round(time.time() - t0)} s of waiting")
+            return "go"
+        if time.time() - t0 > HANDOFF_WAIT_MAX:
+            raise RuntimeError(f"the previous run {pred} did not stop in {HANDOFF_WAIT_MAX // 60} minutes")
+        time.sleep(5)
+
+
+def keep_beating(sb: Supabase, sid: str, stop: threading.Event):
+    """Heartbeat while the run drains and snapshots, so the app never sees it as dead mid-save."""
+    while not stop.wait(HEARTBEAT_SECS):
+        with contextlib.suppress(Exception):
+            sb.rest("PATCH", "worker_sessions", params={"id": f"eq.{sid}"}, body={"heartbeat_at": now_iso()})
+
+
+@contextlib.contextmanager
+def beating(sb: Supabase, sid: str):
+    stop = threading.Event()
+    threading.Thread(target=keep_beating, args=(sb, sid, stop), daemon=True).start()
+    try:
+        yield
+    finally:
+        stop.set()
+
+
 def main():
     sb = Supabase()
     sess = claim_session(sb)
     sid = sess["id"]
+    SESSION_INFO.update(sess.get("info") or {})   # keeps info.handoff_from when this run is a successor
 
     def set_sess(**kw):
         sb.rest("PATCH", "worker_sessions", params={"id": f"eq.{sid}"}, body=kw)
 
     gw_proc = None
+    ho = {"to": None, "tries": 0, "last": None}
     try:
         install()
+        pred = SESSION_INFO.get("handoff_from")
+        if pred:  # successor: do not touch the account's state until the previous run has saved it
+            if wait_for_predecessor(sb, sid, pred, set_sess) == "stop":
+                SESSION_INFO["stop_reason"] = "stopped before taking over"
+                set_sess(status="stopped", stopped_at=now_iso(), info=SESSION_INFO)
+                return
         restored = restore(sb)
+        files_state = restore_files(sb)
         # The app's system prompt lives in Storage so it can be edited without a redeploy.
         os.makedirs(f"{HOME}/.kiro/crew", exist_ok=True)
         if sb.download("config/prompt.md", f"{HOME}/.kiro/crew/prompt.md"):
@@ -2651,7 +3317,8 @@ def main():
         threading.Thread(target=thinking_listener, args=(gw, stop_evt), daemon=True).start()
         threading.Thread(target=thinking_pusher, args=(sb, stop_evt), daemon=True).start()
         pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL_CHATS)
-        SESSION_INFO.update(restored=restored, startup_secs=round(time.time() - T0), crew=CREW_VERSION["v"])
+        SESSION_INFO.update(restored=restored, files_restored=files_state, startup_secs=round(time.time() - T0), crew=CREW_VERSION["v"])
+        SESSION_INFO.pop("handoff_ready", None)
         set_sess(status="running", heartbeat_at=now_iso(), info=SESSION_INFO)
         USAGE_STATE["sid"] = sid
         # Warm the Kiro account total now (a forced scrape can take ~a minute), so the app shows a
@@ -2673,6 +3340,12 @@ def main():
                     break
                 set_sess(heartbeat_at=now_iso())
                 last_hb = time.time()
+                beat = True
+            else:
+                beat = False
+            if handoff_step(sb, sid, ho, set_sess, beat) == "handoff":
+                reason = "handoff"
+                break
             if time.time() - T0 > MAX_RUNTIME:
                 reason = "time guard"
                 break
@@ -2694,7 +3367,9 @@ def main():
                     log("usage refresh:", type(exc).__name__)
                 last_nt = time.time()
             if time.time() - last_snap > SNAPSHOT_EVERY:
-                set_sess(last_snapshot=snapshot(sb, "periodic"))
+                with beating(sb, sid):
+                    set_sess(last_snapshot=snapshot(sb, "periodic", files=False))
+                snapshot_files_later(sb, "periodic")
                 last_snap = time.time()
             try:
                 steer_pending(sb, gw)
@@ -2708,11 +3383,28 @@ def main():
 
         log("stopping:", reason)
         stop_evt.set()
-        pool.shutdown(wait=True, cancel_futures=False)  # let answers in flight finish
-        stop_browser(sb)
-        _safe(codex_backup, sb, True)
         set_sess(status="stopping")
-        snap_at = snapshot(sb, reason)
+        # Keep beating while turns finish and the snapshot uploads: the app and the `session` function
+        # treat a run that is silent for 90 s as dead.
+        with beating(sb, sid):
+            pool.shutdown(wait=True, cancel_futures=False)  # let answers in flight finish
+            stop_browser(sb)
+            _safe(codex_backup, sb, True)
+            snap_at = snapshot(sb, reason)
+            # A successor is requested after the snapshot when it was not requested earlier (sequential
+            # mode, or the early tries failed). Only a time-based stop hands off; Stop never does.
+            if AUTO_RESTART and reason in ("handoff", "time guard") and ho["to"] is None:
+                try:
+                    nxt = request_successor(sb, sid)
+                    SESSION_INFO["handoff"] = {"to": nxt["id"], "at": now_iso(), "mode": "after-stop"}
+                    log(f"hand-off: successor {nxt['id']} requested")
+                except Exception as exc:
+                    SESSION_INFO["handoff_error"] = scrub(exc)[:300]
+                    log("hand-off: could not request the next run:", scrub(exc)[:200])
+            # Stop Kiro Crew before the row says "stopped": that row is the successor's go signal, and two
+            # gateways must never run Crew's scheduled jobs for one account at once.
+            if gw_proc and gw_proc.poll() is None:
+                sh("kirocrew stop", timeout=60)
         SESSION_INFO.update(stop_reason=reason, runtime_secs=round(time.time() - T0))
         set_sess(status="stopped", stopped_at=now_iso(), last_snapshot=snap_at, info=SESSION_INFO)
     except Exception as exc:

@@ -8,7 +8,7 @@ Supabase project ufvskhagspdjslomzwjh
   Postgres with row-level security · Realtime · Storage buckets · Edge Function `session`
         ▲  REST, Storage, Realtime
         │
-Kaggle notebook vladraf/kirocrew-worker (CPU, unsandboxed, stops itself at 11 h)
+Kaggle notebook vladraf/kirocrew-worker (CPU, unsandboxed, hands over to a fresh run at ~10 h 35 m)
   worker.py
    ├─ HTTP ──────────► Kiro Crew gateway 127.0.0.1:5476 ──► kiro-cli acp ──► Kiro models
    ├─ websocket /api/ws ─► live thinking
@@ -50,9 +50,52 @@ browser state) and `panda-files` (per-user folders for files).
 
 - **Start:** the app calls `session`. It inserts a `worker_sessions` row and pushes
   `code/worker.py` from Storage into the Kaggle kernel.
-- **Stop:** the app sets `stop_requested`. The worker finishes the turns in flight, uploads a
-  snapshot to Storage (Crew state and Kiro sessions) and exits.
-- The worker never restarts itself.
+- **Stop:** the app sets `stop_requested` on every live run of the account. The worker finishes the
+  turns in flight, uploads a snapshot to Storage and exits. A Stop never restarts.
+- **Time limit:** see the next section.
+
+## Hand-off at the time limit
+
+Kaggle ends a run at 12 h; the worker's guard is `MAX_RUNTIME` (11 h). The worker has no Kaggle
+credential (the token lives only in the `session` function's secrets), so it asks that function.
+
+1. At `MAX_RUNTIME - 25 min` (`handoff_lead_secs`, 5-40 min) the worker takes a full snapshot (insurance),
+   then calls `session` with `{"action":"handoff","session_id":<its row>}` as the worker account. The
+   function checks the run is live, not asked to stop and at least 30 min old, returns the existing
+   successor if there is one (idempotent), and starts the next run of the same account exactly like Start
+   (new row, `info.handoff_from = <old id>`, pushes the latest `code/worker.py`, so a hand-off also deploys).
+2. The successor boots and installs, sets `info.handoff_ready`, then **waits** (heartbeating) until the old
+   row is `stopped`/`error` or silent for 3 min. It restores only after that.
+3. The old run keeps serving until it sees `handoff_ready`, then leaves the loop: no new messages or
+   commands are claimed, turns in flight finish, browser and Codex login are saved, final snapshot, Crew
+   is stopped, row set to `stopped` (`info.stop_reason = "handoff"`). At `MAX_RUNTIME` it stops anyway.
+4. Messages sent in the gap stay `pending` and are answered by the successor (commands wait up to 3 min).
+
+The app shows the serving run (a running one first, else the newest), and "Restarting" while a successor
+or a draining old run is the newest. Stop sets `stop_requested` on both, so a waiting successor never takes
+over after a Stop. If the function cannot be reached the worker retries (5 times, 2 min apart), then at the
+time guard snapshots, tries once more after the snapshot, and otherwise just stops (app: offline).
+
+Settings (`worker.json` in the Kaggle dataset, env wins): `auto_restart` (default true; env
+`PANDA_AUTO_RESTART=0` turns it off), `handoff_lead_secs`, `handoff_mode` (`"overlap"` default, or
+`"sequential"`: drain, snapshot, request, exit, for the case that Kaggle cancels a running version when a
+new one is pushed).
+
+## What a snapshot holds
+
+Every snapshot (every 30 min, on Stop, on hand-off) writes to `kirocrew-state` (per account under
+`users/<id>/`): `latest-crew.tar.gz`, `latest-kiro.tar.gz` and `latest-files.tar.gz`. The last is the
+owner's files: `~/dev ~/projects` (without `node_modules dist build .venv venv .next __pycache__ .cache`),
+`~/work ~/outputs ~/uploads`, and `~/.panda` without secrets and machine state (`dev.env secrets.env
+drive.json browser.json browser/ stt-lib/ *.log *.pid`). Files over 100 MB are skipped and logged. It is
+restored before Kiro Crew starts; unchanged file sets are not uploaded again.
+
+A Free Supabase project refuses objects over 50 MB, so any of the three files bigger than 40 MB
+(`state_part_mb`) is stored as `name.<gen>.pNNN` parts plus a `name.parts.json` manifest (sha256), written
+last. If the files archive exceeds 200 MB (`state_storage_max_mb`) it goes to Google Drive (`Panda/state`,
+the primary account only) and Storage keeps the manifest; without Drive the oldest files are left out until
+it fits. Work files are not encrypted (the bucket is private); browser cookies and the Codex login still are,
+separately.
 
 ## Commands
 
