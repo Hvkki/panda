@@ -794,6 +794,7 @@ def _cli():
                     os.makedirs(OUTPUTS, exist_ok=True)
                     dest = os.path.join(OUTPUTS, safe_title(j) + ".mp4")
                     shutil.copy(j["local"], dest)
+                    os.remove(j["local"])  # the copy in ~/outputs is the one the chat shows
                     print(f"done {jid}: {dest} · ${j.get('cost') or 0:.2f}")
                 else:
                     print(f"{j.get('status')} {jid}: {j.get('error', '')}")
