@@ -106,6 +106,58 @@ def load_image(src: str) -> bytes | None:
 
 
 # ── PDF ────────────────────────────────────────────────────────────────────
+# reportlab's built-in Helvetica has no Cyrillic, Greek or most accents: Ukrainian text came out
+# as black boxes (■■■■). Embed a full Unicode TTF family instead; Helvetica only if none exists.
+_FONT_DIRS = ["/usr/share/fonts/truetype", "/usr/share/fonts", "/usr/local/share/fonts",
+              os.path.expanduser("~/.local/share/fonts"), os.path.expanduser("~/.fonts")]
+_FAMILIES = [  # (regular, bold, italic, bold italic) file names, best first
+    ("LiberationSans-Regular.ttf", "LiberationSans-Bold.ttf", "LiberationSans-Italic.ttf", "LiberationSans-BoldItalic.ttf"),
+    ("NotoSans-Regular.ttf", "NotoSans-Bold.ttf", "NotoSans-Italic.ttf", "NotoSans-BoldItalic.ttf"),
+    ("DejaVuSans.ttf", "DejaVuSans-Bold.ttf", "DejaVuSans-Oblique.ttf", "DejaVuSans-BoldOblique.ttf"),
+    ("FreeSans.ttf", "FreeSansBold.ttf", "FreeSansOblique.ttf", "FreeSansBoldOblique.ttf"),
+]
+_MONOS = ["LiberationMono-Regular.ttf", "NotoSansMono-Regular.ttf", "DejaVuSansMono.ttf", "FreeMono.ttf"]
+
+
+def _find_font(name):
+    dirs = list(_FONT_DIRS)
+    try:  # matplotlib ships DejaVu, so this works even on a bare machine with matplotlib installed
+        import matplotlib
+        dirs.append(os.path.join(os.path.dirname(matplotlib.__file__), "mpl-data", "fonts", "ttf"))
+    except Exception:
+        pass
+    for d in dirs:
+        for root, _, files in os.walk(d):
+            if name in files:
+                return os.path.join(root, name)
+    return None
+
+
+def pdf_fonts():
+    """Register a Unicode font family; returns (regular, bold, italic, mono) font names."""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.lib.fonts import addMapping
+    names = ("PandaSans", "PandaSans-Bold", "PandaSans-Italic", "PandaSans-BoldItalic")
+    for fam in _FAMILIES:
+        paths = [_find_font(f) for f in fam]
+        if not paths[0]:
+            continue
+        paths = [p or paths[0] for p in paths]  # a missing style falls back to regular
+        try:
+            for n, p in zip(names, paths):
+                pdfmetrics.registerFont(TTFont(n, p))
+            for bold, it, n in ((0, 0, names[0]), (1, 0, names[1]), (0, 1, names[2]), (1, 1, names[3])):
+                addMapping("PandaSans", bold, it, n)
+            mono = next((m for m in map(_find_font, _MONOS) if m), None)
+            if mono:
+                pdfmetrics.registerFont(TTFont("PandaMono", mono))
+            return names[0], names[1], names[2], "PandaMono" if mono else names[0]
+        except Exception:
+            continue
+    return "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Courier"
+
+
 def to_pdf(blocks, out, theme, title):
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_LEFT
@@ -115,14 +167,15 @@ def to_pdf(blocks, out, theme, title):
     from reportlab.platypus import (Image, ListFlowable, ListItem, PageBreak, Paragraph,
                                     SimpleDocTemplate, Spacer, Table, TableStyle)
 
+    REG, BOLD, ITAL, MONO = pdf_fonts()
     accent, ink, soft = (colors.HexColor(c) for c in THEMES[theme])
-    base = ParagraphStyle("b", fontName="Helvetica", fontSize=10.5, leading=15.5, textColor=ink, alignment=TA_LEFT)
+    base = ParagraphStyle("b", fontName=REG, fontSize=10.5, leading=15.5, textColor=ink, alignment=TA_LEFT)
     st = {
-        "h1": ParagraphStyle("h1", parent=base, fontName="Helvetica-Bold", fontSize=22, leading=27, spaceBefore=6, spaceAfter=10, textColor=accent),
-        "h2": ParagraphStyle("h2", parent=base, fontName="Helvetica-Bold", fontSize=15, leading=20, spaceBefore=12, spaceAfter=6),
-        "h3": ParagraphStyle("h3", parent=base, fontName="Helvetica-Bold", fontSize=12, leading=16, spaceBefore=8, spaceAfter=4),
+        "h1": ParagraphStyle("h1", parent=base, fontName=BOLD, fontSize=22, leading=27, spaceBefore=6, spaceAfter=10, textColor=accent),
+        "h2": ParagraphStyle("h2", parent=base, fontName=BOLD, fontSize=15, leading=20, spaceBefore=12, spaceAfter=6),
+        "h3": ParagraphStyle("h3", parent=base, fontName=BOLD, fontSize=12, leading=16, spaceBefore=8, spaceAfter=4),
         "p": ParagraphStyle("p", parent=base, spaceAfter=7),
-        "quote": ParagraphStyle("q", parent=base, leftIndent=10, textColor=colors.HexColor("#6B6259"), fontName="Helvetica-Oblique", borderPadding=(4, 0, 4, 8)),
+        "quote": ParagraphStyle("q", parent=base, leftIndent=10, textColor=colors.HexColor("#6B6259"), fontName=ITAL, borderPadding=(4, 0, 4, 8)),
         "cell": ParagraphStyle("c", parent=base, fontSize=9.5, leading=13),
     }
 
@@ -130,7 +183,7 @@ def to_pdf(blocks, out, theme, title):
         t = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         t = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", t)
         t = re.sub(r"\*([^*]+)\*", r"<i>\1</i>", t)
-        t = re.sub(r"`([^`]+)`", r"<font face='Courier'>\1</font>", t)
+        t = re.sub(r"`([^`]+)`", rf"<font face='{MONO}'>\1</font>", t)
         return re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<link href='\2' color='#2563EB'>\1</link>", t)
 
     flow = []
@@ -148,7 +201,7 @@ def to_pdf(blocks, out, theme, title):
             w = (A4[0] - 40 * mm) / max(len(r) for r in val)
             tb = Table(data, colWidths=[w] * max(len(r) for r in val), repeatRows=1)
             tb.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), soft), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("BACKGROUND", (0, 0), (-1, 0), soft), ("FONTNAME", (0, 0), (-1, 0), BOLD),
                 ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D9D2C7")), ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
             flow += [tb, Spacer(1, 8)]
@@ -167,7 +220,7 @@ def to_pdf(blocks, out, theme, title):
         canvas.saveState()
         canvas.setFillColor(accent)
         canvas.rect(0, A4[1] - 6, A4[0], 6, stroke=0, fill=1)
-        canvas.setFont("Helvetica", 8)
+        canvas.setFont(REG, 8)
         canvas.setFillColor(colors.HexColor("#9A9087"))
         canvas.drawRightString(A4[0] - 20 * mm, 12 * mm, str(doc.page))
         canvas.restoreState()
