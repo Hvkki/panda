@@ -763,11 +763,15 @@ class _FixedSize:
         return data
 
 
-def write_archive(entries: list, dest: str) -> list:
-    """tar.gz of the entries (paths as arc names). Returns the arcs that could not be read."""
+def write_archive(entries: list, dest: str, deadline: float | None = None, level: int = 6) -> list:
+    """tar.gz of the entries (paths as arc names). Returns the arcs that could not be read.
+
+    Past `deadline` it raises TimeoutError (the half-written archive is never uploaded)."""
     failed = []
-    with tarfile.open(dest, "w:gz", compresslevel=6) as t:
+    with tarfile.open(dest, "w:gz", compresslevel=level) as t:
         for e in entries:
+            if deadline and time.time() > deadline:
+                raise TimeoutError("the work-file copy ran out of time")
             try:
                 ti = t.gettarinfo(e.path, arcname=e.arc)
                 if ti is None:
@@ -806,8 +810,14 @@ _files_restore = {"failed": False}  # a run whose restore failed must never over
 _files_lock = threading.Lock()
 
 
-def files_snapshot(sb: "Supabase", reason: str) -> dict | None:
-    """Save the owner's work files. Skips the upload when nothing changed since the last save."""
+def files_snapshot(sb: "Supabase", reason: str, budget: float | None = None) -> dict | None:
+    """Save the owner's work files. Skips the upload when nothing changed since the last save.
+
+    With `budget` (seconds, used at Stop) it compresses fast and gives up when the copy would take
+    longer, keeping the last saved copy (at most SNAPSHOT_EVERY old) instead of holding up the stop.
+    """
+    deadline = time.time() + budget if budget else None
+    level = 1 if budget else 6
     if not FILES_ENABLED:
         return None
     if _files_restore["failed"]:
@@ -828,7 +838,7 @@ def files_snapshot(sb: "Supabase", reason: str) -> dict | None:
             for _ in range(4):
                 if budget is not None:
                     chosen, dropped = trim_to_budget(entries, budget)
-                failed = write_archive(chosen, archive)
+                failed = write_archive(chosen, archive, deadline, level)
                 size = os.path.getsize(archive)
                 if size <= FILES_STORAGE_MAX or drive_ok:
                     break
@@ -844,7 +854,7 @@ def files_snapshot(sb: "Supabase", reason: str) -> dict | None:
                 done, where = blob_save_drive(sb, FILES_BLOB, archive, extra), "Google Drive"
                 if done is None:  # Drive failed: a trimmed copy in Storage beats nothing
                     chosen, dropped = trim_to_budget(entries, int(raw * FILES_STORAGE_MAX / size * 0.9))
-                    write_archive(chosen, archive)
+                    write_archive(chosen, archive, deadline, level)
                     extra["files"] = sum(1 for e in chosen if e.kind == "file")
             if done is None:
                 done, where = blob_save(sb, FILES_BLOB, archive, extra=extra), "Storage"
@@ -897,16 +907,19 @@ def restore(sb: Supabase) -> str:
     return "restored" if got else "fresh"
 
 
-def _save_files_note(sb: Supabase, reason: str):
+def _save_files_note(sb: Supabase, reason: str, budget: float | None = None):
     try:
-        info = files_snapshot(sb, reason)
+        info = files_snapshot(sb, reason, budget)
         if info and not info.get("unchanged"):
             SESSION_INFO["files"] = info
+    except TimeoutError:
+        SESSION_INFO["files_skipped_at_stop"] = True
+        log(f"files: not saved at stop (would take over {int(budget or 0)} s); the last saved copy is kept")
     except Exception as exc:  # the chat state is already saved; report it, do not fail the whole stop
         log("files snapshot failed:", scrub(exc)[:200])
 
 
-def snapshot(sb: Supabase, reason: str, files: bool = True) -> str:
+def snapshot(sb: Supabase, reason: str, files: bool = True, files_budget: float | None = None) -> str:
     out = f"{WORK}/snap"
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
@@ -924,7 +937,7 @@ def snapshot(sb: Supabase, reason: str, files: bool = True) -> str:
     blob_save(sb, "latest-kiro.tar.gz", extra)
     log(f"snapshot uploaded ({reason}), {done['size'] // 1024} KiB in {done['parts']} part(s)")
     if files:
-        _save_files_note(sb, reason)
+        _save_files_note(sb, reason, files_budget)
     return now_iso()
 
 
@@ -2959,6 +2972,42 @@ def resume_interrupted(sb: Supabase):
         log(f"restart: {len(rows)} cut-off replies, {len(done_chats)} continued, {len(stuck)} questions re-queued")
 
 
+STOP_GRACE_SECS = int(CFG.get("stop_grace_secs", 45))     # Stop: answers may finish for this long
+STOP_FILES_SECS = int(CFG.get("stop_files_secs", 150))    # Stop: the work-file copy may take this long
+
+
+def _wait_idle(until: float) -> bool:
+    while time.time() < until:
+        with BUSY_LOCK:
+            if not BUSY_CHATS:
+                return True
+        time.sleep(1)
+    with BUSY_LOCK:
+        return not BUSY_CHATS
+
+
+def stop_answers(sb: Supabase, gw: "Gateway", reason: str):
+    """Stop pressed: answers in flight get STOP_GRACE_SECS to finish, then they are stopped.
+
+    It used to wait for every answer however long it ran (a long Developer task kept Kaggle busy
+    for many minutes after Stop). Stopped answers keep what they wrote and say "stopped by you".
+    """
+    if reason != "stop requested":  # restarts pause their answers in drain_turns instead
+        return
+    if _wait_idle(time.time() + STOP_GRACE_SECS):
+        return
+    with BUSY_LOCK:
+        live = {c: dict(v) for c, v in BUSY_SLOTS.items()}
+    log(f"stop: stopping {len(live)} answer(s) still running")
+    for chat_id, v in live.items():
+        with contextlib.suppress(Exception):
+            sb.rest("PATCH", "messages", params={"chat_id": f"eq.{chat_id}", "role": "eq.assistant",
+                                                 "status": "eq.streaming"}, body={"cancel": True})
+        _safe(gw.call, "POST", f"/api/chat/slots/{v['slot']}/stop", {})
+    if not _wait_idle(time.time() + 30):
+        log("stop: some answers did not end in time; their text so far is kept")
+
+
 def drain_turns(sb: Supabase, reason: str):
     """Before a restart, let answers finish for up to DRAIN_SECS, then pause the rest for the next run."""
     if reason not in ("handoff", "time guard"):
@@ -4178,10 +4227,11 @@ def main():
         # treat a run that is silent for 90 s as dead.
         with beating(sb, sid):
             drain_turns(sb, reason)  # a restart lets answers finish for a while, then pauses them for the next run
-            pool.shutdown(wait=True, cancel_futures=False)  # let answers in flight finish
+            stop_answers(sb, gw, reason)  # Stop: a short grace, then running answers are stopped
+            pool.shutdown(wait=False, cancel_futures=True)
             stop_browser(sb)
             _safe(codex_backup, sb, True)
-            snap_at = snapshot(sb, reason)
+            snap_at = snapshot(sb, reason, files_budget=STOP_FILES_SECS)
             # A successor is requested after the snapshot when it was not requested earlier (sequential
             # mode, or the early tries failed). Only a time-based stop hands off; Stop never does.
             if AUTO_RESTART and reason in ("handoff", "time guard") and ho["to"] is None:
@@ -4217,7 +4267,31 @@ def main():
         gl = f"{WORK}/gateway.log"
         if os.path.exists(gl):  # scrub secrets from the log Kaggle keeps as output
             open(gl, "w").write(scrub(open(gl, errors="replace").read()))
+        clean_work()
     log("worker finished")
+
+
+def clean_work():
+    """Kaggle saves everything left in /kaggle/working as the run's output once the script ends, and
+    shows the run as "saving" until that copy is done. Keep only the logs there."""
+    if WORK != "/kaggle/working":
+        return
+    freed = 0
+    for name in os.listdir(WORK):
+        p = os.path.join(WORK, name)
+        if name.endswith(".log") and os.path.isfile(p):
+            continue
+        try:
+            if os.path.isdir(p) and not os.path.islink(p):
+                freed += sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(p) for f in fs
+                             if os.path.isfile(os.path.join(r, f)))
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                freed += os.path.getsize(p) if os.path.isfile(p) else 0
+                os.remove(p)
+        except OSError:
+            pass
+    log(f"cleaned the Kaggle output folder ({freed // MiB} MB)")
 
 
 if __name__ == "__main__":
