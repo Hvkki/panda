@@ -1191,11 +1191,22 @@ html:has(.sheet-backdrop), html:has(.sheet-backdrop) body { overscroll-behavior-
 .tl-icon { display: grid; color: var(--muted); }
 .tl-step { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tl-time { grid-column: 3; }
+.tl-step-cmd { grid-column: 3; }
+.tl-cmd { font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: .8em; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; display: block; }
+.tl-why { line-height: 1.4; }
+.tl-machine { margin: 0 12px 8px; padding: 10px 12px; border-radius: 14px; border: 1px solid var(--line); background: var(--bg); display: grid; gap: 8px; }
+.tl-machine .tl-label { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; color: var(--muted); }
+.tl-load { text-transform: none; letter-spacing: 0; font-weight: 500; color: var(--muted); }
+.tl-load.busy { color: #b9770e; }
+.tl-cmd-row { display: grid; gap: 2px; min-width: 0; font-size: .86em; }
+.tl-cmd-row .tl-cmd { color: var(--text, inherit); font-size: .88em; }
+.tl-cmd-log { font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace); color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .timeline-pill { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; gap: 6px; margin: 0 auto 8px; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); font-size: .84em; box-shadow: var(--shadow-sm); }
 .timeline-pill svg { color: var(--accent); }
 /* Narrow screens: the timeline becomes a sheet over the bottom of the chat. */
 @media (max-width: 900px) {
   .chat-wrap { position: relative; }
-  .timeline { position: absolute; left: 8px; right: 8px; top: 8px; width: auto; max-height: 62%; border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow, 0 8px 30px rgba(0,0,0,.18)); z-index: 5; }
+  .timeline { position: absolute; left: 8px; right: 8px; top: 8px; width: auto; max-height: 62%; border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow, 0 8px 30px rgba(0,0,0,.18)); z-index: 5; overflow-y: auto; }
+  .timeline .timeline-list { overflow: visible; flex: none; }
 }
 .restart-note { display: flex; align-items: center; justify-content: center; gap: 6px; text-align: center; }

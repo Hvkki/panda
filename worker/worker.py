@@ -19,6 +19,7 @@ Config comes from worker.json in an attached private dataset. No secret is print
 from __future__ import annotations
 
 import base64
+import collections
 import glob
 import json
 import math
@@ -2251,6 +2252,109 @@ def stats_save():
         os.replace(tmp, STEP_STATS_FILE)
 
 
+TL_LONG_MAX = int(CFG.get("timeline_long_step_calls", 10))  # extra notes for long steps, past TL_MAX
+TL_LONG_AFTER = int(CFG.get("timeline_long_step_secs", 150))  # a step this long gets its own "why" note
+MACHINE = {"at": 0.0, "data": {}}
+MACHINE_LOCK = threading.Lock()
+
+
+def _ps_rows() -> dict:
+    """pid -> {ppid, secs, args} for every process (from /proc, no ps needed)."""
+    rows, tick, up = {}, os.sysconf("SC_CLK_TCK"), float(open("/proc/uptime").read().split()[0])
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            stat = open(f"/proc/{d}/stat").read()
+            args = open(f"/proc/{d}/cmdline", "rb").read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+        except OSError:
+            continue
+        f = stat.rsplit(")", 1)[1].split()
+        rows[int(d)] = {"ppid": int(f[1]), "secs": up - int(f[19]) / tick, "args": args, "name": stat.split("(", 1)[1].rsplit(")", 1)[0]}
+    return rows
+
+
+def machine_now() -> dict:
+    """What agents' commands are running right now on Panda's machine, and how busy it is.
+
+    {"load": 16.6, "cpus": 4, "cmds": [{cmd, secs, kids, job?, last?}]}. Agent commands are the
+    shells kiro-cli starts; pjob jobs are read from ~/work/jobs (their shells have left kiro-cli).
+    Shared by every chat and cached for 5 s, so it costs nothing per chat.
+    """
+    with MACHINE_LOCK:
+        if time.time() - MACHINE["at"] < 5:
+            return MACHINE["data"]
+        MACHINE["at"] = time.time()
+    data: dict = {"cpus": os.cpu_count() or 1, "cmds": []}
+    with contextlib.suppress(Exception):
+        data["load"] = round(float(open("/proc/loadavg").read().split()[0]), 1)
+    try:
+        rows = _ps_rows()
+    except Exception:
+        rows = {}
+    kids: dict = {}
+    for pid, r in rows.items():
+        kids.setdefault(r["ppid"], []).append(pid)
+
+    def tree(pid):  # names of the busy programs under a shell: "node, 4× ffmpeg"
+        out, todo = [], list(kids.get(pid, []))
+        while todo and len(out) < 60:
+            p = todo.pop()
+            todo += kids.get(p, [])
+            n = rows[p]["name"]
+            if n not in ("bash", "sh", "timeout", "tail", "head", "grep", "tee", "sleep", "cat"):
+                out.append(n)
+        c = collections.Counter(out)
+        return ", ".join(f"{v}× {k}" if v > 1 else k for k, v in c.most_common(4))
+
+    def shell_cmd(args: str) -> str:
+        m = re.match(r"^\S*(?:bash|sh)\s+-\w*c\s+(.*)$", args, re.S)
+        return (m.group(1) if m else args).strip()
+
+    cmds = []
+    for pid, r in rows.items():
+        parent = rows.get(r["ppid"], {})
+        if "kiro-cli" in parent.get("name", "") + parent.get("args", "")[:60] and r["name"] in ("bash", "sh") \
+                and r["secs"] >= 3:
+            cmds.append({"cmd": scrub(shell_cmd(r["args"]))[:300], "secs": round(r["secs"]), "kids": tree(pid)})
+    root = f"{HOME}/work/jobs"
+    for name in (os.listdir(root) if os.path.isdir(root) else []):
+        d = os.path.join(root, name)
+        try:
+            pid = int(open(f"{d}/pid").read().strip() or 0)
+            if os.path.exists(f"{d}/exit") or pid not in rows:
+                continue
+            started = float(open(f"{d}/started").read().strip() or 0)
+            cmd = open(f"{d}/cmd").read().strip()
+            with open(f"{d}/log", "rb") as fh:
+                fh.seek(0, 2)
+                fh.seek(max(0, fh.tell() - 4096))
+                lines = [ln.split("\r")[-1].strip() for ln in fh.read().decode("utf-8", "replace").split("\n")]
+            last = next((ln for ln in reversed(lines) if ln), "")
+        except (OSError, ValueError):
+            continue
+        cmds.append({"job": name, "cmd": scrub(cmd)[:300], "secs": round(time.time() - started) if started else None,
+                     "kids": tree(pid), "last": scrub(last)[:160]})
+    cmds.sort(key=lambda c: -(c.get("secs") or 0))
+    data["cmds"] = cmds[:8]
+    with MACHINE_LOCK:
+        MACHINE["data"] = data
+    return data
+
+
+def machine_lines(m: dict) -> str:
+    """The machine view in a few lines for the narrator."""
+    if not m:
+        return ""
+    out = [f"Machine: load {m.get('load', '?')} on {m.get('cpus', '?')} CPUs (load above the CPU count means "
+           "commands share the CPUs and each runs slower)."]
+    for c in m.get("cmds") or []:
+        out.append(f"- {'background job ' + c['job'] + ': ' if c.get('job') else ''}{c['cmd'][:160]} "
+                   f"[{c.get('secs')}s{', programs: ' + c['kids'] if c.get('kids') else ''}"
+                   f"{', last log: ' + c['last'] if c.get('last') else ''}]")
+    return "\n".join(out)
+
+
 def lite_ask(gw: "Gateway", text: str, model: str, name: str, timeout: int = 60) -> str:
     """One short answer from a throw-away kirocrew-lite slot (no tools, nothing remembered)."""
     created = gw.call("POST", "/api/chat/slots", {"name": name, "agent": "kirocrew-lite", "memory_mode": "incognito"})
@@ -2286,7 +2390,8 @@ def lite_ask(gw: "Gateway", text: str, model: str, name: str, timeout: int = 60)
         _safe(gw.call, "DELETE", f"/api/chat/slots/{slot}")
 
 
-def narrate(gw: "Gateway", ask: str, tools: list, at: list, elapsed: float, thinking: str, lang: str) -> dict:
+def narrate(gw: "Gateway", ask: str, tools: list, at: list, elapsed: float, thinking: str, lang: str,
+            machine: dict | None = None) -> dict:
     """Haiku's view of the running answer: {now, next, step_left, total_left} (seconds may be None)."""
     lines = []
     n = min(len(tools), len(at))
@@ -2299,18 +2404,25 @@ def narrate(gw: "Gateway", ask: str, tools: list, at: list, elapsed: float, thin
         '{"now": "<what it is doing right now, plain words, max 9 words>", '
         '"next": "<the likely next step, max 9 words, or empty>", '
         '"step_left": <seconds until the current step likely ends, integer>, '
-        '"total_left": <seconds until the whole answer likely ends, integer>}\n'
-        f"Write now/next in this language: {lang}. Never mention tools, JSON or yourself. Be realistic: "
-        "renders, model downloads, GPU jobs, installs and long scripts take minutes.\n\n"
+        '"total_left": <seconds until the whole answer likely ends, integer>, '
+        '"why": "<why the current step takes as long as it does, max 25 words, from the evidence below; '
+        'empty if it is quick>"}\n'
+        f"Write now/next/why in this language: {lang}. Never mention tools, JSON or yourself. Be realistic: "
+        "renders, model downloads, GPU jobs, installs and long scripts take minutes. For why, use the "
+        "facts: what the command does, progress and ETA lines in a job's log, other commands sharing a busy "
+        "machine. Name the cause plainly (e.g. 'the video render is using all 4 CPUs, so the audio mix runs "
+        "slowly'). If a progress line shows an ETA, base step_left/total_left on it. Do not guess beyond the facts.\n\n"
         f"User asked: {ask[:400]}\n"
         f"Running for {int(elapsed)}s. Steps so far (start time, duration):\n" + "\n".join(lines) + "\n"
         + (f"The current kind of step usually takes about {typ}s.\n" if typ else "")
+        + (machine_lines(machine) + "\n" if machine else "")
         + (f"Agent's latest thoughts: {thinking[-700:]}\n" if thinking else ""))
     raw = lite_ask(gw, prompt, TL_MODEL, "Panda timeline", timeout=45)
     m = re.search(r"\{.*\}", raw or "", re.S)
     data = json.loads(m.group(0)) if m else {}
     num = lambda v: int(v) if isinstance(v, (int, float)) and 0 <= v < 6 * 3600 else None
     return {"now": scrub(str(data.get("now") or ""))[:90], "next": scrub(str(data.get("next") or ""))[:90],
+            "why": scrub(str(data.get("why") or ""))[:200],
             "step_left": num(data.get("step_left")), "total_left": num(data.get("total_left"))}
 
 
@@ -2423,11 +2535,12 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                 el = time.time() - t0
                 with THINK_LOCK:
                     th = THINK.get(slot, "")
-                note = narrate(gw, str(msg.get("content") or ""), list(tools), list(tool_at), el, th, lang)
+                note = narrate(gw, str(msg.get("content") or ""), list(tools), list(tool_at), el, th, lang,
+                               tl.get("run"))
             if stream_done.is_set() or not note.get("now"):
                 return
             el = round(el, 1)
-            tl.update(now=note["now"], next=note["next"], at=el, step=len(tools) - 1,
+            tl.update(now=note["now"], next=note["next"], why=note["why"], at=el, step=len(tools) - 1,
                       step_end=round(el + note["step_left"]) if note["step_left"] is not None else None,
                       done_end=round(el + note["total_left"]) if note["total_left"] is not None else None)
             state["dirty"] = True
@@ -2451,12 +2564,27 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                         gw.call("POST", f"/api/chat/slots/{slot}/stop")
                 except Exception as exc:
                     log("stop check failed:", type(exc).__name__)
-            if tl_on and not tl_state["busy"] and tools and tl_state["calls"] < TL_MAX:
+            if tl_on and tools and time.time() - tl_state.get("mach", 0) >= 10 and time.time() - t0 > TL_AFTER:
+                # What is running on the machine now (free: read from /proc, shared by all chats)
+                tl_state["mach"] = time.time()
+                try:
+                    tl["run"] = machine_now()
+                    state["dirty"] = True
+                except Exception as exc:
+                    log("machine view failed:", type(exc).__name__)
+            if tl_on and not tl_state["busy"] and tools:
                 el = time.time() - t0
                 fresh = len(tools) != tl_state["steps"]
                 gap = time.time() - tl_state["last"]
-                if el > TL_AFTER and ((fresh and gap > TL_EVERY) or gap > 2.5 * TL_EVERY):
-                    tl_state.update(busy=True, calls=tl_state["calls"] + 1, last=time.time(), steps=len(tools))
+                step_secs = el - tool_at[-1] if tool_at else 0
+                regular = tl_state["calls"] < TL_MAX and el > TL_AFTER and \
+                    ((fresh and gap > TL_EVERY) or gap > 2.5 * TL_EVERY)
+                # A long step always gets a note saying why (once, then every 10 min), even past TL_MAX.
+                long_step = not regular and tl_state.get("long", 0) < TL_LONG_MAX and step_secs > TL_LONG_AFTER \
+                    and gap > 60 and (tl.get("step") != len(tools) - 1 or gap > 600)
+                if regular or long_step:
+                    tl_state.update(busy=True, last=time.time(), steps=len(tools))
+                    tl_state["calls" if regular else "long"] = tl_state.get("calls" if regular else "long", 0) + 1
                     threading.Thread(target=tl_run, daemon=True).start()
             with THINK_LOCK:
                 n = len(THINK.get(slot, ""))

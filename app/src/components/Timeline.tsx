@@ -11,7 +11,18 @@ export type TimelineNote = {
   step_end?: number | null;   // seconds into the answer when that step should end
   done_end?: number | null;   // seconds into the answer when the whole answer should end
   typ?: number | null;  // how long this kind of step usually takes (from past answers), seconds
+  why?: string;         // Haiku: why the current step takes as long as it does
+  run?: MachineView;    // what is running on Panda's machine right now (worker reads /proc every ~10 s)
 };
+export type MachineCmd = { cmd: string; secs?: number | null; kids?: string; job?: string; last?: string };
+export type MachineView = { load?: number; cpus?: number; cmds?: MachineCmd[] };
+
+/** The command itself, short: drops "cd dir &&" and env prefixes, first line only. */
+function cmdText(raw: string, n = 90): string {
+  let t = raw.replace(/^(running|ran|tool)\s*:\s*/i, "").split("\n")[0].trim();
+  t = t.replace(/^(?:(?:cd\s+\S+|source\s+\S+|set\s+[-+]\w+)\s*(?:&&|;)\s*|[A-Z_][A-Z0-9_]*=\S*\s+)+/, "");
+  return t.length > n ? t.slice(0, n - 1) + "…" : t;
+}
 
 const KEY = "panda.timeline.open";
 
@@ -89,7 +100,30 @@ export function Timeline({ m, onClose }: { m: Message; onClose: () => void }) {
               {doneEta > 0 ? <>Whole answer: {left(doneEta)} · ~{clock(now + doneEta * 1000)}</> : <>Whole answer: should be close</>}
             </div>
           )}
+          {tl.why && sameStep && <div className="tl-why small">Why: {tl.why}</div>}
           {tl.next && sameStep && <div className="tl-next muted small">Next: {tl.next}</div>}
+        </div>
+      )}
+
+      {live && !!tl.run?.cmds?.length && (
+        <div className="tl-machine">
+          <div className="tl-label">
+            Running on Panda's machine
+            {typeof tl.run.load === "number" && tl.run.cpus ? (
+              <span className={`tl-load ${tl.run.load > tl.run.cpus * 1.5 ? "busy" : ""}`}>
+                {tl.run.load > tl.run.cpus * 1.5 ? "very busy" : tl.run.load > tl.run.cpus ? "busy" : "free"} · load {tl.run.load} / {tl.run.cpus} CPUs
+              </span>
+            ) : null}
+          </div>
+          {tl.run.cmds.map((c, i) => (
+            <div key={i} className="tl-cmd-row" title={c.cmd}>
+              <code className="tl-cmd">{c.job ? <b>{c.job}: </b> : null}{cmdText(c.cmd)}</code>
+              <span className="muted small">
+                {typeof c.secs === "number" ? dur(c.secs) : ""}{c.kids ? ` · ${c.kids}` : ""}
+              </span>
+              {c.last && <span className="tl-cmd-log small">{c.last}</span>}
+            </div>
+          ))}
         </div>
       )}
 
@@ -104,6 +138,7 @@ export function Timeline({ m, onClose }: { m: Message; onClose: () => void }) {
               <span className="tl-dot">{running ? <IconSpinner size={12} /> : null}</span>
               <span className="tl-icon">{s.icon}</span>
               <span className="tl-step">{s.label}</span>
+              {/^(Running a command|Working)$/.test(s.label) && <code className="tl-cmd tl-step-cmd">{cmdText(raw, 70)}</code>}
               <span className="tl-time muted small">
                 {st !== undefined ? clock(startMs + st * 1000) : ""}
                 {st !== undefined && end !== undefined ? ` · ${dur(end - st)}` : ""}

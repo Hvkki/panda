@@ -25,7 +25,13 @@ reply["meta"] = {
               "Running: modal run h3_batch.py::batch --jobs jobs.json", "Running: python3 /root/work/tts/qc.py vo2/*.wav"],
     "steps_at": [4.0, 20.0, 41.0, 300.0, 1500.0], "n_steps": 5,
     "tl": {"now": "Checking each voice take for clear speech", "next": "Mixing the music under the voice",
-           "at": 1700.0, "step": 4, "step_end": 2100.0, "done_end": 2700.0, "typ": 380},
+           "at": 1700.0, "step": 4, "step_end": 2100.0, "done_end": 2700.0, "typ": 380,
+           "why": "The video render is using all 4 CPUs, so this audio check runs about 4x slower than usual.",
+           "run": {"load": 16.6, "cpus": 4, "cmds": [
+               {"job": "fullrender", "cmd": "node render.mjs --project projects/thinks --workers 4 --out video_720p.mp4",
+                "secs": 2200, "kids": "24× headless_shell, 4× ffmpeg, node",
+                "last": "8256/14784 frames  3.75 fps  elapsed 36m42s  eta 29m02s"},
+               {"cmd": "cd /root/work/tts && python3 /root/work/tts/qc.py vo2/*.wav", "secs": 200, "kids": "python3"}]}},
 }
 
 
