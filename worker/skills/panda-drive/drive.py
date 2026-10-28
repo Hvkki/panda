@@ -5,7 +5,7 @@
   drive get <name-or-id> [dest]   download into ~/outputs (or dest)
   drive ls [folder/sub]           list files
   drive find <words>              search by name
-  drive rm <name-or-id>           move to trash
+  drive rm <name-or-id> [--forever]  move to trash (--forever: delete for good)
   drive link <name-or-id>         link the user can open
   drive usage                     space used / free
 
@@ -219,9 +219,15 @@ def main():
     elif op == "find" and rest:
         find(" ".join(rest))
     elif op == "rm" and rest:
-        f = resolve(rest[0])
-        call("PATCH", f"{API}/files/{f['id']}", json.dumps({"trashed": True}).encode(), {"Content-Type": "application/json"})
-        print(f"Moved {f['name']} to the trash")
+        forever = "--forever" in rest
+        f = resolve([r for r in rest if r != "--forever"][0])
+        if forever:   # Panda's own superseded snapshot copies: trash still counts against the quota
+            call("DELETE", f"{API}/files/{f['id']}")
+            print(f"Deleted {f['name']}")
+        else:
+            call("PATCH", f"{API}/files/{f['id']}", json.dumps({"trashed": True}).encode(),
+                 {"Content-Type": "application/json"})
+            print(f"Moved {f['name']} to the trash")
     elif op == "link" and rest:
         print(resolve(rest[0]).get("webViewLink"))
     elif op == "usage":

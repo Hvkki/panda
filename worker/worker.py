@@ -2147,10 +2147,12 @@ def drive_get(file_id: str, dest: str) -> bool:
 
 
 def drive_rm(file_id: str) -> None:
-    """Move a Drive file to the trash (the previous copy of the saved work files)."""
+    """Delete the previous copy of the saved work files for good. It used to go to the trash, and Drive
+    counts trash against the 15 GB quota: ~1 GB every 30 minutes filled the user's Drive in a day."""
     if file_id and os.path.exists(DRIVE_CFG):
         with contextlib.suppress(Exception):
-            subprocess.run([sys.executable, DRIVE_TOOL, "rm", file_id], capture_output=True, text=True, timeout=300)
+            subprocess.run([sys.executable, DRIVE_TOOL, "rm", file_id, "--forever"], capture_output=True,
+                           text=True, timeout=300)
 
 
 def drive_put(path: str, folder: str = "outputs") -> dict | None:
