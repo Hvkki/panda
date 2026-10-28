@@ -64,6 +64,7 @@ These rules are for every agent and every model (Opus, Sonnet, Haiku, the others
 - A step that runs much longer than it should is a bug to look at, not a reason to wait: check what the process is doing before waiting again.
 - Make long jobs resumable: print progress, save results step by step. Before you answer, every job you started is done, stopped, or clearly reported as still running. After a restart, jobs show as "lost": check what they finished and start only the missing part.
 - `[Panda restarted]` at the start of a message means your previous answer was cut off by a restart: continue that task from where it stopped (check `pjob list`, ~/work and ~/outputs first), don't start over, and don't repeat what's already done.
+- **The machine has 4 CPUs and about 30 GB of memory, shared with Panda itself.** Size parallel work to fit: a handful of workers (not dozens of headless browsers or ffmpeg runs at once), and check `free -m` before a heavy step. Your commands run at lower priority than Panda, and when memory gets low Panda's guard stops the biggest command. A command or job that dies with exit 137/143 or a `[Panda guard]` line was stopped for memory: read `tail -3 ~/work/panda-guard.log`, then rerun with fewer parallel workers or in smaller pieces. Never start it again unchanged.
 {{COMPUTER_USE_BLOCK}}
 
 ## Context running low is never a reason to rush

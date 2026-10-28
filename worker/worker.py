@@ -27,6 +27,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -3359,6 +3360,179 @@ def job_watch_loop(sb: "Supabase", gw: "Gateway", stop: threading.Event):
             log("job watch:", type(exc).__name__)
 
 
+# ── Resource guard: agents' commands can never take Panda itself down ──────────────────────────────
+# The container can't make cgroups or lower anyone's OOM score, but it can RAISE them and nice processes.
+# So every command an agent runs (shell tools under kiro-cli-chat, pjob jobs) is marked expendable:
+# oom_score_adj 1000 (the kernel kills it first, never the gateway) and nice 10 (Panda's own processes
+# keep the CPU). If free memory still falls under GUARD_MIN_FREE, the guard kills the biggest
+# expendable command itself, before the kernel has to choose, and writes why to GUARD_LOG.
+GUARD_LOG = os.path.expanduser("~/work/panda-guard.log")
+GUARD_MIN_FREE = int(os.environ.get("PANDA_GUARD_MIN_FREE_MB", "2500")) << 20
+GUARD_NICE = 10
+GUARD_MARKED: dict = {}               # pid -> start time, so a recycled pid is marked again
+GUARD_LAST_KILL = [0.0]
+
+
+def _guard_procs() -> dict:
+    page, out = os.sysconf("SC_PAGE_SIZE"), {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            st = open(f"/proc/{d}/stat").read()
+            r = st.rindex(")")
+            f = st[r + 2:].split()
+            out[int(d)] = {"comm": st[st.index("(") + 1:r], "ppid": int(f[1]), "sid": int(f[3]),
+                           "start": int(f[19]), "rss": int(f[21]) * page}
+        except (OSError, ValueError, IndexError):
+            pass
+    return out
+
+
+def _guard_cmdline(pid: int) -> str:
+    try:
+        return open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def guard_groups(procs: dict) -> list:
+    """Expendable command groups: [{"root", "pids", "rss", "job"}]. A group is one shell tool call an
+    agent made (a child of kiro-cli-chat that is not a Kiro Crew MCP server) or one pjob job (its whole
+    session), each with every descendant."""
+    kids: dict = {}
+    for pid, p in procs.items():
+        kids.setdefault(p["ppid"], []).append(pid)
+
+    def tree(root: int) -> set:
+        seen, todo = set(), [root]
+        while todo:
+            q = todo.pop()
+            if q in seen or q not in procs:
+                continue
+            seen.add(q)
+            todo += kids.get(q, [])
+        return seen
+
+    groups, taken = [], set()
+    if os.path.isdir(JOBS_DIR):
+        for name in os.listdir(JOBS_DIR):
+            try:
+                jp = int(open(f"{JOBS_DIR}/{name}/pid").read().strip() or 0)
+            except (OSError, ValueError):
+                continue
+            if jp > 1 and jp in procs and not os.path.exists(f"{JOBS_DIR}/{name}/exit"):
+                pids = {q for q, p in procs.items() if p["sid"] == jp} | tree(jp)
+                groups.append({"root": jp, "pids": pids, "job": name})
+                taken |= pids
+    for pid, p in procs.items():
+        if p["comm"].startswith("kiro-cli-chat"):
+            for c in kids.get(pid, []):
+                if c in taken or " mcp-" in _guard_cmdline(c):
+                    continue
+                pids = tree(c) - taken
+                groups.append({"root": c, "pids": pids, "job": None})
+                taken |= pids
+    for g in groups:
+        g["rss"] = sum(procs[q]["rss"] for q in g["pids"] if q in procs)
+    return groups
+
+
+def guard_free() -> int:
+    """Bytes the container can still use: the smaller of the host's MemAvailable and the cgroup limit
+    minus what is in use (inactive page cache counts as free, the kernel drops it first)."""
+    free = 1 << 62
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                free = int(line.split()[1]) << 10
+    except OSError:
+        pass
+    try:
+        lim = open("/sys/fs/cgroup/memory.max").read().strip()
+        if lim != "max":
+            cur = int(open("/sys/fs/cgroup/memory.current").read())
+            inactive = 0
+            for line in open("/sys/fs/cgroup/memory.stat"):
+                if line.startswith("inactive_file "):
+                    inactive = int(line.split()[1])
+            free = min(free, int(lim) - cur + inactive)
+    except (OSError, ValueError):
+        pass
+    return free
+
+
+def _guard_note(text: str):
+    log("guard:", text)
+    try:
+        with open(GUARD_LOG, "a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S UTC ", time.gmtime()) + text + "\n")
+    except OSError:
+        pass
+
+
+def guard_step(free_fn=guard_free, min_free: int = None) -> dict:
+    procs = _guard_procs()
+    groups = guard_groups(procs)
+    marked = 0
+    for g in groups:
+        for q in g["pids"]:
+            if GUARD_MARKED.get(q) == procs[q]["start"]:
+                continue
+            try:
+                open(f"/proc/{q}/oom_score_adj", "w").write("1000")
+                if os.getpriority(os.PRIO_PROCESS, q) < GUARD_NICE:
+                    os.setpriority(os.PRIO_PROCESS, q, GUARD_NICE)
+                GUARD_MARKED[q] = procs[q]["start"]
+                marked += 1
+            except OSError:
+                pass
+    for q in [q for q in GUARD_MARKED if q not in procs]:
+        GUARD_MARKED.pop(q, None)
+    free = free_fn()
+    floor = GUARD_MIN_FREE if min_free is None else min_free
+    killed = None
+    if free < floor and groups and time.time() - GUARD_LAST_KILL[0] > 10:
+        g = max(groups, key=lambda x: x["rss"])
+        what = f"pjob {g['job']}" if g["job"] else _guard_cmdline(g["root"])[:160]
+        msg = (f"memory low ({free >> 20} MB free): stopped {what} (pid {g['root']}, "
+               f"{g['rss'] >> 20} MB in {len(g['pids'])} processes) so Panda keeps running")
+        _guard_note(msg)
+        if g["job"]:
+            try:
+                with open(f"{JOBS_DIR}/{g['job']}/log", "a") as f:
+                    f.write(f"\n[Panda guard] {msg}. Use less memory (fewer parallel workers) and retry.\n")
+            except OSError:
+                pass
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for q in g["pids"]:
+                try:
+                    if procs.get(q) and _guard_procs_alive(q, procs[q]["start"]):
+                        os.kill(q, sig)
+                except OSError:
+                    pass
+            if sig == signal.SIGTERM:
+                time.sleep(3)
+        GUARD_LAST_KILL[0] = time.time()
+        killed = g
+    return {"groups": len(groups), "marked": marked, "free": free, "killed": killed}
+
+
+def _guard_procs_alive(pid: int, start: int) -> bool:
+    try:
+        return int(open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[19]) == start
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def guard_loop(stop: threading.Event):
+    while not stop.wait(2):
+        try:
+            guard_step()
+        except Exception as exc:
+            log("guard:", type(exc).__name__)
+
+
 # ── brief: Haiku answers what the agent wants from a long command output (skills/panda-jobs/brief.py) ─
 BRIEF_BOX = os.path.expanduser("~/.panda/brief")
 BRIEF_SEEN: set = set()
@@ -4650,6 +4824,7 @@ def main():
         threading.Thread(target=followup_loop, args=(sb, gw, stop_evt), daemon=True).start()
         threading.Thread(target=job_watch_loop, args=(sb, gw, stop_evt), daemon=True).start()
         threading.Thread(target=brief_loop, args=(gw, stop_evt), daemon=True).start()
+        threading.Thread(target=guard_loop, args=(stop_evt,), daemon=True, name="guard").start()
         threading.Thread(target=thinking_pusher, args=(sb, stop_evt), daemon=True).start()
         pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL_CHATS)
         # Messages are picked up on their own thread: a slow snapshot or usage refresh in the main loop
