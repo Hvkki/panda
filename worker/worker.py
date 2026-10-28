@@ -193,7 +193,12 @@ class Supabase:
         return r.content if r.status_code == 200 else None
 
     def delete_object(self, name: str, bucket: str = BUCKET):
-        requests.delete(f"{SB_URL}/storage/v1/object/{bucket}/{quote(name)}", headers=self.headers(), timeout=60)
+        # No JSON Content-Type here: Supabase refuses an empty JSON body with 400, which made every
+        # delete fail silently and left every old snapshot part in Storage (11.5 GB by Oct 2026).
+        h = {k: v for k, v in self.headers().items() if k != "Content-Type"}
+        r = requests.delete(f"{SB_URL}/storage/v1/object/{bucket}/{quote(name)}", headers=h, timeout=60)
+        if r.status_code >= 400 and r.status_code != 404:
+            log(f"storage delete {name.rsplit('/', 1)[-1]}: {r.status_code} {r.text[:120]}")
 
     def download(self, name: str, path: str, bucket: str = BUCKET) -> bool:
         r = requests.get(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
@@ -210,7 +215,15 @@ class Supabase:
 CREW_VERSION = {"v": ""}
 
 
+START_STEPS: dict = {}  # seconds since the script started, per Start phase (shown in session info)
+
+
 def install():
+    # Libraries the Panda skills use (PDF/DOCX/PPTX, image work, phone push): system Python, so they
+    # install while Kiro does.
+    pip = threading.Thread(target=sh, args=(f"{sys.executable} -m pip install -q reportlab python-docx python-pptx "
+                                            "pillow pywebpush websocket-client",), kwargs={"timeout": 600}, daemon=True)
+    pip.start()
     sh("curl -fsSL https://cli.kiro.dev/install | bash", check=True)
     sh("curl -fsSL https://download.crew.kiro.dev/cli.sh | sh", timeout=1500, check=True)
     r = sh("kiro-cli --version; kirocrew --version")
@@ -232,8 +245,7 @@ def install():
     # Cheap model for background work: auto-titles, memory consolidation, heartbeats
     # all run Kiro Crew's "background" role. Haiku 5.5 is fast and cheap and writes better than GLM-5.
     sh("kirocrew config set agent.role_models '{\"background\": \"claude-haiku-5.5\"}'")
-    # Libraries the Panda skills use (PDF/DOCX/PPTX, image work, phone push).
-    sh(f"{sys.executable} -m pip install -q reportlab python-docx python-pptx pillow pywebpush websocket-client", timeout=600)
+    pip.join()
 
 
 def install_skills(sb: "Supabase"):
@@ -608,7 +620,7 @@ def blob_load(sb: "Supabase", name: str, dest: str) -> bool:
         local = []
         try:
             for i, n in enumerate(man.get("parts") or []):
-                p = f"{WORK}/restore-part-{i:03d}"
+                p = f"{WORK}/restore-part-{name}-{i:03d}"  # per blob: two blobs may download at once
                 if not sb.download(state_key(n), p):
                     raise RuntimeError(f"saved part {n} is missing")
                 local.append(p)
@@ -1046,16 +1058,69 @@ def kiro_restore(sb: "Supabase", base: str | None = None) -> int | None:
     return len(files)
 
 
-def restore(sb: Supabase) -> str:
+def prefetch_state(sb: Supabase) -> dict:
+    """Download the saved Crew snapshot and kiro-cli files while Kiro is still being installed (Start
+    used to install first, ~1.5 min, and only then download ~0.5 GB). Nothing is unpacked into ~/.kiro
+    here: `kirocrew setup` writes there at the same time. restore() applies the result afterwards."""
+    out: dict = {}
+
+    def crew():
+        p = f"{WORK}/restore-crew.tar.gz"
+        out["crew"] = p if blob_load(sb, "latest-crew.tar.gz", p) else ""
+
+    def kiro():
+        stage = f"{WORK}/kiro-stage"
+        shutil.rmtree(stage, ignore_errors=True)
+        n = kiro_restore(sb, stage)
+        if n is not None:
+            out["kiro_stage"], out["kiro_n"] = stage, n
+        else:
+            p = f"{WORK}/restore-kiro.tar.gz"
+            out["kiro_tar"] = p if blob_load(sb, "latest-kiro.tar.gz", p) else ""
+
+    for fn in (crew, kiro):
+        def run(fn=fn):
+            try:
+                fn()
+            except Exception as exc:
+                out.setdefault("errors", []).append(f"{fn.__name__}: {scrub(exc)[:200]}")
+        t = threading.Thread(target=run, daemon=True, name=f"prefetch-{fn.__name__}")
+        t.start()
+        out.setdefault("threads", []).append(t)
+    return out
+
+
+def restore(sb: Supabase, pre: dict | None = None) -> str:
     snap = f"{WORK}/restore-crew.tar.gz"
     extra = f"{WORK}/restore-kiro.tar.gz"
-    got = blob_load(sb, "latest-crew.tar.gz", snap)
+    if pre is not None:
+        for t in pre.get("threads", []):
+            t.join()
+        for e in pre.get("errors", []):
+            log("prefetch failed, downloading again:", e)
+        if pre.get("errors"):
+            pre = None  # fall back to the plain sequential restore below
+    got = pre["crew"] if pre is not None else blob_load(sb, "latest-crew.tar.gz", snap)
     if got:
         sh(f"kirocrew restore {snap} --mode replace --force", timeout=900)
-    n = kiro_restore(sb)
+    if pre is not None and pre.get("kiro_stage"):
+        stage = pre["kiro_stage"]
+        for dirpath, _, names in os.walk(stage):
+            for name in names:
+                src = os.path.join(dirpath, name)
+                dest = os.path.join(f"{HOME}/.kiro", os.path.relpath(src, stage))
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.move(src, dest)  # same disk: a rename; keeps the saved mtime
+        shutil.rmtree(stage, ignore_errors=True)
+        n = pre["kiro_n"]
+    elif pre is not None:
+        n = None
+    else:
+        n = kiro_restore(sb)
     if n is not None:
         log(f"restore: {n} kiro-cli files from chunks")
-    elif blob_load(sb, "latest-kiro.tar.gz", extra):  # saved by a worker from before the chunk store
+    elif (pre["kiro_tar"] if pre is not None else blob_load(sb, "latest-kiro.tar.gz", extra)):
+        # saved by a worker from before the chunk store
         with tarfile.open(extra) as t:
             t.extractall(f"{HOME}/.kiro", filter="data")
     for lock in glob.glob(f"{HOME}/.kiro/sessions/cli/*.lock"):
@@ -4502,14 +4567,19 @@ def main():
     gw_proc = None
     ho = {"to": None, "tries": 0, "last": None}
     try:
-        install()
         pred = SESSION_INFO.get("handoff_from")
+        # Download the saved state while Kiro installs. A successor must not read it before the previous
+        # run has saved, so it keeps the old order.
+        pre = prefetch_state(sb) if not pred else None
+        install()
+        START_STEPS["install"] = round(time.time() - T0)
         if pred:  # successor: do not touch the account's state until the previous run has saved it
             if wait_for_predecessor(sb, sid, pred, set_sess) == "stop":
                 SESSION_INFO["stop_reason"] = "stopped before taking over"
                 set_sess(status="stopped", stopped_at=now_iso(), info=SESSION_INFO)
                 return
-        restored = restore(sb)
+        restored = restore(sb, pre)
+        START_STEPS["restore"] = round(time.time() - T0)
         # The app's system prompt lives in Storage so it can be edited without a redeploy.
         os.makedirs(f"{HOME}/.kiro/crew", exist_ok=True)
         if sb.download("config/prompt.md", f"{HOME}/.kiro/crew/prompt.md"):
@@ -4521,6 +4591,7 @@ def main():
         # After the Drive login and the drive tool are in place: big saves live in Google Drive, and
         # restoring before them failed on every run, so ~/dev, ~/work and ~/outputs came back empty.
         files_state = restore_files(sb)
+        START_STEPS["files"] = round(time.time() - T0)
         setup_drive()  # the restored ~/.panda may hold an older drive.json
         try:
             sync_secrets(sb)
@@ -4532,7 +4603,9 @@ def main():
         start_browser(sb)
         _safe(start_codex, sb)
         start_stt()
+        START_STEPS["before_gateway"] = round(time.time() - T0)
         gw_proc = start_gateway()
+        START_STEPS["gateway_up"] = round(time.time() - T0)
         gw = Gateway()
         # Kiro Crew settings changed in the app, re-applied in case the snapshot predates them.
         apply_overrides(gw, user_settings(sb, OWNER).get("crewOverrides"))
@@ -4555,7 +4628,9 @@ def main():
         except Exception as exc:
             log("restart check failed:", scrub(exc)[:200])
         threading.Thread(target=claim_loop, args=(sb, gw, pool, stop_evt), daemon=True).start()
-        SESSION_INFO.update(restored=restored, files_restored=files_state, startup_secs=round(time.time() - T0), crew=CREW_VERSION["v"])
+        SESSION_INFO.update(restored=restored, files_restored=files_state, startup_secs=round(time.time() - T0), crew=CREW_VERSION["v"],
+                            start_steps=START_STEPS)
+        log("start timings (s since script start):", START_STEPS)
         SESSION_INFO.pop("handoff_ready", None)
         set_sess(status="running", heartbeat_at=now_iso(), info=SESSION_INFO)
         USAGE_STATE["sid"] = sid

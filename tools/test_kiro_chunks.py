@@ -120,6 +120,24 @@ def main():
     R["lock_files_skipped"] = not any(a.endswith(".lock") for a, _ in W._kiro_walk(dest))
     timed("save_after_restore", lambda: W.kiro_save(sb, dest))  # mtimes kept: nothing re-uploads
 
+    # Start path: prefetch while Kiro installs, then restore() moves the staged files into ~/.kiro.
+    home = f"{tmp}/home"
+    os.makedirs(f"{home}/.kiro", exist_ok=True)
+    real = (W.HOME, W.WORK, W.blob_load, W.sh)
+    W.HOME, W.WORK = home, f"{tmp}/kwork"
+    os.makedirs(W.WORK, exist_ok=True)
+    W.blob_load = lambda sb_, name, p: False  # no Crew snapshot in this fake store
+    W.sh = lambda *a, **k: None
+    try:
+        t0 = time.time()
+        pre = W.prefetch_state(sb)
+        W.restore(sb, pre)
+        R["start_restore"] = {"secs": round(time.time() - t0, 1),
+                              "identical": tree_sha(dest) == tree_sha(f"{home}/.kiro"),
+                              "work_left": os.listdir(W.WORK)}
+    finally:
+        W.HOME, W.WORK, W.blob_load, W.sh = real
+
     if "--old" in sys.argv:
         t0 = time.time()
         arc = f"{tmp}/old.tar.gz"
@@ -131,7 +149,8 @@ def main():
         R["old_method"] = {"pack_secs": round(secs, 1), "up_mb": size // MB,
                            "est_secs_at_4MBps": round(secs + size / UPLINK, 1)}
     shutil.rmtree(tmp, ignore_errors=True)
-    ok = R["restore_identical"] and R["unchanged_save"]["up_mb"] == 0 and R["save_after_restore"]["up_mb"] == 0
+    ok = (R["restore_identical"] and R["unchanged_save"]["up_mb"] == 0 and R["save_after_restore"]["up_mb"] == 0
+          and R["start_restore"]["identical"] and not R["start_restore"]["work_left"])
     R["ok"] = ok
     print(json.dumps(R, indent=1))
     if os.path.isdir("/kaggle/working"):
