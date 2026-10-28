@@ -42,34 +42,21 @@ function isAlive(r: Row | undefined | null): boolean {
     (["requested", "starting"].includes(r.status) && (age < BOOT_SECS || beat < ALIVE_SECS));
 }
 
-/** Push the worker code to this account's notebook and record the run. Used by Start and by hand-off. */
-async function launch(admin: Admin, userId: string, info: Row): Promise<
-  { ok: true; session: Row } | { ok: false; status: number; error: string }
-> {
-  const token = Deno.env.get("KAGGLE_API_TOKEN");
-  const fallback = Deno.env.get("KAGGLE_KERNEL");
-  const dataset = Deno.env.get("KAGGLE_DATASET");
-  if (!token || !fallback || !dataset) return { ok: false, status: 500, error: "function secrets are not set" };
-
-  // This account's own notebook (its own CPU), else the default one.
-  let kernel = fallback;
+/** This account's own notebook (its own CPU), else the default one. */
+async function kernelFor(admin: Admin, userId: string, fallback: string): Promise<string> {
   const map = await admin.storage.from("kirocrew-state").download("config/kernels.json");
   if (!map.error) {
     try {
       const k = (JSON.parse(await map.data.text()) as Record<string, string>)[userId];
-      if (typeof k === "string" && /^[\w-]+\/[\w-]+$/.test(k)) kernel = k;
+      if (typeof k === "string" && /^[\w-]+\/[\w-]+$/.test(k)) return k;
     } catch { /* a broken map falls back to the default notebook */ }
   }
-  const code = await admin.storage.from("kirocrew-state").download("code/worker.py");
-  if (code.error) return { ok: false, status: 500, error: "worker code missing in storage" };
+  return fallback;
+}
 
-  const { data: sess, error: insErr } = await admin.from("worker_sessions")
-    .insert({ owner: userId, status: "requested", info, kaggle_kernel: `${kernel} v?` }).select().single();
-  if (insErr) return { ok: false, status: 500, error: insErr.message };
-  // The run serves exactly this Start press (and so this account).
-  const text = (await code.data.text()).replace(/^INJECTED_SESSION_ID = ""$/m, `INJECTED_SESSION_ID = "${sess.id}"`);
+/** Push `text` as a private CPU script with internet and the worker dataset; Kaggle runs it at once. */
+async function pushKernel(token: string, dataset: string, kernel: string, text: string): Promise<Row> {
   const title = kernel.split("/")[1].replace(/-/g, " ");
-
   const push = await fetch("https://api.kaggle.com/v1/kernels.KernelsApiService/SaveKernel", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
@@ -81,13 +68,62 @@ async function launch(admin: Admin, userId: string, info: Row): Promise<
     }),
   });
   const out = await push.json().catch(() => ({}));
-  if (!push.ok || out.error) {
-    await admin.from("worker_sessions").update({ status: "error", info: { ...info, error: out.error || push.status } })
+  return { ok: push.ok && !out.error, status: push.status, error: out.error, versionNumber: out.versionNumber };
+}
+
+/** Push the worker code to this account's notebook and record the run. Used by Start and by hand-off. */
+async function launch(admin: Admin, userId: string, info: Row): Promise<
+  { ok: true; session: Row } | { ok: false; status: number; error: string }
+> {
+  const token = Deno.env.get("KAGGLE_API_TOKEN");
+  const fallback = Deno.env.get("KAGGLE_KERNEL");
+  const dataset = Deno.env.get("KAGGLE_DATASET");
+  if (!token || !fallback || !dataset) return { ok: false, status: 500, error: "function secrets are not set" };
+
+  const kernel = await kernelFor(admin, userId, fallback);
+  const code = await admin.storage.from("kirocrew-state").download("code/worker.py");
+  if (code.error) return { ok: false, status: 500, error: "worker code missing in storage" };
+
+  const { data: sess, error: insErr } = await admin.from("worker_sessions")
+    .insert({ owner: userId, status: "requested", info, kaggle_kernel: `${kernel} v?` }).select().single();
+  if (insErr) return { ok: false, status: 500, error: insErr.message };
+  // The run serves exactly this Start press (and so this account).
+  const text = (await code.data.text()).replace(/^INJECTED_SESSION_ID = ""$/m, `INJECTED_SESSION_ID = "${sess.id}"`);
+
+  const out = await pushKernel(token, dataset, kernel, text);
+  if (!out.ok) {
+    await admin.from("worker_sessions").update({ status: "error", info: { ...info, error: out.error || out.status } })
       .eq("id", sess.id);
-    return { ok: false, status: 502, error: `Kaggle refused the start: ${out.error || push.status}` };
+    return { ok: false, status: 502, error: `Kaggle refused the start: ${out.error || out.status}` };
   }
   await admin.from("worker_sessions").update({ kaggle_kernel: `${kernel} v${out.versionNumber}` }).eq("id", sess.id);
   return { ok: true, session: { ...sess, kaggle_kernel: `${kernel} v${out.versionNumber}` } };
+}
+
+/** Remote Panda: a live main run asks for its helper notebook "<notebook>-remote-<n>" (worker/remote.py).
+ * It only pulls work from Storage and stops itself when idle or when the main run is gone. */
+async function remoteStart(admin: Admin, body: Row): Promise<Response> {
+  const token = Deno.env.get("KAGGLE_API_TOKEN");
+  const fallback = Deno.env.get("KAGGLE_KERNEL");
+  const dataset = Deno.env.get("KAGGLE_DATASET");
+  if (!token || !fallback || !dataset) return json({ error: "function secrets are not set" }, 500);
+  if (body.op !== "start") return json({ error: "unknown remote op" }, 400);
+  const rid = String(body.remote_id || "r1");
+  if (!/^r[1-4]$/.test(rid)) return json({ error: "remote_id must be r1-r4" }, 400);
+  const sid = String(body.session_id || "");
+  const { data: cur } = await admin.from("worker_sessions").select("*").eq("id", sid).maybeSingle();
+  if (!cur) return json({ error: "no such run" }, 404);
+  if (!isAlive(cur) || cur.stop_requested) return json({ error: "only a live run can start a remote Panda" }, 409);
+  const kernel = `${await kernelFor(admin, cur.owner, fallback)}-remote-${rid.slice(1)}`;
+  const code = await admin.storage.from("kirocrew-state").download("code/remote.py");
+  if (code.error) return json({ error: "remote code missing in storage" }, 500);
+  const text = (await code.data.text())
+    .replace(/^INJECTED_OWNER = ""$/m, `INJECTED_OWNER = "${cur.owner}"`)
+    .replace(/^INJECTED_REMOTE_ID = ""$/m, `INJECTED_REMOTE_ID = "${rid}"`)
+    .replace(/^INJECTED_MAIN_SESSION = ""$/m, `INJECTED_MAIN_SESSION = "${sid}"`);
+  const out = await pushKernel(token, dataset, kernel, text);
+  if (!out.ok) return json({ error: `Kaggle refused the remote start: ${out.error || out.status}` }, 502);
+  return json({ kernel: `${kernel} v${out.versionNumber}` });
 }
 
 Deno.serve(async (req) => {
@@ -102,8 +138,10 @@ Deno.serve(async (req) => {
   const body = await req.json().catch(() => ({}));
   const { action = "status" } = body;
 
-  // The worker account may do exactly one thing here: hand its own run over to a successor.
+  // The worker account may do exactly two things here: hand its own run over to a successor, and start
+  // its remote Panda helper notebook.
   if (isWorker?.length) {
+    if (action === "remote") return await remoteStart(admin, body);
     if (action !== "handoff") return json({ error: "worker accounts cannot use this" }, 403);
     const sid = String(body.session_id || "");
     const { data: cur } = await admin.from("worker_sessions").select("*").eq("id", sid).maybeSingle();

@@ -1,7 +1,7 @@
 ---
 name: panda-jobs
 description: "Run long commands (renders, GPU/Modal jobs, installs, downloads, transcription, builds, big scripts) in the background with pjob, and get a Haiku wake-up when they end or get stuck instead of polling. Also `brief`: run a command and get only the answer you need from its output. Use for any command that may take more than about a minute or print a lot."
-triggers: long command, background, run in background, parallel, wait for, render, install, download, modal run, ffmpeg, training, transcribe, build, takes a while, long output, test suite, log
+triggers: long command, background, remote, remote panda, heavy, second machine, run in background, parallel, wait for, render, install, download, modal run, ffmpeg, training, transcribe, build, takes a while, long output, test suite, log
 ---
 
 # Background jobs with pjob, short answers with brief
@@ -47,6 +47,28 @@ running answer, or starts a new turn if you already ended yours.
   media, mixing or processing whole audio/video files, pip/npm installs, transcription, big scrapes, test
   suites, training. **Not sure? Use a job**: it costs nothing.
 - Two or more independent long commands: start each as its own job so they run at the same time.
+
+### --remote: run it on remote Panda (a second machine)
+This machine (4 CPUs, ~30 GB) also runs Panda itself. A heavy command (a full video render, many headless
+browsers, big ffmpeg batches, data runs that need lots of memory) can run on **remote Panda** instead: a
+second Kaggle notebook with its own 4 CPUs and ~30 GB. Panda starts it when needed (about 1 minute) and it
+stops itself after 20 idle minutes. It costs no credits; it has ffmpeg, node, npm, git and Python, but
+none of your chats or the browser.
+
+```bash
+pjob start fullrender --remote --files ~/work/thinks/full --notify --want "frames done, output path, errors" \
+  --sh 'cd ~/work/thinks/full && node render.mjs'
+pjob start stems --remote --files ~/work/mix/in.wav ~/work/mix/mix.py --out ~/work/mix/out --notify \
+  --setup 'pip install -q demucs' --sh 'cd ~/work/mix && python3 mix.py'
+```
+
+- `--files`: files and folders (under `~`) the command needs; they land at the same paths there. Send
+  only what it needs: everything goes over the network (limit 3 GB packed).
+- `--out`: what to bring back (default: the `--files` paths). Only files the command created or changed
+  come back, to the same paths here.
+- `--setup`: an install step, run once per remote start (pip, npm ci, apt).
+- Everything else works as for local jobs: the log, `--notify` and its Haiku note, `pjob stop`.
+- Use it when a command is heavy for minutes; quick commands stay local (sending files takes time).
 
 ## brief: only the answer, not the output
 

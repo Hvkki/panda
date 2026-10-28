@@ -18,6 +18,8 @@ python3 -m py_compile worker/worker.py
 TAR="$(mktemp)"
 tar -czf "$TAR" --exclude=__pycache__ -C worker/skills .
 up code/worker.py worker/worker.py text/x-python
+python3 -m py_compile worker/remote.py
+up code/remote.py worker/remote.py text/x-python
 up config/prompt.md worker/prompt.md text/markdown
 up code/skills.tar.gz "$TAR" application/gzip
 rm -f "$TAR"

@@ -44,6 +44,11 @@ gw = [q for q, x in W._guard_procs().items() if "kirocrew gateway" in W._guard_c
 assert gw and all(open(f"/proc/{q}/oom_score_adj").read().strip() == "0" for q in gw), "gateway marked!"
 print(f"ok mark: job {len(job['pids'])} procs, {job['rss'] >> 20} MB, oom 1000 nice 10; gateway untouched")
 
+# The kill step must only ever see the test's own job: on the live machine the biggest group can be a
+# real command of another chat (this test once stopped a 3.9 GB one that way).
+_real_groups = W.guard_groups
+W.guard_groups = lambda procs: [g for g in _real_groups(procs) if g["job"] == "hog"]
+
 r = W.guard_step(free_fn=lambda: 100 << 20)
 assert r["killed"] and r["killed"]["job"] == "hog", r["killed"]
 time.sleep(0.5)

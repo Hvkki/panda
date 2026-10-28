@@ -193,12 +193,24 @@ class Supabase:
                          headers=self.headers(), timeout=600)
         return r.content if r.status_code == 200 else None
 
+    def get_fresh(self, name: str, bucket: str = BUCKET) -> bytes | None:
+        """Like get(), never from the CDN. Supabase's CDN can serve an OVERWRITTEN object for up to 60 s
+        at other edges (remote Panda read its old queue.json and a short log that way); a fresh signed
+        URL is its own cache key, so it always reaches the origin."""
+        r = requests.post(f"{SB_URL}/storage/v1/object/sign/{bucket}/{quote(name)}", json={"expiresIn": 60},
+                          headers=self.headers(), timeout=60)
+        url = (r.json() if r.status_code == 200 else {}).get("signedURL") if r.text else None
+        if not url:
+            return None
+        g = requests.get(f"{SB_URL}/storage/v1{url}", timeout=600)
+        return g.content if g.status_code == 200 else None
+
     def delete_object(self, name: str, bucket: str = BUCKET):
         # No JSON Content-Type here: Supabase refuses an empty JSON body with 400, which made every
         # delete fail silently and left every old snapshot part in Storage (11.5 GB by Oct 2026).
         h = {k: v for k, v in self.headers().items() if k != "Content-Type"}
         r = requests.delete(f"{SB_URL}/storage/v1/object/{bucket}/{quote(name)}", headers=h, timeout=60)
-        if r.status_code >= 400 and r.status_code != 404:
+        if r.status_code >= 400 and r.status_code != 404 and "not_found" not in r.text:
             log(f"storage delete {name.rsplit('/', 1)[-1]}: {r.status_code} {r.text[:120]}")
 
     def download(self, name: str, path: str, bucket: str = BUCKET) -> bool:
@@ -265,6 +277,7 @@ def install_skills(sb: "Supabase"):
 # (`pb() { python3 …; }`), and Kiro Crew refuses to auto-approve a command that redefines a program
 # name: the step then waited for an approval nobody saw, and the chat seemed to stop answering.
 SKILL_COMMANDS = {"pb": "panda-browser/pb.py", "drive": "panda-drive/drive.py", "pvideo": "panda-video/video.py",
+                  "premote": "panda-jobs/premote.py",
                   "panda-issue": "panda-issue/issue.py", "pjob": "panda-jobs/jobs.py", "brief": "panda-jobs/brief.py"}
 
 
@@ -3535,6 +3548,223 @@ def guard_loop(stop: threading.Event):
             log("guard:", type(exc).__name__)
 
 
+# ── Remote Panda: heavy commands on a second Kaggle notebook (worker/remote.py; `pjob start --remote`) ─
+# The agent's pjob runs skills/panda-jobs/premote.py, a light proxy: it drops a request in REMOTE_BOX/req
+# and mirrors REMOTE_BOX/jobs/<tid>/log to its own output until REMOTE_BOX/jobs/<tid>/exit appears.
+# This worker does the rest with its own credentials (agents never get them): starts the remote notebook
+# through the session function (the Kaggle token stays there), uploads --files, queues the task, copies
+# the remote log back as it grows, and brings back changed files under the --out paths.
+REMOTE_BOX = os.path.expanduser("~/.panda/remote")
+REMOTE_ID = os.environ.get("PANDA_REMOTE_ID", "r1")
+REMOTE_MAX_IN = int(CFG.get("remote_max_in_mb", 3000)) * MiB
+REMOTE_BOOT_WAIT = 900
+REMOTE_ASK_GAP = 480
+REMOTE = {"lock": threading.Lock(), "asked": 0.0, "queue": {"tasks": {}}}
+REMOTE_SEEN: set = set()
+
+
+def rkey(*parts) -> str:
+    return "/".join(["remote", REMOTE_ID, *parts])
+
+
+def remote_get_json(sb: "Supabase", *parts):
+    raw = sb.get_fresh(state_key(rkey(*parts)))
+    try:
+        return json.loads(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def remote_put_json(sb: "Supabase", obj, *parts):
+    sb.put(state_key(rkey(*parts)), json.dumps(obj).encode(), mime="application/json")
+
+
+def remote_alive(b) -> bool:
+    return bool(b) and b.get("state") == "running" and time.time() - float(b.get("at") or 0) < 90
+
+
+def remote_request_start(sb: "Supabase") -> str:
+    """Ask the session function to push remote.py to this account's remote notebook. Returns its name."""
+    r = requests.post(f"{SB_URL}/functions/v1/session", headers=sb.headers(), timeout=120,
+                      json={"action": "remote", "op": "start", "remote_id": REMOTE_ID,
+                            "session_id": USAGE_STATE.get("sid", "")})
+    try:
+        body = r.json()
+    except ValueError:
+        body = {}
+    if r.status_code >= 400 or body.get("error"):
+        err = scrub(body.get("error") or r.text)[:200]
+        if "worker accounts cannot use this" in err:
+            err = "the session function has no remote action yet (paste the new index.ts in Supabase)"
+        raise RuntimeError(f"{r.status_code} {err}")
+    return str(body.get("kernel") or "")
+
+
+REMOTE_STARTER = remote_request_start      # tests swap this for a direct Kaggle push
+
+
+def remote_queue_edit(sb: "Supabase", fn):
+    """queue.json has one writer, this worker; the remote only reads it."""
+    with REMOTE["lock"]:
+        fn(REMOTE["queue"])
+        REMOTE["queue"]["at"] = time.time()
+        remote_put_json(sb, REMOTE["queue"], "queue.json")
+
+
+def remote_ensure(sb: "Supabase", note, cancelled) -> bool:
+    deadline = time.time() + REMOTE_BOOT_WAIT
+    while time.time() < deadline:
+        if cancelled():
+            return False
+        if remote_alive(remote_get_json(sb, "beat.json")):
+            return True
+        with REMOTE["lock"]:
+            due = time.time() - REMOTE["asked"] > REMOTE_ASK_GAP
+            if due:
+                REMOTE["asked"] = time.time()
+        if due:
+            note("starting remote Panda on Kaggle (usually 1-3 min)")
+            try:
+                k = REMOTE_STARTER(sb)
+                note(f"remote notebook {k or '?'} started, waiting for it to come up")
+            except Exception as exc:
+                with REMOTE["lock"]:
+                    REMOTE["asked"] = 0.0
+                note(f"could not start remote Panda: {scrub(exc)[:240]}")
+                return False
+        time.sleep(10)
+    note(f"remote Panda did not come up in {REMOTE_BOOT_WAIT // 60} min")
+    return False
+
+
+def _home_rel(p: str, must_exist: bool) -> str:
+    full = os.path.realpath(os.path.expanduser(p))
+    if not full.startswith(HOME + "/") or (must_exist and not os.path.exists(full)):
+        raise ValueError(f"{p}: {'not found' if must_exist else 'not'} under {HOME}")
+    return os.path.relpath(full, HOME)
+
+
+def remote_task(sb: "Supabase", req: dict):
+    tid = req["tid"]
+    d = f"{REMOTE_BOX}/jobs/{tid}"
+    os.makedirs(d, exist_ok=True)
+    logf = open(f"{d}/log", "ab")
+
+    def note(text: str):
+        logf.write(f"[remote] {text}\n".encode())
+        logf.flush()
+
+    def cancelled() -> bool:
+        return os.path.exists(f"{d}/cancel")
+
+    rc, queued = 255, False
+    try:
+        files = [_home_rel(p, True) for p in req.get("files") or []]
+        outs = [_home_rel(p, False) for p in req.get("out") or []] or files
+        cwd = req.get("cwd") or HOME
+        cwd = os.path.relpath(cwd, HOME) if os.path.realpath(cwd).startswith(HOME + "/") else "."
+        if not remote_ensure(sb, note, cancelled):
+            rc = 143 if cancelled() else 255
+            return
+        if files:
+            t1, arc = time.time(), f"{WORK}/remote-{tid}-in.tar.gz"
+            try:
+                with tarfile.open(arc, "w:gz", compresslevel=1) as t:
+                    for rel in files:
+                        t.add(os.path.join(HOME, rel), arcname=rel)
+                size = os.path.getsize(arc)
+                if size > REMOTE_MAX_IN:
+                    raise ValueError(f"--files pack to {size >> 20} MB, over the {REMOTE_MAX_IN >> 20} MB limit; "
+                                     "send only what the command needs")
+                blob_save(sb, rkey("tasks", tid, "in.tar.gz"), arc)
+                note(f"sent {len(files)} path(s), {size >> 20} MB packed, in {time.time() - t1:.0f}s")
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(arc)
+        remote_put_json(sb, {"tid": tid, "cmd": req["cmd"], "cwd": cwd, "setup": req.get("setup") or "",
+                             "out": outs, "files": files, "has_input": bool(files), "at": time.time()},
+                        "tasks", tid, "task.json")
+        remote_queue_edit(sb, lambda q: q.setdefault("tasks", {}).__setitem__(tid, {"cancel": False}))
+        queued = True
+        got, stale, cancel_at, last_check = 0, 0, 0.0, time.time()
+        while True:
+            time.sleep(4)
+            if cancelled() and not cancel_at:
+                cancel_at = time.time()
+                remote_queue_edit(sb, lambda q: q["tasks"].__setitem__(tid, {"cancel": True}))
+            st = remote_get_json(sb, "tasks", tid, "status.json") or {}
+            if int(st.get("log_bytes") or 0) > got:
+                raw = sb.get_fresh(state_key(rkey("tasks", tid, "log"))) or b""
+                frm = int(st.get("log_from") or 0)
+                if os.environ.get("PANDA_REMOTE_DEBUG"):
+                    log(f"remote {tid}: status {st.get('state')} log_bytes {st.get('log_bytes')} from {frm}, "
+                        f"fetched {len(raw)}, had {got}")
+                if got < frm:
+                    logf.write(f"[remote] ({(frm - got) >> 10} KB of log skipped)\n".encode())
+                    got = frm
+                logf.write(raw[got - frm:])
+                logf.flush()
+                got = frm + len(raw)
+            if st.get("state") in ("done", "failed", "cancelled"):
+                rc = 143 if st["state"] == "cancelled" else int(st["exit"] if st.get("exit") is not None else 255)
+                if st.get("out"):
+                    arc = f"{WORK}/remote-{tid}-out.tar.gz"
+                    try:
+                        if blob_load(sb, rkey("tasks", tid, "out.tar.gz"), arc):
+                            ok, bad = extract_archive(arc, HOME, sorted({o.split("/")[0] for o in outs}))
+                            note(f"brought back {ok} file(s), {os.path.getsize(arc) >> 20} MB packed"
+                                 + (f", {bad} skipped" if bad else ""))
+                    finally:
+                        with contextlib.suppress(OSError):
+                            os.remove(arc)
+                break
+            if cancel_at and time.time() - cancel_at > 60:
+                rc = 143
+                break
+            if time.time() - last_check >= 60:
+                last_check = time.time()
+                stale = 0 if remote_alive(remote_get_json(sb, "beat.json")) else stale + 1
+                if stale >= 3:
+                    note("remote Panda stopped while running this (its notebook ended)")
+                    break
+    except Exception as exc:
+        note(f"error: {scrub(exc)[:300]}")
+        rc = 143 if cancelled() else 255
+    finally:
+        with contextlib.suppress(Exception):
+            if queued:
+                remote_queue_edit(sb, lambda q: q["tasks"].pop(tid, None))
+            for n in ("in.tar.gz", "out.tar.gz"):
+                k = rkey("tasks", tid, n)
+                _forget_old(sb, k, _manifest_get(sb, k), keep_single=False, keep_manifest=False)
+            for n in ("task.json", "status.json", "log"):
+                sb.delete_object(state_key(rkey("tasks", tid, n)))
+        logf.close()
+        open(f"{d}/exit", "w").write(str(rc))   # last: the proxy has the whole log once it sees this
+        log(f"remote {tid}: exit {rc}")
+
+
+def remote_loop(sb: "Supabase", stop: threading.Event):
+    box = f"{REMOTE_BOX}/req"
+    os.makedirs(box, exist_ok=True)
+    while not stop.wait(2):
+        try:
+            for f in sorted(os.listdir(box)):
+                if not f.endswith(".json") or f in REMOTE_SEEN:
+                    continue
+                REMOTE_SEEN.add(f)
+                try:
+                    req = json.load(open(f"{box}/{f}"))
+                    os.remove(f"{box}/{f}")
+                except (OSError, ValueError):
+                    continue
+                if not re.fullmatch(r"[A-Za-z0-9._-]{1,96}", str(req.get("tid", ""))) or not req.get("cmd"):
+                    continue
+                threading.Thread(target=remote_task, args=(sb, req), daemon=True, name=f"remote-{req['tid']}").start()
+        except Exception as exc:
+            log("remote loop:", type(exc).__name__)
+
+
 # ── brief: Haiku answers what the agent wants from a long command output (skills/panda-jobs/brief.py) ─
 BRIEF_BOX = os.path.expanduser("~/.panda/brief")
 BRIEF_SEEN: set = set()
@@ -4827,6 +5057,7 @@ def main():
         threading.Thread(target=job_watch_loop, args=(sb, gw, stop_evt), daemon=True).start()
         threading.Thread(target=brief_loop, args=(gw, stop_evt), daemon=True).start()
         threading.Thread(target=guard_loop, args=(stop_evt,), daemon=True, name="guard").start()
+        threading.Thread(target=remote_loop, args=(sb, stop_evt), daemon=True, name="remote").start()
         threading.Thread(target=thinking_pusher, args=(sb, stop_evt), daemon=True).start()
         pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL_CHATS)
         # Messages are picked up on their own thread: a slow snapshot or usage refresh in the main loop

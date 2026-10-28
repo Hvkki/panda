@@ -5,6 +5,8 @@
   pjob start NAME --sh 'a && b'      the same, with a shell line
   pjob start NAME --notify [--want 'what to report'] [--stall 600] -- COMMAND
                                      Panda wakes this chat when it ends or looks stuck (no polling)
+  pjob start NAME --remote [--files P ...] [--out P ...] [--setup 'CMD'] --notify -- COMMAND
+                                     run it on remote Panda (its own 4 CPUs / ~30 GB), files sent and brought back
   pjob status [NAME]                 running / done (exit code) / lost, with run time and the last log lines
   pjob wait NAME [--max 300]         block until NAME ends or --max seconds pass (default 240), then status
   pjob wait-any A B C [--max 300]    block until the first of them ends
@@ -135,13 +137,25 @@ def cmd_start(a, rest):
     line = a.sh if a.sh else shlex.join(rest)
     if not line.strip():
         sys.exit("pjob: give a command after -- or use --sh")
+    shown = line
+    if a.remote:
+        home = os.path.expanduser("~")
+        for p in a.files or []:
+            full = os.path.realpath(os.path.expanduser(p))
+            if not full.startswith(home + "/") or not os.path.exists(full):
+                sys.exit(f"pjob: --files {p}: not found under {home}")
+        premote = os.path.join(os.path.dirname(os.path.abspath(__file__)), "premote.py")
+        line = shlex.join([sys.executable, premote, "run", "--name", a.name, "--cwd", a.cwd or os.getcwd(),
+                           "--files", *(a.files or []), "--out", *(a.out or []), f"--setup={a.setup or ''}",
+                           f"--cmd={line}"])
+        shown = f"remote: {shown}"
     os.makedirs(d, exist_ok=True)
     for f in ("exit", "ended", "log", "notify", "notified", "watch.json"):
         try:
             os.remove(os.path.join(d, f))
         except OSError:
             pass
-    open(os.path.join(d, "cmd"), "w").write(line)
+    open(os.path.join(d, "cmd"), "w").write(shown)
     open(os.path.join(d, "started"), "w").write(str(time.time()))
     open(os.path.join(d, "boot"), "w").write(_boot())
     # The wrapper records the exit code and end time itself, so status works after this process is gone.
@@ -187,6 +201,10 @@ def main():
     s.add_argument("--notify", action="store_true", help="wake this chat when the job ends or looks stuck")
     s.add_argument("--want", help="with --notify: what to report from the log when it ends")
     s.add_argument("--stall", type=float, default=600, help="with --notify: log quiet this many seconds = check if stuck")
+    s.add_argument("--remote", action="store_true", help="run on remote Panda (a second Kaggle notebook)")
+    s.add_argument("--files", nargs="+", help="with --remote: files/folders under ~ to send first")
+    s.add_argument("--out", nargs="+", help="with --remote: folders/files to bring back (default: --files)")
+    s.add_argument("--setup", help="with --remote: install step run once per remote start (pip/apt/npm)")
     s = sub.add_parser("status"); s.add_argument("name", nargs="?"); s.add_argument("-n", type=int, default=12)
     s.add_argument("--json", action="store_true")
     s = sub.add_parser("wait"); s.add_argument("name"); s.add_argument("--max", type=float, default=240)
