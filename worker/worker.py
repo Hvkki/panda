@@ -239,7 +239,8 @@ def install_skills(sb: "Supabase"):
 # Skill helpers as real commands. The skills used to tell the agent to define a shell function
 # (`pb() { python3 …; }`), and Kiro Crew refuses to auto-approve a command that redefines a program
 # name: the step then waited for an approval nobody saw, and the chat seemed to stop answering.
-SKILL_COMMANDS = {"pb": "panda-browser/pb.py", "drive": "panda-drive/drive.py", "pvideo": "panda-video/video.py"}
+SKILL_COMMANDS = {"pb": "panda-browser/pb.py", "drive": "panda-drive/drive.py", "pvideo": "panda-video/video.py",
+                  "panda-issue": "panda-issue/issue.py"}
 
 
 def install_skill_commands():
@@ -3386,6 +3387,33 @@ def command_loop(sb: Supabase, gw: Gateway, stop: threading.Event):
 
 
 _NOTIF_SENT = {"at": 0.0}
+ISSUES_DIR = os.path.expanduser("~/.panda/issues")
+
+
+def mirror_issues(sb: Supabase):
+    """Reports agents filed with `panda-issue` -> notifications rows (source 'issue') the app lists in
+    Developer -> Issues. The owner accepts or dismisses each one; nothing is fixed automatically."""
+    if not os.path.isdir(ISSUES_DIR):
+        return
+    for name in sorted(n for n in os.listdir(ISSUES_DIR) if n.endswith(".json"))[:10]:
+        path = os.path.join(ISSUES_DIR, name)
+        try:
+            rec = json.load(open(path, encoding="utf-8"))
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+            continue
+        title = scrub(str(rec.get("title") or ""))[:160]
+        details = scrub(str(rec.get("details") or ""))[:6000]
+        sev = rec.get("severity") if rec.get("severity") in ("low", "normal", "high") else "normal"
+        sb.rest("POST", "notifications", body={
+            "owner": OWNER, "source": "issue", "text": details or title,
+            "meta": {"kind": "dev_issue", "title": title, "severity": sev, "status": "new",
+                     "ts": f"issue-{name[:-5]}", "at": rec.get("at")}})
+        push(sb, OWNER, "Panda reported an issue", title, "./?v=developer&tab=issues")
+        with open(os.path.join(ISSUES_DIR, "sent.log"), "a", encoding="utf-8") as f:
+            f.write(f"{time.time():.0f}\t{title}\n")
+        os.remove(path)
 
 
 def mirror_notifications(sb: Supabase, gw: Gateway, seen: set):
@@ -3710,6 +3738,7 @@ def main():
                 with beating(sb, sid):
                     try:
                         mirror_notifications(sb, gw, seen)
+                        mirror_issues(sb)
                         approve_background(gw, sb)
                     except Exception as exc:
                         log("notifications:", type(exc).__name__)

@@ -1105,6 +1105,15 @@ html:has(.sheet-backdrop), html:has(.sheet-backdrop) body { overscroll-behavior-
   background: var(--accent-soft); color: var(--text-2); }
 .dev-env { padding-top: 12px; }
 .dev-env code { font-family: var(--mono); font-size: .9em; }
+.tab-badge { display: inline-block; margin-left: 6px; min-width: 18px; padding: 0 5px; border-radius: 999px; background: var(--accent, #d9622b); color: #fff; font-size: .78em; line-height: 18px; text-align: center; }
+.small-tabs { margin: 4px 0 12px; }
+.issue-card { align-items: flex-start; gap: 12px; }
+.issue-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.issue-text { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0; font-size: .92em; }
+.issue-sev { padding: 1px 8px; border-radius: 999px; font-size: .75em; border: 1px solid var(--line); }
+.issue-sev.high { background: #c0392b; color: #fff; border-color: #c0392b; }
+.issue-actions { display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+@media (max-width: 560px) { .issue-card { flex-direction: column; } .issue-actions { flex-direction: row; width: 100%; } .issue-actions .btn { flex: 1; } }
 .dev-bulk { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
 .dev-bulk textarea { max-width: none; width: 100%; font-family: var(--mono); font-size: .85em; resize: vertical; color: var(--text); }
 @media (max-width: 600px) {

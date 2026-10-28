@@ -327,6 +327,9 @@ export function NotificationsModal({ items, online, onClose }: { items: Notifica
             <div className="notif-title">{n.meta.title || n.source}</div>
             <div className="notif-text">{n.text}</div>
             <SkillReview n={n} online={online} />
+            {n.source === "issue" && n.meta.status === "new" && (
+              <a className="small" href="./?v=developer&tab=issues">Review it in Developer → Issues</a>
+            )}
             <div className="muted small">{new Date(n.created_at).toLocaleString()}</div>
           </div>
         ))}
