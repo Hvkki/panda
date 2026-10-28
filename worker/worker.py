@@ -1186,6 +1186,37 @@ def start_gateway() -> subprocess.Popen:
     raise RuntimeError("gateway did not come up")
 
 
+GW_RESTARTS: list = []   # times of in-run gateway restarts, to stop a crash loop
+
+
+def restart_gateway(gw, old: subprocess.Popen, with_beat) -> subprocess.Popen:
+    """The gateway exited mid-run: note why (exit code + log tail, kept in the session row and as
+    gateway-crash-N.log), then start it again and refresh the token. Raises after 5 restarts in an hour."""
+    code = old.poll()
+    gl = f"{WORK}/gateway.log"
+    tail = ""
+    try:
+        text = scrub(open(gl, errors="replace").read())   # Kaggle keeps .log files as run output
+        tail = "".join(text.splitlines(True)[-15:])[-1500:]
+        open(f"{WORK}/gateway-crash-{len(GW_RESTARTS) + 1}.log", "w").write(text[-2_000_000:])
+    except OSError:
+        pass
+    now = time.time()
+    GW_RESTARTS[:] = [t for t in GW_RESTARTS if now - t < 3600] + [now]
+    # -9 is SIGKILL, almost always the out-of-memory killer
+    note = {"at": now_iso(), "exit": code, "oom_likely": code == -9, "log_tail": tail}
+    SESSION_INFO["gateway_restarts"] = (SESSION_INFO.get("gateway_restarts") or [])[-4:] + [note]
+    log(f"gateway exited (code {code}); restart {len(GW_RESTARTS)} in the last hour")
+    if len(GW_RESTARTS) > 5:
+        raise RuntimeError(f"gateway process keeps exiting (code {code}, {len(GW_RESTARTS)} times in an hour)")
+    time.sleep(3)
+    with with_beat():   # starting takes up to a minute: keep the app from showing Offline
+        p = start_gateway()
+    gw.token = mint_token()
+    log("gateway restarted")
+    return p
+
+
 def mint_token() -> str:
     r = sh("kirocrew token --ttl 13h", timeout=60, check=True)
     m = re.search(r"token=([A-Za-z0-9._~\-]+)", r.stdout)
@@ -4645,7 +4676,11 @@ def main():
         reason = "stop requested"
         while True:
             if gw_proc.poll() is not None:
-                raise RuntimeError("gateway process exited")
+                # Kiro Crew's gateway died (crash, out of memory...). That used to end the whole run, so the
+                # notebook stopped until someone pressed Start. Restart it in place instead; give up only
+                # if it keeps dying (5 restarts within an hour), which means something is really broken.
+                gw_proc = restart_gateway(gw, gw_proc, with_beat=lambda: beating(sb, sid))
+                set_sess(heartbeat_at=now_iso(), info=SESSION_INFO)
             if time.time() - last_hb > HEARTBEAT_SECS:
                 row = sb.rest("GET", "worker_sessions",
                               params={"id": f"eq.{sid}", "select": "stop_requested"})[0]
