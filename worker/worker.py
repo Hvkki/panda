@@ -193,6 +193,11 @@ class Supabase:
                          headers=self.headers(), timeout=600)
         return r.content if r.status_code == 200 else None
 
+    def exists(self, name: str, bucket: str = BUCKET) -> bool:
+        r = requests.head(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
+                          headers=self.headers(), timeout=30)
+        return r.status_code == 200
+
     def get_fresh(self, name: str, bucket: str = BUCKET) -> bytes | None:
         """Like get(), never from the CDN. Supabase's CDN can serve an OVERWRITTEN object for up to 60 s
         at other edges (remote Panda read its old queue.json and a short log that way); a fresh signed
@@ -213,9 +218,17 @@ class Supabase:
         if r.status_code >= 400 and r.status_code != 404 and "not_found" not in r.text:
             log(f"storage delete {name.rsplit('/', 1)[-1]}: {r.status_code} {r.text[:120]}")
 
-    def download(self, name: str, path: str, bucket: str = BUCKET) -> bool:
-        r = requests.get(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
-                         headers=self.headers(), timeout=600, stream=True)
+    def download(self, name: str, path: str, bucket: str = BUCKET, fresh: bool = False) -> bool:
+        if fresh:   # past the CDN (see get_fresh): for objects that are overwritten in place
+            r = requests.post(f"{SB_URL}/storage/v1/object/sign/{bucket}/{quote(name)}", json={"expiresIn": 600},
+                              headers=self.headers(), timeout=60)
+            url = r.json().get("signedURL") if r.status_code == 200 else None
+            if not url:
+                return False
+            r = requests.get(f"{SB_URL}/storage/v1{url}", timeout=600, stream=True)
+        else:
+            r = requests.get(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
+                             headers=self.headers(), timeout=600, stream=True)
         if r.status_code != 200:
             return False
         with open(path, "wb") as f:
@@ -533,7 +546,7 @@ def _manifest_name(name: str) -> str:
 def _manifest_get(sb: "Supabase", name: str) -> dict | None:
     tmp = f"{WORK}/manifest-{uuid.uuid4().hex}.json"
     try:
-        if sb.download(state_key(_manifest_name(name)), tmp):
+        if sb.download(state_key(_manifest_name(name)), tmp, fresh=True):   # overwritten at every save
             data = json.load(open(tmp))
             return data if isinstance(data, dict) else None
     except (OSError, ValueError):
@@ -625,7 +638,7 @@ def blob_load(sb: "Supabase", name: str, dest: str) -> bool:
     """Fetch what blob_save / blob_save_drive stored (or an old single object). False if there is none."""
     man = _manifest_get(sb, name)
     if not man:
-        return sb.download(state_key(name), dest)
+        return sb.download(state_key(name), dest, fresh=True)
     if man.get("drive"):
         if not drive_get(man["drive"].get("id", ""), dest):
             raise RuntimeError("the saved work files are in Google Drive but could not be fetched")
@@ -845,6 +858,99 @@ def extract_archive(archive: str, home: str, roots: list) -> tuple:
 _files_sync = {"sig": None}
 _files_restore = {"failed": False}  # a run whose restore failed must never overwrite the good saved copy
 _files_lock = threading.Lock()
+FILES_INDEX = "latest-files-index.json.gz"      # {"id", "files": {arc: [size, mtime]}}: what the full copy holds
+FILES_DELTA_BLOB = "latest-files-delta.tar.gz"  # files changed since that copy, when it could not be replaced
+FILES_DELTA_META = "latest-files-delta.json"    # {"base_id", "files", "saved_at"}: applied only on that base
+_files_alerted = {"at": 0.0}
+
+
+def files_alert(sb: "Supabase", text: str):
+    """Tell the owner (bell + push) that saving the work files is degraded. At most once every 6 hours."""
+    log("files:", text)
+    if time.time() - _files_alerted["at"] < 6 * 3600:
+        return
+    _files_alerted["at"] = time.time()
+    with contextlib.suppress(Exception):
+        sb.rest("POST", "notifications", body={"owner": OWNER, "source": "panda", "text": text,
+                                               "meta": {"kind": "files_save", "title": "Work files", "ts": f"files-{int(time.time())}"}})
+        push(sb, OWNER, "Saving your work files", text, "./?panel=notifications")
+
+
+def _get_json_gz(sb: "Supabase", name: str):
+    raw = sb.get_fresh(state_key(name))
+    if not raw:
+        return None
+    try:
+        import gzip
+        return json.loads(gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw)
+    except (OSError, ValueError):
+        return None
+
+
+def files_index_get(sb: "Supabase") -> dict | None:
+    idx = _get_json_gz(sb, FILES_INDEX)
+    return idx if isinstance(idx, dict) and isinstance(idx.get("files"), dict) else None
+
+
+def files_index_put(sb: "Supabase", entries: list):
+    import gzip
+    idx = {"id": uuid.uuid4().hex, "saved_at": now_iso(),
+           "files": {e.arc: [e.size, e.mtime] for e in entries if e.kind == "file"}}
+    sb.put(state_key(FILES_INDEX), gzip.compress(json.dumps(idx).encode()), mime="application/gzip")
+
+
+def files_base_exists(sb: "Supabase") -> bool:
+    return bool(_manifest_get(sb, FILES_BLOB)) or sb.exists(state_key(FILES_BLOB))
+
+
+def files_delta_forget(sb: "Supabase"):
+    """After a new full copy: the change-only copy belongs to the old one. The meta goes first, so a
+    half-done cleanup can never put old changes over the new copy (restore checks base_id anyway)."""
+    sb.delete_object(state_key(FILES_DELTA_META))
+    _forget_old(sb, FILES_DELTA_BLOB, _manifest_get(sb, FILES_DELTA_BLOB), keep_single=False, keep_manifest=False)
+
+
+def files_delta_save(sb: "Supabase", entries: list, reason: str, deadline, level: int, skipped: int) -> dict:
+    """The full copy could not be replaced (Drive refused it, or it no longer fits in Storage): keep it, and
+    save only the files that changed since it in Storage. Restore puts this on top of the full copy."""
+    idx = files_index_get(sb)
+    if idx:
+        changed = [e for e in entries if e.kind == "file" and idx["files"].get(e.arc) != [e.size, e.mtime]]
+    else:   # a full copy from before the index existed: what changed since it was saved (10 min margin)
+        man = _manifest_get(sb, FILES_BLOB) or {}
+        since = (parse_ts(man.get("saved_at")) or 0) - 600
+        changed = [e for e in entries if e.kind == "file" and e.mtime >= since]
+    keep = [e for e in entries if e.kind != "file"] + changed      # folders and links are tiny
+    keep.sort(key=lambda e: e.arc)
+    arc = f"{WORK}/files-delta.tar.gz"
+    dropped, budget = [], None
+    try:
+        for _ in range(4):
+            chosen = keep
+            if budget is not None:
+                chosen, dropped = trim_to_budget(keep, budget)
+            write_archive(chosen, arc, deadline, level)
+            size = os.path.getsize(arc)
+            if size <= FILES_STORAGE_MAX:
+                break
+            budget = int(sum(e.size for e in chosen if e.kind == "file") * FILES_STORAGE_MAX / size * 0.9)
+        for a, sz, why in dropped:
+            log(f"files: change not saved, {why}: ~/{a} ({sz // MiB} MB)")
+        sb.delete_object(state_key(FILES_DELTA_META))     # never a meta pointing at a half-uploaded delta
+        done = blob_save(sb, FILES_DELTA_BLOB, arc)
+        n = sum(1 for e in chosen if e.kind == "file")
+        sb.put(state_key(FILES_DELTA_META), json.dumps({"base_id": (idx or {}).get("id"), "files": n,
+                                                         "saved_at": now_iso()}).encode(), mime="application/json")
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(arc)
+    _files_sync["sig"] = None            # try the full copy again at the next save
+    info = {"files": n, "raw_bytes": sum(e.size for e in changed), "archive_bytes": done["size"],
+            "parts": done["parts"], "where": "Storage (changes since the last full copy)",
+            "skipped": skipped + len(dropped)}
+    log(f"files saved ({reason}): only the {n} changed files, {done['size'] / MiB:.1f} MB in Storage; "
+        f"the last full copy stays as it is")
+    return info
 
 
 def files_snapshot(sb: "Supabase", reason: str, budget: float | None = None) -> dict | None:
@@ -889,12 +995,17 @@ def files_snapshot(sb: "Supabase", reason: str, budget: float | None = None) -> 
             done = where = None
             if size > FILES_STORAGE_MAX and drive_ok:
                 done, where = blob_save_drive(sb, FILES_BLOB, archive, extra), "Google Drive"
-                if done is None:  # Drive failed: a trimmed copy in Storage beats nothing
-                    chosen, dropped = trim_to_budget(entries, int(raw * FILES_STORAGE_MAX / size * 0.9))
-                    write_archive(chosen, archive, deadline, level)
-                    extra["files"] = sum(1 for e in chosen if e.kind == "file")
-            if done is None:
+                if done is None:
+                    files_alert(sb, "Google Drive did not take the copy of your work files (is it full?). "
+                                    "Panda keeps the last full copy and saves only the changes until it works again.")
+            elif not dropped or not files_base_exists(sb):
                 done, where = blob_save(sb, FILES_BLOB, archive, extra=extra), "Storage"
+            if done is None:
+                # Never replace the last full copy with a partial one: a trimmed copy kept only the newest
+                # files, and a restart then lost everything older (28 Oct, Drive full of old copies).
+                return files_delta_save(sb, entries, reason, deadline, level, len(skipped))
+            files_index_put(sb, chosen)     # what this copy holds: later change-only saves build on it
+            files_delta_forget(sb)
             _files_sync["sig"] = None if dropped else sig  # a trimmed save is tried again next time
             info = {"files": extra["files"], "raw_bytes": raw, "archive_bytes": done["size"],
                     "parts": done["parts"], "where": where, "skipped": len(skipped) + len(dropped)}
@@ -904,6 +1015,27 @@ def files_snapshot(sb: "Supabase", reason: str, budget: float | None = None) -> 
         finally:
             with contextlib.suppress(OSError):
                 os.remove(archive)
+
+
+def files_delta_restore(sb: "Supabase", tmp: str):
+    """Put the change-only copy over the full one, if it was made on top of exactly that full copy."""
+    raw = sb.get_fresh(state_key(FILES_DELTA_META))
+    if not raw:
+        return
+    try:
+        meta = json.loads(raw)
+    except ValueError:
+        return
+    base = (files_index_get(sb) or {}).get("id")
+    if meta.get("base_id") != base:
+        log("files: a change-only copy exists for an older full copy; not applied")
+        return
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    if blob_load(sb, FILES_DELTA_BLOB, tmp):
+        ok, bad = extract_archive(tmp, HOME, FILES_ROOTS)
+        log(f"files restored: {ok} changed items on top (saved {meta.get('saved_at', '?')[:16]})"
+            + (f", {bad} skipped" if bad else ""))
 
 
 def restore_files(sb: "Supabase") -> str:
@@ -916,9 +1048,10 @@ def restore_files(sb: "Supabase") -> str:
             log("files: nothing saved yet")
             return "none"
         ok, bad = extract_archive(tmp, HOME, FILES_ROOTS)
+        log(f"files restored: {ok} items" + (f", {bad} skipped" if bad else ""))
+        files_delta_restore(sb, tmp)
         entries, _ = select_files(HOME, FILES_ROOTS, exclude=(WORK,))
         _files_sync["sig"] = files_signature(entries)
-        log(f"files restored: {ok} items" + (f", {bad} skipped" if bad else ""))
         return "restored"
     except Exception as exc:
         log("files could not be restored:", scrub(exc)[:200])

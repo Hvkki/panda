@@ -38,7 +38,16 @@ class FakeStorage:
             raise RuntimeError(f"upload {name}: 413 The object exceeded the maximum allowed size")
         self.objects[name] = data
 
-    def download(self, name, path, bucket=None):
+    def put(self, name, data, mime=None, bucket=None):
+        self.objects[name] = data
+
+    def get_fresh(self, name, bucket=None):
+        return self.objects.get(name)
+
+    def exists(self, name, bucket=None):
+        return name in self.objects
+
+    def download(self, name, path, bucket=None, fresh=False):
         if name not in self.objects:
             return False
         open(path, "wb").write(self.objects[name])
@@ -313,7 +322,7 @@ def test_over_storage_goes_to_drive_or_is_trimmed():
             W._files_sync["sig"] = None
             info = W.files_snapshot(st, "drive")
             assert info["where"] == "Google Drive" and info["skipped"] == 0, info
-            assert [n for n in st.objects if not n.endswith(".parts.json")] == []
+            assert [n for n in st.objects if not n.endswith(".parts.json") and n != W.FILES_INDEX] == []
             home2 = os.path.join(root, "h2")
             os.makedirs(home2)
             W.HOME, W._files_sync["sig"] = home2, None
