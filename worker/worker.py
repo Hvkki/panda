@@ -634,7 +634,7 @@ def blob_load(sb: "Supabase", name: str, dest: str) -> bool:
         local = []
         try:
             for i, n in enumerate(man.get("parts") or []):
-                p = f"{WORK}/restore-part-{name}-{i:03d}"  # per blob: two blobs may download at once
+                p = f"{WORK}/restore-part-{name.replace('/', '_')}-{i:03d}"  # per blob: two blobs may download at once
                 if not sb.download(state_key(n), p):
                     raise RuntimeError(f"saved part {n} is missing")
                 local.append(p)
