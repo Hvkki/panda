@@ -3,6 +3,8 @@
 
   pjob start NAME -- COMMAND...      start COMMAND in the background (its own log, survives your turn's steps)
   pjob start NAME --sh 'a && b'      the same, with a shell line
+  pjob start NAME --notify [--want 'what to report'] [--stall 600] -- COMMAND
+                                     Panda wakes this chat when it ends or looks stuck (no polling)
   pjob status [NAME]                 running / done (exit code) / lost, with run time and the last log lines
   pjob wait NAME [--max 300]         block until NAME ends or --max seconds pass (default 240), then status
   pjob wait-any A B C [--max 300]    block until the first of them ends
@@ -108,6 +110,24 @@ def show(s: dict, n: int = 12):
             print(out)
 
 
+SESSION_MAP = os.path.expanduser("~/.kiro/crew/session_map.json")
+
+
+def my_slot() -> str:
+    """The Kiro Crew chat slot this shell belongs to (session_map: 'dashboard:<slot>' -> {sid})."""
+    sid = os.environ.get("KIRO_SESSION_ID", "")
+    if not sid:
+        return ""
+    try:
+        m = json.load(open(SESSION_MAP))
+    except (OSError, ValueError):
+        return ""
+    for key, v in (m.items() if isinstance(m, dict) else []):
+        if isinstance(v, dict) and v.get("sid") == sid:
+            return key.split(":", 1)[1] if ":" in key else key
+    return ""
+
+
 def cmd_start(a, rest):
     d = _dir(a.name)
     if os.path.isdir(d) and state(a.name)["state"] == "running":
@@ -116,7 +136,7 @@ def cmd_start(a, rest):
     if not line.strip():
         sys.exit("pjob: give a command after -- or use --sh")
     os.makedirs(d, exist_ok=True)
-    for f in ("exit", "ended", "log"):
+    for f in ("exit", "ended", "log", "notify", "notified", "watch.json"):
         try:
             os.remove(os.path.join(d, f))
         except OSError:
@@ -133,7 +153,21 @@ def cmd_start(a, rest):
                          start_new_session=True, env={**os.environ, "PYTHONUNBUFFERED": "1"})
     open(os.path.join(d, "pid"), "w").write(str(p.pid))
     print(f"started {a.name} (pid {p.pid}). Log: {d}/log")
-    print(f"Check with: pjob status {a.name}   ·   wait with: pjob wait {a.name} --max 240")
+    if a.notify:
+        slot = my_slot()
+        if not slot:  # a helper (subagent) run or a shell outside any chat: nobody to wake
+            print("No chat to wake from here (helper run): wait with "
+                  f"`pjob wait {a.name} --max 900` in few long slices instead of polling often.")
+            return
+        # Panda's worker watches the job for free and wakes this chat (a "Haiku steered" message) when it
+        # ends, or when its log goes quiet for --stall seconds and Haiku judges it stuck.
+        json.dump({"slot": slot, "sid": os.environ.get("KIRO_SESSION_ID", ""), "want": (a.want or "")[:400],
+                   "stall": max(120, min(int(a.stall), 6 * 3600)), "at": time.time()},
+                  open(os.path.join(d, "notify"), "w"))
+        print("Panda will message you in this chat when it ends or looks stuck: no need to poll it. "
+              "Do other work, or end your turn with a short note.")
+    else:
+        print(f"Check with: pjob status {a.name}   ·   wait with: pjob wait {a.name} --max 240")
 
 
 def _wait(names, mx: float):
@@ -150,6 +184,9 @@ def main():
     ap = argparse.ArgumentParser(prog="pjob", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="op", required=True)
     s = sub.add_parser("start"); s.add_argument("name"); s.add_argument("--sh"); s.add_argument("--cwd")
+    s.add_argument("--notify", action="store_true", help="wake this chat when the job ends or looks stuck")
+    s.add_argument("--want", help="with --notify: what to report from the log when it ends")
+    s.add_argument("--stall", type=float, default=600, help="with --notify: log quiet this many seconds = check if stuck")
     s = sub.add_parser("status"); s.add_argument("name", nargs="?"); s.add_argument("-n", type=int, default=12)
     s.add_argument("--json", action="store_true")
     s = sub.add_parser("wait"); s.add_argument("name"); s.add_argument("--max", type=float, default=240)

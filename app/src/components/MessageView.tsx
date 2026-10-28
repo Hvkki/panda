@@ -260,6 +260,10 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
     // Panda restarted mid-answer; the worker asked the agent to carry on. Show a quiet note, not a bubble.
     return <div className="restart-note muted small"><IconRetry size={13} /> Panda restarted mid-answer, so it's carrying on from where it stopped</div>;
   }
+  if (m.role === "user" && m.meta.haiku_steer) {
+    // The job watcher's note to the agent (a background job ended or looks stuck): only a quiet label.
+    return <div className="restart-note muted small">Haiku steered</div>;
+  }
   if (m.role === "user") {
     const cmd = commandOf(m);
     return (

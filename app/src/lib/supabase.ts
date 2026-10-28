@@ -102,6 +102,8 @@ export type Message = {
     n_steps?: number;
     /** Worker-made "carry on" after a restart cut the previous answer off. */
     auto_continue?: boolean;
+    /** Job watcher's note to the agent (a --notify job ended or looks stuck); shown only as "Haiku steered". */
+    haiku_steer?: boolean;
     interrupted?: boolean;
     tl?: import("../components/Timeline").TimelineNote | null;
   };
