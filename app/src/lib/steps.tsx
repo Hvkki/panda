@@ -21,6 +21,7 @@ export function describeStep(raw: string): Step {
 
   if (low.startsWith("error:")) return s(<IconAlert size={15} />, short(t.slice(6).trim() || "Something failed"), { error: true });
   if (low.includes("stopped by you")) return s(<IconAlert size={15} />, "Stopped");
+  if (low.includes("paused: panda restarted")) return s(<IconClock size={15} />, "Paused: Panda restarted");
 
   // Panda skills
   const doc = t.match(/make_doc\.py\s+\S+\s+(\S+\.(pdf|docx|pptx))/i);

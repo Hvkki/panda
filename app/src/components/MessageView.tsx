@@ -256,6 +256,10 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
   const { online } = useBrowser();
   if (m.role === "tool") return m.meta.kind === "approval" ? <ApprovalCard m={m} /> : null;
 
+  if (m.role === "user" && m.meta.auto_continue) {
+    // Panda restarted mid-answer; the worker asked the agent to carry on. Show a quiet note, not a bubble.
+    return <div className="restart-note muted small"><IconRetry size={13} /> Panda restarted mid-answer, so it's carrying on from where it stopped</div>;
+  }
   if (m.role === "user") {
     const cmd = commandOf(m);
     return (

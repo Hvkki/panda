@@ -1167,3 +1167,35 @@ html:has(.sheet-backdrop), html:has(.sheet-backdrop) body { overscroll-behavior-
 .memory-doc { white-space: pre-wrap; word-break: break-word; font: inherit; font-size: 0.92em; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; margin: 0; max-height: 50vh; overflow: auto; }
 .memory-text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .memory-key { overflow-wrap: anywhere; }
+
+/* ── Live timeline (what a running answer is doing, and when the step may finish) ── */
+.chat-wrap { flex: 1; display: flex; min-height: 0; min-width: 0; }
+.chat-wrap > .chat { min-width: 0; }
+.timeline { width: 300px; flex: none; border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; animation: rise .2s var(--ease); }
+.timeline-head { display: flex; align-items: center; gap: 8px; padding: 12px 10px 10px 14px; border-bottom: 1px solid var(--line); }
+.timeline-head svg { color: var(--accent); flex: none; }
+.timeline-head .muted { margin-left: auto; }
+.timeline-now { margin: 12px; padding: 12px; border-radius: 14px; border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line)); background: color-mix(in srgb, var(--accent) 6%, var(--bg)); display: grid; gap: 6px; }
+.tl-label { font-size: .72em; text-transform: uppercase; letter-spacing: .06em; color: var(--accent); font-weight: 600; }
+.tl-now-text { font-weight: 600; line-height: 1.35; }
+.tl-eta { display: flex; align-items: center; gap: 6px; font-size: .86em; }
+.tl-eta.over { color: #b9770e; }
+.tl-next { font-style: italic; }
+.timeline-list { list-style: none; margin: 0; padding: 4px 8px 16px; overflow-y: auto; flex: 1; display: grid; align-content: start; gap: 2px; }
+.timeline-list li { display: grid; grid-template-columns: 14px 18px 1fr; grid-template-rows: auto auto; column-gap: 6px; padding: 7px 6px; border-radius: 10px; font-size: .86em; align-items: center; }
+.timeline-list li.running { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.timeline-list li.err .tl-step { color: #c0392b; }
+.tl-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line); justify-self: center; display: grid; place-items: center; }
+.timeline-list li.done .tl-dot { background: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+.timeline-list li.running .tl-dot { width: auto; height: auto; background: none; color: var(--accent); }
+.tl-icon { display: grid; color: var(--muted); }
+.tl-step { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl-time { grid-column: 3; }
+.timeline-pill { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; gap: 6px; margin: 0 auto 8px; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); font-size: .84em; box-shadow: var(--shadow-sm); }
+.timeline-pill svg { color: var(--accent); }
+/* Narrow screens: the timeline becomes a sheet over the bottom of the chat. */
+@media (max-width: 900px) {
+  .chat-wrap { position: relative; }
+  .timeline { position: absolute; left: 8px; right: 8px; top: 8px; width: auto; max-height: 62%; border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow, 0 8px 30px rgba(0,0,0,.18)); z-index: 5; }
+}
+.restart-note { display: flex; align-items: center; justify-content: center; gap: 6px; text-align: center; }

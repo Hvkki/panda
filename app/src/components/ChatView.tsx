@@ -6,7 +6,8 @@ import { useT } from "../lib/i18n";
 import { MessageView, PendingReply, commandOf } from "./MessageView";
 import { Composer, type SendMeta } from "./Composer";
 import { Helpers } from "./Helpers";
-import { IconCoins, IconSpinner, IconX } from "./Icons";
+import { Timeline, useTimelineOpen } from "./Timeline";
+import { IconCoins, IconList, IconSpinner, IconX } from "./Icons";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Attachment } from "../lib/files";
@@ -75,6 +76,9 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
   }, [messages, sides]);
 
   const streaming = messages.find((m) => m.role === "assistant" && (m.status === "streaming" || m.status === "waiting"));
+  const [tlOpen, setTlOpen] = useTimelineOpen();
+  // The timeline follows the running answer; with nothing running it can show the last one on request.
+  const tlMsg = streaming && (streaming.meta.tools?.length || 0) > 0 ? streaming : null;
   const busy = !!streaming || messages.some((m) => m.role === "user" && (m.status === "processing"));
 
   // Safety net while Panda answers: a live link can drop silently with no error at all, so re-read every
@@ -146,6 +150,7 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
     ?? { pct: 0, reset: true };
 
   return (
+    <div className={`chat-wrap ${tlMsg && tlOpen ? "with-timeline" : ""}`}>
     <div className="chat">
       <div className="chat-scroll" ref={scroller}
         onScroll={(e) => {
@@ -171,6 +176,11 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
         </div>
       </div>
       <div className="chat-bottom">
+        {tlMsg && !tlOpen && (
+          <button className="timeline-pill" onClick={() => setTlOpen(true)}>
+            <IconList size={14} /> {tlMsg.meta.tl?.now ? `Now: ${tlMsg.meta.tl.now}` : "Show what Panda is doing"}
+          </button>
+        )}
         {sides.length > 0 && (
           <div className="side-stack">
             {sides.map((s) => (
@@ -188,6 +198,8 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
           onSend={(text, att, meta) => onSendMessage(chat, text, att, meta)} onCommand={command}
           onStop={stop} busy={busy} autoFocus context={context} draftKey={chat.id} />
       </div>
+    </div>
+    {tlMsg && tlOpen && <Timeline m={tlMsg} onClose={() => setTlOpen(false)} />}
     </div>
   );
 }

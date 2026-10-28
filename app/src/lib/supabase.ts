@@ -96,6 +96,14 @@ export type Message = {
     command?: string;
     browser?: BrowserShot;
     replayed?: boolean;
+    /** Live timeline: seconds into the answer when each step in `tools` started, the full step count,
+     *  and the worker's note on the current step (see Timeline.tsx). */
+    steps_at?: number[];
+    n_steps?: number;
+    /** Worker-made "carry on" after a restart cut the previous answer off. */
+    auto_continue?: boolean;
+    interrupted?: boolean;
+    tl?: import("../components/Timeline").TimelineNote | null;
   };
   created_at: string;
 };

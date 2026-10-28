@@ -240,7 +240,7 @@ def install_skills(sb: "Supabase"):
 # (`pb() { python3 …; }`), and Kiro Crew refuses to auto-approve a command that redefines a program
 # name: the step then waited for an approval nobody saw, and the chat seemed to stop answering.
 SKILL_COMMANDS = {"pb": "panda-browser/pb.py", "drive": "panda-drive/drive.py", "pvideo": "panda-video/video.py",
-                  "panda-issue": "panda-issue/issue.py"}
+                  "panda-issue": "panda-issue/issue.py", "pjob": "panda-jobs/jobs.py"}
 
 
 def install_skill_commands():
@@ -2180,6 +2180,140 @@ def context_lost(sb: Supabase, chat_id: str, before_id: int) -> str:
     return ""
 
 
+# ── live timeline: what a long answer is doing now, and when the step may finish ─────────────
+# Free part: every step's start time, and how long the same kind of step took before (kept in
+# ~/.panda/step_stats.json). Cheap part: on long answers a tiny Haiku call on a throw-away
+# kirocrew-lite slot (incognito, no tools) names the step in plain words and guesses when it and
+# the whole answer will finish. It runs at most every TL_EVERY s and TL_MAX times per answer.
+TL_AFTER = int(CFG.get("timeline_after_secs", 40))     # only answers running longer than this
+TL_EVERY = int(CFG.get("timeline_every_secs", 120))     # at most one Haiku note per this many seconds
+TL_MAX = int(CFG.get("timeline_max_calls", 15))        # per answer
+TL_MODEL = str(CFG.get("timeline_model", "claude-haiku-5.5"))
+TL_SEM = threading.Semaphore(2)                        # chats running at once share two narrators
+STEP_STATS_FILE = f"{HOME}/.panda/step_stats.json"
+STEP_STATS: dict = {}
+STEP_STATS_LOCK = threading.Lock()
+
+
+def step_kind(raw: str) -> str:
+    """Group steps that tend to take as long as each other: 'python3 qc.py', 'pb open', 'web_search'."""
+    t = re.sub(r"^(running|ran|tool)\s*:\s*", "", raw or "", flags=re.I).strip()
+    # "cd ~/work && FOO=1 python3 mix.py" is a mix.py step
+    t = re.sub(r"^(?:(?:cd\s+\S+|source\s+\S+|\.\s+\S+|set\s+[-+]\w+)\s*(?:&&|;)\s*|[A-Z_][A-Z0-9_]*=\S*\s+)+", "", t)
+    low = t.lower()
+    if re.match(r"(writing|reading|creating|editing|fs_\w+|grep|glob)\b", low):
+        return low.split()[0]
+    m = re.match(r"(?:\S*/)?(?:python3?|bash|sh|node|uv run|npx)\s+(?:-\S+\s+)*(\S*?([\w.-]+\.(?:py|sh|js|ts)))\b", t) \
+        or re.match(r"(?:\S*/)?modal\s+run\s+(\S*?([\w.-]+\.py))", t)
+    if m:
+        sub = re.match(r"\s+([a-z][\w-]*)(?=\s|$)", t[m.end():])
+        return f"run {m.group(2)}" + (f" {sub.group(1)}" if sub and len(sub.group(1)) < 16 else "")
+    for word in ("pvideo", "pb", "drive", "modal", "ffmpeg", "pip", "npm", "curl", "git", "yt-dlp", "whisper"):
+        if re.match(rf"(?:\S*/)?{re.escape(word)}\b", low):
+            verb = re.match(rf"(?:\S*/)?{re.escape(word)}\s+([a-z][\w-]*)", low)
+            return word + (f" {verb.group(1)}" if verb else "")
+    return (re.match(r"[@\w/.-]+", low) or [low[:20]])[0][:40] or "step"
+
+
+def _stats_load():
+    with STEP_STATS_LOCK:
+        if STEP_STATS:
+            return
+        with contextlib.suppress(Exception):
+            STEP_STATS.update(json.load(open(STEP_STATS_FILE)))
+
+
+def step_typical(kind: str):
+    """Median seconds this kind of step took before, or None."""
+    _stats_load()
+    with STEP_STATS_LOCK:
+        xs = sorted(STEP_STATS.get(kind) or [])
+    return round(xs[len(xs) // 2]) if len(xs) >= 2 else None
+
+
+def step_record(kind: str, secs: float):
+    if secs < 0.5:
+        return
+    _stats_load()
+    with STEP_STATS_LOCK:
+        xs = STEP_STATS.setdefault(kind, [])
+        xs.append(round(secs, 1))
+        del xs[:-15]
+        if len(STEP_STATS) > 400:  # forget the rarest kinds
+            for k in sorted(STEP_STATS, key=lambda k: len(STEP_STATS[k]))[:100]:
+                STEP_STATS.pop(k, None)
+
+
+def stats_save():
+    with STEP_STATS_LOCK, contextlib.suppress(Exception):
+        tmp = STEP_STATS_FILE + ".tmp"
+        json.dump(STEP_STATS, open(tmp, "w"))
+        os.replace(tmp, STEP_STATS_FILE)
+
+
+def lite_ask(gw: "Gateway", text: str, model: str, name: str, timeout: int = 60) -> str:
+    """One short answer from a throw-away kirocrew-lite slot (no tools, nothing remembered)."""
+    created = gw.call("POST", "/api/chat/slots", {"name": name, "agent": "kirocrew-lite", "memory_mode": "incognito"})
+    slot = created.get("key") or created.get("id") or created.get("slot") or created.get("name")
+    if not slot:
+        raise RuntimeError("no narrator slot")
+    try:
+        for path, body in ((f"/api/chat/slots/{slot}/model", {"model": model}),
+                           (f"/api/chat/slots/{slot}/reasoning-effort", {"reasoning_effort": "low"})):
+            _safe(gw.call, "POST", path, body)
+        out, done = {"text": ""}, threading.Event()
+
+        def run():
+            try:
+                for c in gw.stream_chat(slot, text):
+                    if not isinstance(c, dict):
+                        continue
+                    if c.get("type") == "chunk":
+                        out["text"] += chunk_text(c)
+                    elif c.get("type") == "assistant" and c.get("content"):
+                        out["text"] = c["content"] if len(c["content"]) >= len(out["text"]) else out["text"]
+                    elif c.get("type") in ("permission", "tool", "error"):
+                        break  # a narrator never needs tools
+            except Exception:
+                pass
+            finally:
+                done.set()
+        threading.Thread(target=run, daemon=True).start()
+        if not done.wait(timeout):
+            _safe(gw.call, "POST", f"/api/chat/slots/{slot}/stop", {})
+        return out["text"]
+    finally:
+        _safe(gw.call, "DELETE", f"/api/chat/slots/{slot}")
+
+
+def narrate(gw: "Gateway", ask: str, tools: list, at: list, elapsed: float, thinking: str, lang: str) -> dict:
+    """Haiku's view of the running answer: {now, next, step_left, total_left} (seconds may be None)."""
+    lines = []
+    n = min(len(tools), len(at))
+    for i in range(max(0, n - 10), n):
+        end = at[i + 1] if i + 1 < n else elapsed
+        lines.append(f"- [{int(at[i])}s, took {int(end - at[i])}s{' so far' if i == n - 1 else ''}] {tools[i][:220]}")
+    typ = step_typical(step_kind(tools[-1])) if tools else None
+    prompt = (
+        "You watch another AI agent work and explain it to its user. Reply with ONE line of JSON only, no prose:\n"
+        '{"now": "<what it is doing right now, plain words, max 9 words>", '
+        '"next": "<the likely next step, max 9 words, or empty>", '
+        '"step_left": <seconds until the current step likely ends, integer>, '
+        '"total_left": <seconds until the whole answer likely ends, integer>}\n'
+        f"Write now/next in this language: {lang}. Never mention tools, JSON or yourself. Be realistic: "
+        "renders, model downloads, GPU jobs, installs and long scripts take minutes.\n\n"
+        f"User asked: {ask[:400]}\n"
+        f"Running for {int(elapsed)}s. Steps so far (start time, duration):\n" + "\n".join(lines) + "\n"
+        + (f"The current kind of step usually takes about {typ}s.\n" if typ else "")
+        + (f"Agent's latest thoughts: {thinking[-700:]}\n" if thinking else ""))
+    raw = lite_ask(gw, prompt, TL_MODEL, "Panda timeline", timeout=45)
+    m = re.search(r"\{.*\}", raw or "", re.S)
+    data = json.loads(m.group(0)) if m else {}
+    num = lambda v: int(v) if isinstance(v, (int, float)) and 0 <= v < 6 * 3600 else None
+    return {"now": scrub(str(data.get("now") or ""))[:90], "next": scrub(str(data.get("next") or ""))[:90],
+            "step_left": num(data.get("step_left")), "total_left": num(data.get("total_left"))}
+
+
 def handle(sb: Supabase, gw: Gateway, msg: dict):
     chat = sb.rest("GET", "chats", params={"id": f"eq.{msg['chat_id']}", "select": "*"})[0]
     settings = user_settings(sb, chat["owner"])
@@ -2240,10 +2374,24 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                     body={"chat_id": chat["id"], "owner": chat["owner"], "role": "assistant",
                           "status": "streaming", "reply_to": msg["id"], "meta": base_meta})[0]
     text, thinking, tools, usage, t0 = "", "", [], None, time.time()
+    tool_at: list = []   # seconds since t0 when each step in `tools` started (same order)
+    tl: dict = {}        # live timeline note for the app (see narrate())
+    tl_state = {"calls": 0, "last": 0.0, "steps": 0, "busy": False}
+    tl_on = not cmd and settings.get("liveTimeline", True) is not False
+    lang = {"it": "Italian", "uk": "Ukrainian"}.get(str(settings.get("language") or ""), "English")
+
+    def add_step(step: str):
+        now = round(time.time() - t0, 1)
+        if tools and tool_at:
+            step_record(step_kind(tools[-1]), now - tool_at[-1])
+        tools.append(step)
+        tool_at.append(now)
+        tl["typ"] = step_typical(step_kind(step))
     with THINK_LOCK:
         THINK[slot], THINK_REPLY[slot], THINK_SENT[slot] = "", reply["id"], 0
     meta = lambda: {**base_meta, "replayed": needs_replay,
-                    "tools": tools[-30:], "usage": usage, "secs": round(time.time() - t0, 1)}
+                    "tools": tools[-30:], "steps_at": tool_at[-30:], "n_steps": len(tools), "tl": dict(tl) if tl else None,
+                    "usage": usage, "secs": round(time.time() - t0, 1)}
     # Pushes run on a small background thread too, so a quiet stretch (a long tool call, the model
     # thinking before its first token) still delivers the last text and thinking instead of holding
     # them until the next stream event. The main loop only marks the state dirty.
@@ -2267,6 +2415,27 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                 except Exception as exc:
                     log("stop call failed:", exc)
 
+    def tl_run():
+        try:
+            with TL_SEM:
+                if stream_done.is_set():
+                    return
+                el = time.time() - t0
+                with THINK_LOCK:
+                    th = THINK.get(slot, "")
+                note = narrate(gw, str(msg.get("content") or ""), list(tools), list(tool_at), el, th, lang)
+            if stream_done.is_set() or not note.get("now"):
+                return
+            el = round(el, 1)
+            tl.update(now=note["now"], next=note["next"], at=el, step=len(tools) - 1,
+                      step_end=round(el + note["step_left"]) if note["step_left"] is not None else None,
+                      done_end=round(el + note["total_left"]) if note["total_left"] is not None else None)
+            state["dirty"] = True
+        except Exception as exc:
+            log("timeline note failed:", type(exc).__name__, str(exc)[:120])
+        finally:
+            tl_state["busy"] = False
+
     def flusher():
         seen_think, last_check = 0, 0.0
         while not stream_done.wait(0.4):
@@ -2282,6 +2451,13 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                         gw.call("POST", f"/api/chat/slots/{slot}/stop")
                 except Exception as exc:
                     log("stop check failed:", type(exc).__name__)
+            if tl_on and not tl_state["busy"] and tools and tl_state["calls"] < TL_MAX:
+                el = time.time() - t0
+                fresh = len(tools) != tl_state["steps"]
+                gap = time.time() - tl_state["last"]
+                if el > TL_AFTER and ((fresh and gap > TL_EVERY) or gap > 2.5 * TL_EVERY):
+                    tl_state.update(busy=True, calls=tl_state["calls"] + 1, last=time.time(), steps=len(tools))
+                    threading.Thread(target=tl_run, daemon=True).start()
             with THINK_LOCK:
                 n = len(THINK.get(slot, ""))
             if n != seen_think:
@@ -2313,7 +2489,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             if kind == "tool":
                 step = clean_step(c.get("content"))
                 if step and (not tools or tools[-1] != step):
-                    tools.append(step)
+                    add_step(step)
                 seg_break = bool(text)
                 state["last"] = 0.0  # show the new step in the app right away
             elif kind == "context_usage":
@@ -2325,13 +2501,13 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                 except ValueError:
                     pass
             elif kind == "error":
-                tools.append("error: " + clean_step(c.get("content")))
+                add_step("error: " + clean_step(c.get("content")))
             elif is_thinking(c):
                 with THINK_LOCK:
                     THINK[slot] = THINK.get(slot, "") + (c.get("content") or c.get("text") or "")
             elif is_compaction_notice(chunk_text(c) if kind == "chunk" else c.get("content")):
                 # Crew's own "✅ Conversation compacted: <summary>" — an internal summary, not the answer.
-                tools.append("context compacted")
+                add_step("context compacted")
                 seg_break = bool(text)
                 compacted = True
             elif kind == "chunk":
@@ -2348,13 +2524,17 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             if time.time() - state["last"] > 0.4:
                 push_now()
             if cancelled.is_set():
-                tools.append("stopped by you")
+                add_step("paused: Panda restarted" if RESTARTING.is_set() else "stopped by you")
                 break
         if queued_id:
             wait_queued(sb, gw, slot, queued_id, reply["id"], {**meta(), "queued": True}, cancelled)
-        if cancelled.is_set() and "stopped by you" not in tools:
-            tools.append("stopped by you")
+        if cancelled.is_set() and not {"stopped by you", "paused: Panda restarted"} & set(tools):
+            add_step("paused: Panda restarted" if RESTARTING.is_set() else "stopped by you")
         stream_done.set()
+        if tools and tool_at:
+            step_record(step_kind(tools[-1]), time.time() - t0 - tool_at[-1])
+            stats_save()
+        tl.clear()  # the answer is done: no "now" / ETA on a finished reply
         with BUSY_LOCK:
             BUSY_SLOTS.pop(chat["id"], None)
         with push_lock:  # wait out a push still in flight, so it cannot land after the final write
@@ -2399,6 +2579,10 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                     raise
                 time.sleep(1.5 * (attempt + 1))
         _safe(lambda: sb.rest("PATCH", "messages", params={"id": f"eq.{msg['id']}"}, body={"status": "done"}))
+        if cancelled.is_set() and RESTARTING.is_set():
+            _safe(lambda: sb.rest("PATCH", "messages", params={"id": f"eq.{reply['id']}"},
+                                  body={"meta": {**done_meta, "interrupted": True}}))
+            _safe(queue_continue, sb, chat["id"], chat["owner"], msg, "paused for the restart")
         if (not cmd and USED_HELPERS.search("\n".join(tools))) or chat["id"] in FOLLOW:
             watch_followups(sb, gw, chat, slot)
         USAGE_STATE["poke"] = True  # refresh the account total soon
@@ -2579,6 +2763,92 @@ def steer_pending(sb: Supabase, gw: Gateway):
             meta.pop("steer", None)
             sb.rest("PATCH", "messages", params={"id": f"eq.{r['id']}"}, body={"status": "pending", "meta": meta})
             log("steer failed, will run next:", type(exc).__name__)
+
+
+# ── restarts: a turn cut off by a restart is continued by the next run ───────────────────────
+# Graceful (auto-restart / time guard): the stopping run lets turns finish for up to DRAIN_SECS, then
+# pauses the rest (RESTARTING) and queues a "[Panda restarted] continue" message the next run answers.
+# Hard (crash, Kaggle's 12 h kill): the next run finds the replies left "streaming" and does the same.
+RESTARTING = threading.Event()
+DRAIN_SECS = int(CFG.get("restart_drain_secs", 15 * 60))
+KAGGLE_CAP = 12 * 3600
+CONTINUE_MAX = 3   # a task is continued at most this many times in a row
+CONTINUE_TEXT = (
+    "[Panda restarted] Panda's machine restarted in the middle of your last answer, so it was cut off. "
+    "This conversation is restored, but programs, background jobs (`pjob` shows them as lost) and browser "
+    "pages from before the restart were stopped. Continue the same task from where it stopped: first check "
+    "what already finished (pjob list, ~/work, ~/outputs, logs), don't redo finished steps, start again only "
+    "what was cut off, then finish the answer to my request.")
+
+
+def queue_continue(sb: Supabase, chat_id: str, owner: str, user_msg: dict | None, why: str) -> bool:
+    """Queue the continue message for a chat whose answer a restart cut off. Returns True if queued."""
+    n = int(((user_msg or {}).get("meta") or {}).get("continue_n") or 0) + 1
+    if n > CONTINUE_MAX:
+        log(f"chat {chat_id}: cut off again, not continuing a {n}th time")
+        return False
+    sb.rest("POST", "messages", body={"chat_id": chat_id, "owner": owner, "role": "user", "status": "pending",
+                                      "content": CONTINUE_TEXT,
+                                      "meta": {"auto_continue": True, "continue_n": n, "why": why}})
+    log(f"chat {chat_id}: queued a continue after the restart ({why})")
+    return True
+
+
+def resume_interrupted(sb: Supabase):
+    """Startup: replies a dead run left 'streaming' are closed as cut off and their task is continued."""
+    rows = sb.rest("GET", "messages", params={"owner": f"eq.{OWNER}", "role": "eq.assistant",
+                                              "status": "in.(streaming,waiting)", "order": "id.asc", "limit": "30",
+                                              "select": "id,chat_id,owner,reply_to,meta,created_at"}) or []
+    done_chats: set = set()
+    for r in rows:
+        meta = {**(r.get("meta") or {}), "interrupted": True, "tl": None}
+        tools = list(meta.get("tools") or [])
+        meta["tools"] = (tools + ["paused: Panda restarted"])[-30:]
+        sb.rest("PATCH", "messages", params={"id": f"eq.{r['id']}"}, body={"status": "done", "meta": meta})
+        user = None
+        if r.get("reply_to"):
+            got = sb.rest("GET", "messages", params={"id": f"eq.{r['reply_to']}", "select": "id,meta,status"}) or []
+            user = got[0] if got else None
+            if user and user.get("status") == "processing":
+                sb.rest("PATCH", "messages", params={"id": f"eq.{user['id']}"}, body={"status": "done"})
+        fresh = (time.time() - (parse_ts(r.get("created_at")) or 0)) < 13 * 3600
+        if fresh and r["chat_id"] not in done_chats:
+            # A follow-up after helpers has no question behind it: continue it the same way.
+            if queue_continue(sb, r["chat_id"], r.get("owner") or OWNER, user, "found cut off at start"):
+                done_chats.add(r["chat_id"])
+    # Questions claimed by the dead run but never answered: back in line.
+    stuck = sb.rest("GET", "messages", params={"owner": f"eq.{OWNER}", "role": "eq.user", "status": "eq.processing",
+                                               "select": "id,chat_id", "limit": "30"}) or []
+    for u in stuck:
+        if u["chat_id"] in done_chats:
+            continue
+        answered = sb.rest("GET", "messages", params={"reply_to": f"eq.{u['id']}", "select": "id", "limit": "1"})
+        if not answered:
+            sb.rest("PATCH", "messages", params={"id": f"eq.{u['id']}"}, body={"status": "pending"})
+    if rows or stuck:
+        log(f"restart: {len(rows)} cut-off replies, {len(done_chats)} continued, {len(stuck)} questions re-queued")
+
+
+def drain_turns(sb: Supabase, reason: str):
+    """Before a restart, let answers finish for up to DRAIN_SECS, then pause the rest for the next run."""
+    if reason not in ("handoff", "time guard"):
+        return
+    deadline = min(time.time() + DRAIN_SECS, T0 + KAGGLE_CAP - 15 * 60)
+    while time.time() < deadline:
+        with BUSY_LOCK:
+            if not BUSY_CHATS:
+                return
+        time.sleep(2)
+    with BUSY_LOCK:
+        live = {c: dict(v) for c, v in BUSY_SLOTS.items()}
+    if not live:
+        return
+    RESTARTING.set()
+    log(f"restart: pausing {len(live)} answers still running; the next run continues them")
+    for chat_id in live:
+        with contextlib.suppress(Exception):
+            sb.rest("PATCH", "messages", params={"chat_id": f"eq.{chat_id}", "role": "eq.assistant",
+                                                 "status": "eq.streaming"}, body={"cancel": True})
 
 
 def claim_next(sb: Supabase):
@@ -3699,6 +3969,10 @@ def main():
         pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL_CHATS)
         # Messages are picked up on their own thread: a slow snapshot or usage refresh in the main loop
         # used to leave new messages "Queued" for minutes, and a network blip in claim_next crashed the run.
+        try:
+            resume_interrupted(sb)
+        except Exception as exc:
+            log("restart check failed:", scrub(exc)[:200])
         threading.Thread(target=claim_loop, args=(sb, gw, pool, stop_evt), daemon=True).start()
         SESSION_INFO.update(restored=restored, files_restored=files_state, startup_secs=round(time.time() - T0), crew=CREW_VERSION["v"])
         SESSION_INFO.pop("handoff_ready", None)
@@ -3773,6 +4047,7 @@ def main():
         # Keep beating while turns finish and the snapshot uploads: the app and the `session` function
         # treat a run that is silent for 90 s as dead.
         with beating(sb, sid):
+            drain_turns(sb, reason)  # a restart lets answers finish for a while, then pauses them for the next run
             pool.shutdown(wait=True, cancel_futures=False)  # let answers in flight finish
             stop_browser(sb)
             _safe(codex_backup, sb, True)
