@@ -872,6 +872,9 @@ html:has(.sheet-backdrop), html:has(.sheet-backdrop) body { overscroll-behavior-
 .attach-row.right { justify-content: flex-end; margin-bottom: 0; }
 .attach-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 220px; padding: 4px 6px 4px 4px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); font-size: 0.82em; }
 .attach-chip.bad { border-color: var(--danger); }
+.attach-more { font-weight: 600; color: var(--text); padding: 4px 10px; cursor: pointer; }
+.attach-more:hover { background: var(--line); }
+.attach-progress { align-self: center; }
 .attach-chip button { color: var(--muted); display: grid; place-items: center; }
 .attach-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-badge { color: #fff; font-size: 0.66em; font-weight: 700; letter-spacing: 0.03em; border-radius: 5px; padding: 2px 5px; flex: none; }

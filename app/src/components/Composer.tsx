@@ -34,6 +34,11 @@ type Props = {
   online?: boolean;
 };
 
+/** Files one message can carry, uploads running at once, and chips shown before "+N". */
+const MAX_FILES = 100;
+const UPLOAD_LANES = 4;
+export const CHIPS_SHOWN = 8;
+
 const GROUP_TITLE = { panda: "commandsPanda", crew: "commandsCrew", shortcut: "commandsShortcuts" } as const;
 
 export function Composer({ model, effort, onModel, onSend, onCommand, onStop, busy, autoFocus, initialText = "",
@@ -48,6 +53,7 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
   // A one-off prefill (initialText) wins; otherwise restore the saved draft for this chat.
   const [text, setText] = useState(initialText || readDraft());
   const [files, setFiles] = useState<(Attachment & { uploading?: boolean; error?: string })[]>([]);
+  const [showAll, setShowAll] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [active, setActive] = useState(0);
   const [dismissed, setDismissed] = useState("");
@@ -63,23 +69,34 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
   const addFiles = async (list: FileList | File[]) => {
     // Copy the files first: the picker's FileList is emptied as soon as its input is reset, and a
     // drop or paste list dies with its event, both before the session read below resolves.
-    const picked = Array.from(list).slice(0, 10);
+    const all = Array.from(list);
+    const room = Math.max(0, MAX_FILES - files.length);
+    const picked = all.slice(0, room);
+    if (all.length > picked.length) setNotice(`Up to ${MAX_FILES} files per message: ${all.length - picked.length} not attached.`);
     if (!picked.length) return;
     const { data } = await supabase.auth.getSession();
     const owner = data.session?.user.id;
     if (!owner) { setNotice("Sign in again to attach files."); return; }
-    for (const f of picked) {
-      const temp = { path: `temp-${f.name}-${Date.now()}`, name: f.name, mime: f.type, size: f.size, uploading: true };
-      setFiles((prev) => [...prev, temp]);
-      try {
-        const row = await uploadFile(owner, f, { kind: "upload" });
-        setFiles((prev) => prev.map((x) => x.path === temp.path ? { path: row.path, name: row.name, mime: row.mime, size: row.size, file_id: row.id } : x));
-      } catch (e) {
-        const why = (e as Error).message || "upload failed";
-        setFiles((prev) => prev.map((x) => x.path === temp.path ? { ...x, uploading: false, error: why } : x));
-        setNotice(`${f.name} was not attached: ${why}`);
+    // Show every chip at once, then upload a few at a time (one by one made 50 photos crawl).
+    const stamp = Date.now();
+    const temps = picked.map((f, i) => ({ path: `temp-${stamp}-${i}-${f.name}`, name: f.name, mime: f.type, size: f.size, uploading: true }));
+    setFiles((prev) => [...prev, ...temps]);
+    let next = 0;
+    const worker = async () => {
+      while (next < picked.length) {
+        const i = next++;
+        const f = picked[i], temp = temps[i];
+        try {
+          const row = await uploadFile(owner, f, { kind: "upload" });
+          setFiles((prev) => prev.map((x) => x.path === temp.path ? { path: row.path, name: row.name, mime: row.mime, size: row.size, file_id: row.id } : x));
+        } catch (e) {
+          const why = (e as Error).message || "upload failed";
+          setFiles((prev) => prev.map((x) => x.path === temp.path ? { ...x, uploading: false, error: why } : x));
+          setNotice(`${f.name} was not attached: ${why}`);
+        }
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(UPLOAD_LANES, picked.length) }, worker));
   };
 
   useEffect(() => {
@@ -121,7 +138,7 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
 
   const ready = files.filter((f) => !f.uploading && !f.error);
   const uploading = files.some((f) => f.uploading);
-  const clear = () => { setText(""); setFiles([]); };
+  const clear = () => { setText(""); setFiles([]); setShowAll(false); };
 
   const runClient = (cmd: SlashCmd, args: string) => {
     if (cmd.name === "/model") {
@@ -232,7 +249,7 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
       onPaste={(e) => { if (e.clipboardData.files.length) { e.preventDefault(); addFiles(e.clipboardData.files); } }}>
       {files.length > 0 && (
         <div className="attach-row">
-          {files.map((f) => {
+          {(showAll ? files : files.slice(0, CHIPS_SHOWN)).map((f) => {
             const k = fileKind(f.name, f.mime);
             return (
               <div key={f.path} className={`attach-chip ${f.error ? "bad" : ""}`} title={f.error || f.name}>
@@ -242,6 +259,13 @@ export function Composer({ model, effort, onModel, onSend, onCommand, onStop, bu
               </div>
             );
           })}
+          {files.length > CHIPS_SHOWN && (
+            <button type="button" className="attach-chip attach-more" onClick={() => setShowAll((v) => !v)}
+              aria-label={showAll ? "Show fewer files" : `Show all ${files.length} files`}>
+              {showAll ? "Show less" : `+${files.length - CHIPS_SHOWN}`}
+            </button>
+          )}
+          {uploading && <span className="attach-progress muted small">{ready.length}/{files.length} uploaded</span>}
         </div>
       )}
       {matches.length > 0 && (

@@ -25,6 +25,27 @@ const COMMAND_NOTE: Record<string, string> = {
   "/compact": "Earlier messages were summarised to free up context.",
 };
 
+/** Files on a sent message: the first 8 chips, then a "+N" chip that shows the rest. */
+const SENT_SHOWN = 8;
+function SentFiles({ files }: { files: Attachment[] }) {
+  const [all, setAll] = useState(false);
+  const shown = all ? files : files.slice(0, SENT_SHOWN);
+  return (
+    <div className="attach-row right">
+      {shown.map((a) => {
+        const k = fileKind(a.name, a.mime);
+        return <div key={a.path} className="attach-chip" title={a.name}><span className="file-badge" style={{ background: k.color }}>{k.label}</span><span className="attach-name">{a.name}</span></div>;
+      })}
+      {files.length > SENT_SHOWN && (
+        <button type="button" className="attach-chip attach-more" onClick={() => setAll((v) => !v)}
+          aria-label={all ? "Show fewer files" : `Show all ${files.length} files`}>
+          {all ? "Show less" : `+${files.length - SENT_SHOWN}`}
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** A short hop of the panda when a reply has just finished (not for replies already on screen). */
 function useJustFinished(live: boolean, ok: boolean) {
   const [hop, setHop] = useState(false);
@@ -268,14 +289,7 @@ export const MessageView = memo(function MessageView({ m, onRetry, onOption, isL
     const cmd = commandOf(m);
     return (
       <div className="msg user">
-        {(m.meta.attachments || []).length > 0 && (
-          <div className="attach-row right">
-            {(m.meta.attachments || []).map((a: Attachment) => {
-              const k = fileKind(a.name, a.mime);
-              return <div key={a.path} className="attach-chip"><span className="file-badge" style={{ background: k.color }}>{k.label}</span><span className="attach-name">{a.name}</span></div>;
-            })}
-          </div>
-        )}
+        {(m.meta.attachments || []).length > 0 && <SentFiles files={m.meta.attachments || []} />}
         {cmd && m.meta.command ? (
           <div className="bubble command"><IconSlash size={15} /><span>{m.content}</span></div>
         ) : <div className="bubble">{m.content}</div>}

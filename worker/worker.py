@@ -2072,7 +2072,7 @@ def link_files(text: str, published: list) -> str:
 
 def fetch_attachments(sb: Supabase, chat: dict, msg: dict) -> list:
     out = []
-    for a in (msg.get("meta") or {}).get("attachments", [])[:10]:
+    for a in (msg.get("meta") or {}).get("attachments", [])[:100]:
         dest = os.path.expanduser(f"~/uploads/{chat['id']}/{safe_name(a.get('name') or 'file')}")
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         if a.get("path") and sb.download(a["path"], dest, bucket=FILES_BUCKET):
