@@ -181,6 +181,17 @@ class Supabase:
         if r.status_code >= 400:
             raise RuntimeError(f"upload {name}: {r.status_code} {r.text[:200]}")
 
+    def put(self, name: str, data: bytes, mime: str = "application/octet-stream", bucket: str = BUCKET):
+        r = requests.post(f"{SB_URL}/storage/v1/object/{bucket}/{quote(name)}", data=data, timeout=600,
+                          headers=self.headers({"x-upsert": "true", "Content-Type": mime}))
+        if r.status_code >= 400:
+            raise RuntimeError(f"upload {name}: {r.status_code} {r.text[:200]}")
+
+    def get(self, name: str, bucket: str = BUCKET) -> bytes | None:
+        r = requests.get(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
+                         headers=self.headers(), timeout=600)
+        return r.content if r.status_code == 200 else None
+
     def delete_object(self, name: str, bucket: str = BUCKET):
         requests.delete(f"{SB_URL}/storage/v1/object/{bucket}/{quote(name)}", headers=self.headers(), timeout=60)
 
@@ -892,17 +903,167 @@ def restore_files(sb: "Supabase") -> str:
             os.remove(tmp)
 
 
+# ── kiro-cli's own files (chat transcripts, agents): saved in content-addressed chunks ──────────────
+# ~/.kiro/sessions/cli held 1.4 GB of transcripts. Packing all of it with gzip -9 and uploading ~500 MB
+# at every Stop and every periodic save was the bulk of a 10+ minute Stop. Now each file is cut into
+# KIRO_CHUNK pieces named by their sha256; a save uploads only pieces the store does not have yet. The
+# transcripts are append-only, so a long chat that grew re-uploads only its last piece or two. A small
+# index (written LAST, so a crash mid-save keeps the previous complete set) lists every file's pieces.
+KIRO_CHUNK = 8 * MiB
+KIRO_INDEX = "kiro-index.json"
+KIRO_LANES = 4
+_kiro = {"files": {}}  # arc (relative to ~/.kiro) -> {"size", "mtime_ns", "chunks": [sha...]}
+_kiro_lock = threading.Lock()
+
+
+def _kiro_chunk_key(h: str) -> str:
+    return state_key(f"kiro-chunks/{h}.z")
+
+
+def _kiro_walk(base: str):
+    for d in EXTRA_DIRS:
+        for dirpath, _, names in os.walk(f"{base}/{d}"):
+            for n in sorted(names):
+                if not n.endswith(".lock"):
+                    p = os.path.join(dirpath, n)
+                    yield os.path.relpath(p, base), p
+
+
+def kiro_save(sb: "Supabase", base: str | None = None) -> dict:
+    """Save ~/.kiro's EXTRA_DIRS incrementally. Returns counts for the log."""
+    import hashlib
+    import zlib
+    from concurrent.futures import ThreadPoolExecutor
+    base = base or f"{HOME}/.kiro"
+    with _kiro_lock:
+        old = _kiro["files"]
+        stored = {h for f in old.values() for h in f["chunks"]}
+        new, sent, errors = {}, set(), []
+        stats = {"files": 0, "changed": 0, "chunks_up": 0, "bytes_up": 0}
+        gate = threading.BoundedSemaphore(KIRO_LANES * 2)  # caps chunks held in memory
+        stat_lock = threading.Lock()
+
+        def up(h: str, raw: bytes):
+            try:
+                z = zlib.compress(raw, 1)
+                for i in range(3):
+                    try:
+                        sb.put(_kiro_chunk_key(h), z)
+                        break
+                    except Exception:
+                        if i == 2:
+                            raise
+                        time.sleep(3 * (i + 1))
+                with stat_lock:
+                    stats["chunks_up"] += 1
+                    stats["bytes_up"] += len(z)
+            except Exception as exc:
+                errors.append(scrub(exc)[:120])
+            finally:
+                gate.release()
+
+        with ThreadPoolExecutor(KIRO_LANES) as pool:
+            for arc, p in _kiro_walk(base):
+                try:
+                    st = os.stat(p)
+                    prev = old.get(arc)
+                    if prev and prev["size"] == st.st_size and prev["mtime_ns"] == st.st_mtime_ns:
+                        new[arc] = prev
+                        stats["files"] += 1
+                        continue
+                    chunks, size = [], 0
+                    with open(p, "rb") as f:
+                        while True:
+                            raw = f.read(KIRO_CHUNK)
+                            if not raw and chunks:
+                                break
+                            h = hashlib.sha256(raw).hexdigest()[:40]
+                            chunks.append(h)
+                            size += len(raw)
+                            if h not in stored and h not in sent:
+                                sent.add(h)
+                                gate.acquire()
+                                pool.submit(up, h, raw)
+                            if len(raw) < KIRO_CHUNK:
+                                break
+                except OSError:  # kiro-cli deletes and rewrites these files all the time: skip, next save retries
+                    continue
+                # Size is what was read; mtime from before the read, so a file written meanwhile differs next time.
+                new[arc] = {"size": size, "mtime_ns": st.st_mtime_ns if size == st.st_size else 0, "chunks": chunks}
+                stats["files"] += 1
+                stats["changed"] += 1
+        if errors:
+            raise RuntimeError(f"{len(errors)} kiro chunk upload(s) failed: {errors[0]}")
+        sb.put(state_key(KIRO_INDEX), json.dumps({"v": 1, "chunk": KIRO_CHUNK, "files": new}).encode(),
+               mime="application/json")
+        _kiro["files"] = new
+        live = {h for f in new.values() for h in f["chunks"]}
+        dead = stored - live
+        with ThreadPoolExecutor(KIRO_LANES) as pool:
+            list(pool.map(lambda h: _safe_delete(sb, _kiro_chunk_key(h)), dead))
+        stats["deleted"] = len(dead)
+        return stats
+
+
+def _safe_delete(sb: "Supabase", key: str):
+    with contextlib.suppress(Exception):
+        sb.delete_object(key)
+
+
+def kiro_restore(sb: "Supabase", base: str | None = None) -> int | None:
+    """Put the chunked ~/.kiro files back. None when there is no index yet (older runs used a tarball)."""
+    import zlib
+    from concurrent.futures import ThreadPoolExecutor
+    base = base or f"{HOME}/.kiro"
+    raw = sb.get(state_key(KIRO_INDEX))
+    if not raw:
+        return None
+    files = json.loads(raw)["files"]
+    need = sorted({h for f in files.values() for h in f["chunks"]})
+
+    def fetch(h):
+        d = sb.get(_kiro_chunk_key(h))
+        if d is None:
+            raise RuntimeError(f"kiro chunk {h[:12]} is missing")
+        return h, zlib.decompress(d)
+
+    cache = {}
+    with ThreadPoolExecutor(KIRO_LANES * 2) as pool:
+        for h, d in pool.map(fetch, need):
+            cache[h] = d  # ~1.4 GB of transcripts fits in RAM; Kaggle has 30 GB
+    for arc, f in files.items():
+        if arc.startswith("/") or ".." in arc.split("/"):
+            continue
+        dest = os.path.join(base, arc)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as out:
+            for h in f["chunks"]:
+                out.write(cache[h])
+        if f.get("mtime_ns"):
+            os.utime(dest, ns=(f["mtime_ns"], f["mtime_ns"]))
+    with _kiro_lock:
+        _kiro["files"] = files  # the next save uploads only what changes from here
+    return len(files)
+
+
 def restore(sb: Supabase) -> str:
     snap = f"{WORK}/restore-crew.tar.gz"
     extra = f"{WORK}/restore-kiro.tar.gz"
     got = blob_load(sb, "latest-crew.tar.gz", snap)
     if got:
         sh(f"kirocrew restore {snap} --mode replace --force", timeout=900)
-    if blob_load(sb, "latest-kiro.tar.gz", extra):
+    n = kiro_restore(sb)
+    if n is not None:
+        log(f"restore: {n} kiro-cli files from chunks")
+    elif blob_load(sb, "latest-kiro.tar.gz", extra):  # saved by a worker from before the chunk store
         with tarfile.open(extra) as t:
             t.extractall(f"{HOME}/.kiro", filter="data")
-        for lock in glob.glob(f"{HOME}/.kiro/sessions/cli/*.lock"):
-            os.remove(lock)
+    for lock in glob.glob(f"{HOME}/.kiro/sessions/cli/*.lock"):
+        os.remove(lock)
+    # Kaggle copies whatever is left in /kaggle/working at the end of the run: never leave these there.
+    for p in (snap, extra):
+        with contextlib.suppress(OSError):
+            os.remove(p)
     log("restore:", "from snapshot" if got else "fresh start (no snapshot yet)")
     return "restored" if got else "fresh"
 
@@ -928,14 +1089,12 @@ def snapshot(sb: Supabase, reason: str, files: bool = True, files_budget: float 
     if not found:
         raise RuntimeError("snapshot produced no file")
     done = blob_save(sb, "latest-crew.tar.gz", found[-1])
-    extra = f"{WORK}/kiro-extra.tar.gz"
-    with tarfile.open(extra, "w:gz") as t:
-        for d in EXTRA_DIRS:
-            p = f"{HOME}/.kiro/{d}"
-            if os.path.isdir(p):
-                tar_add_live(t, p, d)
-    blob_save(sb, "latest-kiro.tar.gz", extra)
-    log(f"snapshot uploaded ({reason}), {done['size'] // 1024} KiB in {done['parts']} part(s)")
+    shutil.rmtree(out, ignore_errors=True)  # never left in /kaggle/working for Kaggle to copy
+    t0 = time.time()
+    k = kiro_save(sb)
+    log(f"snapshot uploaded ({reason}), crew {done['size'] // 1024} KiB in {done['parts']} part(s); "
+        f"kiro-cli: {k['changed']}/{k['files']} files changed, {k['chunks_up']} chunks "
+        f"({k['bytes_up'] // MiB} MB) up, {k['deleted']} dropped, {time.time() - t0:.0f} s")
     if files:
         _save_files_note(sb, reason, files_budget)
     return now_iso()
