@@ -8,6 +8,7 @@ import { disablePush, enablePush, pushState } from "../lib/push";
 import { gw } from "../lib/commands";
 import { CrewSettingsPanel } from "./CrewSettings";
 import { UsagePanel } from "./Usage";
+import { MemoryPanel } from "./MemoryPanel";
 import type { Worker } from "./SessionChip";
 
 function Modal({ title, onClose, children, wide }: { title: string; onClose: () => void; children: ReactNode; wide?: boolean }) {
@@ -178,6 +179,8 @@ export function SettingsModal({ email, userId, onClose, worker, online, initialT
               hint="Panda learns your preferences and projects over time. Applies from the next Start." />
             <p className="muted small">Existing memories stay available either way. Scheduled tasks, lessons and
               skills are stored in your private backup between sessions.</p>
+            <h3>What Panda remembers</h3>
+            <MemoryPanel online={online} />
           </>}
 
           {tab === "account" && <>
