@@ -4537,6 +4537,9 @@ def main():
         # Kiro Crew settings changed in the app, re-applied in case the snapshot predates them.
         apply_overrides(gw, user_settings(sb, OWNER).get("crewOverrides"))
         start_video(sb, gw)
+        # First chunked save in the background now (it uploads everything once, ~1-2 min), so a Stop
+        # soon after Start only sends what changed instead of paying for the whole first copy.
+        threading.Thread(target=_safe, args=(kiro_save, sb), daemon=True, name="kiro-first-save").start()
         stop_evt = threading.Event()
         threading.Thread(target=command_loop, args=(sb, gw, stop_evt), daemon=True).start()
         threading.Thread(target=thinking_listener, args=(gw, stop_evt), daemon=True).start()
@@ -4625,12 +4628,18 @@ def main():
         # Keep beating while turns finish and the snapshot uploads: the app and the `session` function
         # treat a run that is silent for 90 s as dead.
         with beating(sb, sid):
+            t_stop = time.time()
             drain_turns(sb, reason)  # a restart lets answers finish for a while, then pauses them for the next run
             stop_answers(sb, gw, reason)  # Stop: a short grace, then running answers are stopped
+            t_ans = time.time()
             pool.shutdown(wait=False, cancel_futures=True)
             stop_browser(sb)
             _safe(codex_backup, sb, True)
+            t_snap = time.time()
             snap_at = snapshot(sb, reason, files_budget=STOP_FILES_SECS)
+            SESSION_INFO["stop_secs"] = {"answers": round(t_ans - t_stop), "browser_codex": round(t_snap - t_ans),
+                                         "snapshot": round(time.time() - t_snap)}
+            log("stop timings:", SESSION_INFO["stop_secs"])
             # A successor is requested after the snapshot when it was not requested earlier (sequential
             # mode, or the early tries failed). Only a time-based stop hands off; Stop never does.
             if AUTO_RESTART and reason in ("handoff", "time guard") and ho["to"] is None:
