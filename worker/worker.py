@@ -2708,6 +2708,8 @@ def followup_step(sb: Supabase, gw: Gateway):
                                        and (m.get("meta") or {}).get("kind") not in ("compaction", "session_reload"))
                 if t.strip() and not is_compaction_notice(t))
         w["seen"] = total
+        # A wake can start the next phase (more helpers): keep watching while the chat keeps working.
+        w["until"] = max(w["until"], time.time() + FOLLOW_HOURS * 3600)
         if not text.strip():
             sb.rest("DELETE", "messages", params={"id": f"eq.{w['row']}"})
         else:
