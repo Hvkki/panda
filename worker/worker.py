@@ -259,6 +259,53 @@ class Supabase:
         if r.status_code >= 400 and r.status_code != 404 and "not_found" not in r.text:
             log(f"storage delete {name.rsplit('/', 1)[-1]}: {r.status_code} {r.text[:120]}")
 
+    def list(self, prefix: str, bucket: str = BUCKET) -> list:
+        """Objects directly under `prefix` (paginated). Each: {name (full path), size, updated_at}.
+        Sub-folder placeholders (id is null) are skipped."""
+        out, offset, page = [], 0, 100
+        while True:
+            r = requests.post(f"{SB_URL}/storage/v1/object/list/{bucket}", timeout=60,
+                              headers=self.headers(),
+                              json={"prefix": prefix.rstrip("/") + "/", "limit": page, "offset": offset,
+                                    "sortBy": {"column": "name", "order": "asc"}})
+            if r.status_code >= 400:
+                raise RuntimeError(f"storage list {prefix}: {r.status_code} {r.text[:200]}")
+            batch = r.json() or []
+            for o in batch:
+                if o.get("id") is None:
+                    continue
+                out.append({"name": f"{prefix.rstrip('/')}/{o['name']}",
+                            "size": int((o.get("metadata") or {}).get("size") or 0),
+                            "updated_at": o.get("updated_at") or o.get("created_at")})
+            if len(batch) < page:
+                break
+            offset += page
+        return out
+
+    def list_tree(self, prefix: str, bucket: str = BUCKET, _depth: int = 0) -> list:
+        """Like list(), but recurses into sub-folders (for nested prefixes such as remote/<rid>/tasks/)."""
+        out, offset, page = [], 0, 100
+        while True:
+            r = requests.post(f"{SB_URL}/storage/v1/object/list/{bucket}", timeout=60,
+                              headers=self.headers(),
+                              json={"prefix": prefix.rstrip("/") + "/", "limit": page, "offset": offset,
+                                    "sortBy": {"column": "name", "order": "asc"}})
+            if r.status_code >= 400:
+                raise RuntimeError(f"storage list {prefix}: {r.status_code} {r.text[:200]}")
+            batch = r.json() or []
+            for o in batch:
+                full = f"{prefix.rstrip('/')}/{o['name']}"
+                if o.get("id") is None:
+                    if _depth < 6:
+                        out += self.list_tree(full, bucket, _depth + 1)
+                else:
+                    out.append({"name": full, "size": int((o.get("metadata") or {}).get("size") or 0),
+                                "updated_at": o.get("updated_at") or o.get("created_at")})
+            if len(batch) < page:
+                break
+            offset += page
+        return out
+
     def download(self, name: str, path: str, bucket: str = BUCKET, fresh: bool = False) -> bool:
         """Save the object to `path`. False only when it does not exist; busy answers (429, 5xx,
         dropped connections) are retried, like get()."""
@@ -1349,6 +1396,70 @@ def kiro_save(sb: "Supabase", base: str | None = None) -> dict:
 def _safe_delete(sb: "Supabase", key: str):
     with contextlib.suppress(Exception):
         sb.delete_object(key)
+
+
+KIRO_GC_GRACE = int(CFG.get("kiro_gc_grace_secs", 3600))   # don't delete a chunk uploaded this recently
+KIRO_GC_EVERY = int(CFG.get("kiro_gc_every_secs", 6 * 3600))
+REMOTE_GC_GRACE = int(CFG.get("remote_gc_grace_secs", 6 * 3600))   # stale remote-task tars older than this
+
+
+def storage_gc(sb: "Supabase") -> dict:
+    """Backstop for kiro_save's incremental delete: list every kiro-chunk in Storage and remove any the
+    current index no longer references and that is older than the grace window (so an in-flight upload is
+    never dropped). Orphans accrete from crashed saves, runs from before the index existed, and B2
+    double-writes -- that is what pushed the Supabase bucket over quota."""
+    raw = sb.get_fresh(state_key(KIRO_INDEX))
+    if not raw:
+        return {"skipped": "no index"}
+    try:
+        referenced = {h for f in json.loads(raw)["files"].values() for h in f["chunks"]}
+    except (ValueError, KeyError, TypeError):
+        return {"skipped": "bad index"}
+    try:
+        objs = sb.list(state_key("kiro-chunks"))
+    except Exception as exc:
+        log("storage GC: list failed:", scrub(exc)[:150])
+        return {"skipped": "list failed"}
+    now, removed, freed = time.time(), 0, 0
+    for o in objs:
+        base = o["name"].rsplit("/", 1)[-1]
+        if not base.endswith(".z") or base[:-2] in referenced:
+            continue
+        if now - (parse_ts(o.get("updated_at")) or 0) < KIRO_GC_GRACE:
+            continue
+        _safe_delete(sb, o["name"])
+        removed += 1
+        freed += o["size"]
+    if removed:
+        log(f"storage GC: removed {removed} orphan chunks, freed {freed // (1 << 20)} MB "
+            f"({len(referenced)} referenced, {len(objs)} total)")
+    # Sweep transient remote-Panda task tars (in/out) left behind after a task finished; they are pulled
+    # back by the main run and never needed again. Only those older than REMOTE_GC_GRACE, so an in-flight
+    # or just-finished task is never touched.
+    rrem = rfreed = 0
+    try:
+        for o in sb.list_tree(state_key("remote")):
+            if now - (parse_ts(o.get("updated_at")) or 0) < REMOTE_GC_GRACE:
+                continue
+            _safe_delete(sb, o["name"])
+            rrem += 1
+            rfreed += o["size"]
+    except Exception as exc:
+        log("storage GC: remote sweep skipped:", scrub(exc)[:120])
+    if rrem:
+        log(f"storage GC: removed {rrem} stale remote task files, freed {rfreed // (1 << 20)} MB")
+    return {"removed": removed, "freed": freed + rfreed, "referenced": len(referenced),
+            "total": len(objs), "remote_removed": rrem}
+
+
+def gc_loop(sb: "Supabase", stop: threading.Event):
+    """Run storage_gc a few minutes after start, then every KIRO_GC_EVERY, so the bucket self-cleans."""
+    if stop.wait(180):
+        return
+    while True:
+        _safe(storage_gc, sb)
+        if stop.wait(KIRO_GC_EVERY):
+            return
 
 
 def kiro_restore(sb: "Supabase", base: str | None = None) -> int | None:
@@ -5994,6 +6105,7 @@ def main():
         threading.Thread(target=hang_loop, args=(sb, gw, stop_evt), daemon=True, name="hang").start()
         threading.Thread(target=drive_trash_loop, args=(stop_evt,), daemon=True, name="drive-trash").start()
         threading.Thread(target=remote_loop, args=(sb, stop_evt), daemon=True, name="remote").start()
+        threading.Thread(target=gc_loop, args=(sb, stop_evt), daemon=True, name="gc").start()
         threading.Thread(target=thinking_pusher, args=(sb, stop_evt), daemon=True).start()
         pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL_CHATS)
         # Messages are picked up on their own thread: a slow snapshot or usage refresh in the main loop
