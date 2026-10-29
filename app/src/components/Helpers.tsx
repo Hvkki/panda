@@ -28,6 +28,7 @@ export function Helpers({ slot, online, busy }: { slot: string | null; online: b
     const parent = `dashboard:${slot}`;
     let timer = 0;
     const tick = async () => {
+      if (document.hidden) return;  // a tab in the background never polls
       try {
         const r = await gw<{ agents: Helper[] }>("GET", "/api/spawn");
         if (!alive.current) return;
@@ -37,8 +38,10 @@ export function Helpers({ slot, online, busy }: { slot: string | null; online: b
       } catch { /* offline or relay hiccup: keep the last list */ }
     };
     tick();
-    // Poll only while something can change: Panda answering, or a helper still running.
-    if (busy || running) timer = window.setInterval(tick, 5000);
+    // Poll only while something can change, and slowly: every poll is a relay command row with the
+    // full helper list (~16 KB), and polling every 5 s from open chats overloaded the database.
+    if (running) timer = window.setInterval(tick, 20000);
+    else if (busy) timer = window.setInterval(tick, 45000);
     return () => { alive.current = false; window.clearInterval(timer); };
   }, [slot, online, busy, running]);
 

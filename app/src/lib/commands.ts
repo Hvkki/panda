@@ -10,10 +10,10 @@ export async function runCommand<T = unknown>(op: string, args: Record<string, u
   if (error || !data) throw error || new Error("could not queue command");
   const id = data.id as number;
   const t0 = Date.now();
-  let wait = 600;
+  let wait = 700;
   while (Date.now() - t0 < timeoutMs) {
     await new Promise((r) => setTimeout(r, wait));
-    wait = Math.min(1500, wait + 150);
+    wait = Math.min(3000, wait + 300);  // each check is a database read; back off
     const { data: row } = await supabase.from("commands").select("status,result").eq("id", id).single();
     if (row?.status === "done") return row.result as T;
     if (row?.status === "error") throw new Error((row.result as { error?: string })?.error || "failed");
