@@ -108,6 +108,7 @@ export type Message = {
     tl?: import("../components/Timeline").TimelineNote | null;
   };
   created_at: string;
+  updated_at?: string;    // set by the database on every change (catch-up reads fetch rows newer than this)
 };
 
 /** Kiro account usage as Kiro Crew reports it (GET /api/sessions/usage). */

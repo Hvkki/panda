@@ -11,6 +11,19 @@ import { IconCoins, IconList, IconSpinner, IconX } from "./Icons";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Attachment } from "../lib/files";
+import { useSettings } from "../lib/settings";
+
+/** Every `messages` column except `thinking`. Keep in step with the table (supabase/schema.sql). */
+const MESSAGE_COLS_NO_THINKING = "id,chat_id,owner,role,content,status,reply_to,meta,created_at,updated_at,cancel,decision";
+
+/** A Postgres timestamp ("2026-10-29T22:16:10.169511+00:00", with or without zone) as ms, or 0. */
+function tsOf(s?: string | null): number {
+  const m = /^(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d(?::?\d\d)?)?$/.exec(s || "");
+  if (!m) return 0;
+  let tz = m[4] || "Z";
+  if (tz !== "Z") tz = tz.length === 3 ? `${tz}:00` : tz.length === 5 ? `${tz.slice(0, 3)}:${tz.slice(3)}` : tz;
+  return Date.parse(`${m[1]}T${m[2]}${(m[3] || "").slice(0, 4)}${tz}`) || 0;
+}
 
 type Props = {
   chat: Chat;
@@ -27,6 +40,8 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
   const t = useT();
   const [messages, setMessages] = useState<Message[]>([]);
   const [loading, setLoading] = useState(true);
+  const { settings } = useSettings();
+  const withThinking = !!settings.showThinking; // thinking is ~70-85% of a long chat's bytes; load it only when shown
   const [sides, setSides] = useState<Side[]>([]);
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -35,24 +50,48 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
   useEffect(() => {
     let alive = true;
     setLoading(true);
-    // Full re-read: the first load, and again whenever the live link may have missed changes.
-    const load = (first = false) => supabase.from("messages").select("*").eq("chat_id", chat.id).order("id")
+    const cols = withThinking ? "*" : MESSAGE_COLS_NO_THINKING;
+    let seen = 0; // newest updated_at we hold (server time, ms): catch-up reads start a little before it
+    const note = (rows: Message[]) => { for (const r of rows) seen = Math.max(seen, tsOf(r.updated_at)); };
+    // A re-read can land just after a newer live update of a reply still being written: keep the longer text.
+    const pick = (p: Message | undefined, r: Message) => p && r.status === "streaming" && p.status === "streaming" &&
+      (p.content || "").length > (r.content || "").length ? p : r;
+    // Full read: the first load, and when there is nothing to catch up from.
+    const load = (first = false) => supabase.from("messages").select(cols).eq("chat_id", chat.id).order("id")
       .then(({ data, error }) => {
         if (!alive || error || !data) { if (alive && first) setLoading(false); return; }
-        const rows = data as Message[];
-        // A re-read can land just after a newer live update of a reply still being written: keep the longer text.
-        setMessages((prev) => first ? rows : rows.map((r) => {
-          const p = prev.find((m) => m.id === r.id);
-          return p && r.status === "streaming" && p.status === "streaming" &&
-            (p.content || "").length > (r.content || "").length ? p : r;
-        }));
+        const rows = data as unknown as Message[];
+        note(rows);
+        setMessages((prev) => first ? rows : rows.map((r) => pick(prev.find((m) => m.id === r.id), r)));
         setLoading(false);
         if (first) stick.current = true;
       });
+    // Catch-up read whenever the live link may have missed changes: only the rows changed since the
+    // newest one we hold, plus the id list so a deleted row goes too. Re-reading the whole chat every
+    // 6 s (2 MB for a long chat, mostly thinking) was most of the database's traffic on 29 Oct.
+    const sync = () => {
+      if (!seen) { load(); return; }
+      const since = new Date(seen - 5000).toISOString();
+      Promise.all([
+        supabase.from("messages").select("id").eq("chat_id", chat.id),
+        supabase.from("messages").select(cols).eq("chat_id", chat.id).gte("updated_at", since).order("id"),
+      ]).then(([ids, changed]) => {
+        if (!alive || ids.error || changed.error || !ids.data || !changed.data) return;
+        const kept = new Set((ids.data as { id: number }[]).map((r) => r.id));
+        const rows = changed.data as unknown as Message[];
+        note(rows);
+        setMessages((prev) => {
+          const byId = new Map(prev.filter((m) => kept.has(m.id)).map((m) => [m.id, m] as const));
+          for (const r of rows) byId.set(r.id, pick(byId.get(r.id), r));
+          return [...byId.values()].sort((a, b) => a.id - b.id);
+        });
+      });
+    };
     load(true);
     const ch = supabase.channel(`chat-${chat.id}`)
       .on("postgres_changes", { event: "*", schema: "public", table: "messages", filter: `chat_id=eq.${chat.id}` },
         (p) => {
+          if (p.eventType !== "DELETE") note([p.new as Message]);
           setMessages((prev) => {
             if (p.eventType === "DELETE") return prev.filter((m) => m.id !== (p.old as Message).id);
             const row = p.new as Message;
@@ -63,11 +102,11 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
             return next;
           });
         })
-      .subscribe(onRejoin(() => load()));
-    const off = onResume(() => load());
-    reload.current = () => load();
+      .subscribe(onRejoin(() => sync()));
+    const off = onResume(() => sync());
+    reload.current = () => sync();
     return () => { alive = false; supabase.removeChannel(ch); off(); reload.current = null; };
-  }, [chat.id]);
+  }, [chat.id, withThinking]);
 
   // Keep the view pinned to the bottom while streaming, unless the user scrolled up.
   useEffect(() => {
