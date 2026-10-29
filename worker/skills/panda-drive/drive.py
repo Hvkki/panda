@@ -6,11 +6,14 @@
   drive ls [folder/sub]           list files
   drive find <words>              search by name
   drive rm <name-or-id> [--forever]  move to trash (--forever: delete for good)
+  drive emptytrash [hours]        delete for good Panda's files trashed over [hours] (default 1) ago
+                                  (Panda's worker does this every 30 min; trash counts against the quota)
   drive link <name-or-id>         link the user can open
   drive usage                     space used / free
 
 Everything lives under the "Panda" folder of the user's Drive. Credentials: ~/.panda/drive.json
 """
+import calendar
 import json
 import mimetypes
 import os
@@ -205,6 +208,35 @@ def find(words):
         print("No matches.")
 
 
+def empty_trash(grace_hours: float = 1.0):
+    """Delete for good what is in the trash, but only files Panda itself created (this app only sees
+    those; the user's own trashed files are never touched) and only once they have been trashed for
+    `grace_hours`, so a `drive rm` stays undoable for a while. Drive counts the trash against the quota."""
+    cutoff = time.time() - grace_hours * 3600
+    n = size = 0
+    tok = None
+    while True:
+        q = {"q": "trashed=true", "fields": "nextPageToken,files(id,name,size,trashedTime,modifiedTime)", "pageSize": 200}
+        if tok:
+            q["pageToken"] = tok
+        r = call("GET", f"{API}/files?" + urllib.parse.urlencode(q))
+        for f in r.get("files", []):
+            when = f.get("trashedTime") or f.get("modifiedTime") or ""
+            try:
+                t = calendar.timegm(time.strptime(when[:19], "%Y-%m-%dT%H:%M:%S"))
+            except ValueError:
+                t = 0
+            if t > cutoff:
+                continue
+            call("DELETE", f"{API}/files/{f['id']}")
+            n += 1
+            size += int(f.get("size", 0))
+        tok = r.get("nextPageToken")
+        if not tok:
+            break
+    print(f"Emptied {n} file(s), {human(size)} from the trash")
+
+
 def main():
     a = sys.argv[1:]
     if not a or a[0] in ("-h", "--help", "help"):
@@ -228,6 +260,8 @@ def main():
             call("PATCH", f"{API}/files/{f['id']}", json.dumps({"trashed": True}).encode(),
                  {"Content-Type": "application/json"})
             print(f"Moved {f['name']} to the trash")
+    elif op == "emptytrash":
+        empty_trash(float(rest[0]) if rest else 1.0)
     elif op == "link" and rest:
         print(resolve(rest[0]).get("webViewLink"))
     elif op == "usage":

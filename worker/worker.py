@@ -989,7 +989,7 @@ def files_snapshot(sb: "Supabase", reason: str, budget: float | None = None) -> 
     longer, keeping the last saved copy (at most SNAPSHOT_EVERY old) instead of holding up the stop.
     """
     deadline = time.time() + budget if budget else None
-    level = 1 if budget else 6
+    level = 1     # was 6 for periodic saves: ~3x the CPU for a few % smaller (most of ~/work is media)
     if not FILES_ENABLED:
         return None
     if _files_restore["failed"]:
@@ -1342,8 +1342,15 @@ def snapshot(sb: Supabase, reason: str, files: bool = True, files_budget: float 
 
 
 def snapshot_files_later(sb: Supabase, reason: str):
-    """Periodic work-file save in the background, so a big copy never holds up the message loop."""
-    threading.Thread(target=_save_files_note, args=(sb, reason), daemon=True).start()
+    """Periodic work-file save in the background, so a big copy never holds up the message loop. It
+    compresses GBs: the thread runs at nice 19 with idle I/O so chats keep their CPU (it used to run at
+    full priority and, with ~/work at 5 GB, held a core for minutes every 30 min)."""
+    def run():
+        with contextlib.suppress(OSError):
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 19)   # this thread only
+        _ioprio_idle(0)
+        _save_files_note(sb, reason)
+    threading.Thread(target=run, daemon=True, name="files-save").start()
 
 
 def start_gateway() -> subprocess.Popen:
@@ -2328,6 +2335,26 @@ def drive_rm(file_id: str) -> None:
         with contextlib.suppress(Exception):
             subprocess.run([sys.executable, DRIVE_TOOL, "rm", file_id, "--forever"], capture_output=True,
                            text=True, timeout=300)
+
+
+DRIVE_TRASH_EVERY = 1800
+
+
+def drive_trash_loop(stop: threading.Event):
+    """Every 30 min (and right after Start): empty Panda's own files from the Drive trash once they have
+    been there an hour. Old code and agents' `drive rm` put copies there, and the trash counts against the
+    15 GB quota: twice it filled the Drive (13 GB, then 12 GB of old work-file copies)."""
+    first = True
+    while not stop.wait(60 if first else DRIVE_TRASH_EVERY):
+        first = False
+        if not os.path.exists(DRIVE_CFG):
+            continue
+        with contextlib.suppress(Exception):
+            r = subprocess.run([sys.executable, DRIVE_TOOL, "emptytrash", "1"], capture_output=True, text=True,
+                               timeout=600)
+            out = (r.stdout or "").strip()
+            if r.returncode != 0 or not out.startswith("Emptied 0 "):
+                log("drive trash:", scrub(out + (r.stderr or ""))[-200:])
 
 
 def drive_put(path: str, folder: str = "outputs") -> dict | None:
@@ -3548,6 +3575,29 @@ GUARD_MIN_FREE = int(os.environ.get("PANDA_GUARD_MIN_FREE_MB", "2500")) << 20
 GUARD_NICE = 10
 GUARD_MARKED: dict = {}               # pid -> start time, so a recycled pid is marked again
 GUARD_LAST_KILL = [0.0]
+_LIBC = None
+
+
+def _ioprio_idle(tid: int = 0):
+    """Idle I/O class for a process or thread (0 = the calling thread): its disk reads and writes wait
+    until nobody else needs the disk. Never raises."""
+    global _LIBC
+    try:
+        import ctypes
+        _LIBC = _LIBC or ctypes.CDLL(None, use_errno=True)
+        _LIBC.syscall(251, 1, tid, 3 << 13)       # ioprio_set(IOPRIO_WHO_PROCESS, tid, IDLE class)
+    except Exception:
+        pass
+
+
+def _guard_idle(pid: int):
+    """SCHED_IDLE + idle I/O: the process runs only on CPU and disk time Panda itself is not using. With
+    plain nice 10, 48 headless browsers of one render still outweighed the gateway together (each nice-10
+    process keeps ~1/10 of a normal one's share), so new chats waited minutes for their first token."""
+    with contextlib.suppress(OSError, AttributeError):
+        if os.sched_getscheduler(pid) != os.SCHED_IDLE:
+            os.sched_setscheduler(pid, os.SCHED_IDLE, os.sched_param(0))
+    _ioprio_idle(pid)
 
 
 def _guard_procs() -> dict:
@@ -3660,6 +3710,7 @@ def guard_step(free_fn=guard_free, min_free: int = None) -> dict:
                 open(f"/proc/{q}/oom_score_adj", "w").write("1000")
                 if os.getpriority(os.PRIO_PROCESS, q) < GUARD_NICE:
                     os.setpriority(os.PRIO_PROCESS, q, GUARD_NICE)
+                _guard_idle(q)
                 GUARD_MARKED[q] = procs[q]["start"]
                 marked += 1
             except OSError:
@@ -3735,6 +3786,13 @@ def _proc_cpu_secs(pid: int) -> float:
         return 0.0
 
 
+def _proc_state(pid: int) -> str:
+    try:
+        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return ""
+
+
 def _uptime() -> float:
     try:
         return float(open("/proc/uptime").read().split()[0])
@@ -3806,6 +3864,8 @@ def hang_step(sb: "Supabase", gw, now: float = None, procs: dict = None, slot_fn
         cpu_pct = 100 * (cpu - h["cpu"][0][1]) / max(1.0, span)
         if cpu_pct >= HANG_MAX_CPU or now - h["alert_at"] < max(HANG_WINDOW, 1200):
             continue
+        if any(_proc_state(q) == "R" for q in g["pids"]):
+            continue      # wants CPU but isn't getting it (a busy machine, SCHED_IDLE): starved, not hung
         h["alert_at"] = now
         cmd = _guard_cmdline(root)
         tree = "\n".join(f"{q} {procs[q]['comm']} {_guard_cmdline(q)[:160]}" for q in sorted(g["pids"])[:12])
@@ -5481,6 +5541,7 @@ def main():
         threading.Thread(target=brief_loop, args=(gw, stop_evt), daemon=True).start()
         threading.Thread(target=guard_loop, args=(stop_evt,), daemon=True, name="guard").start()
         threading.Thread(target=hang_loop, args=(sb, gw, stop_evt), daemon=True, name="hang").start()
+        threading.Thread(target=drive_trash_loop, args=(stop_evt,), daemon=True, name="drive-trash").start()
         threading.Thread(target=remote_loop, args=(sb, stop_evt), daemon=True, name="remote").start()
         threading.Thread(target=thinking_pusher, args=(sb, stop_evt), daemon=True).start()
         pool = ThreadPoolExecutor(max_workers=MAX_PARALLEL_CHATS)
