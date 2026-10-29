@@ -218,7 +218,7 @@ function Shell({ userId, email }: { userId: string; email: string }) {
         <header className="topbar">
           <button className="icon-btn" onClick={() => setSideOpen((v) => !v)} aria-label="Sidebar"><IconSidebar /></button>
           <div className="topbar-title">{view === "chat" ? active?.title || "" : view === "developer" ? "Developer" : view === "video" ? "Video" : ""}</div>
-          {(browserLive || browserOpen) && browser && (
+          {(online || browserLive || browserOpen) && browser && (
             <button className={`icon-btn browser-btn ${browserBusy ? "busy" : ""} ${needsYou ? "needs" : ""}`}
               onClick={() => setBrowserOpen((v) => !v)} aria-label="Panda's browser" title="Panda's browser"><IconGlobe /></button>
           )}
