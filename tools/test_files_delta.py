@@ -50,6 +50,18 @@ def check(label):
     print(f"ok {label}: all {len(want)} files back")
 
 
+# ~/work/tmp is regenerable scratch (render frames, temp output) and must never be saved -- it used
+# to re-upload GBs on every backup. select_files skips it; work/studio (real work) is still saved.
+os.makedirs(f"{H}/work/tmp/render", exist_ok=True)
+open(f"{H}/work/tmp/render/frames.bin", "wb").write(b"scratch")
+os.makedirs(f"{H}/work/studio", exist_ok=True)
+open(f"{H}/work/studio/keep.bin", "wb").write(b"real")
+_arcs = {e.arc for e in W.select_files(H, ["work"])[0]}
+assert "work/studio/keep.bin" in _arcs, _arcs
+assert not any(a.startswith("work/tmp/") for a in _arcs), f"work/tmp not skipped: {sorted(_arcs)}"
+shutil.rmtree(f"{H}/work")                 # clean slate for the Storage round-trip below
+print("ok tmp-skip: ~/work/tmp excluded from the save set")
+
 try:
     # 1. a full copy that fits in Storage
     put("dev/repo/.git/HEAD", b"ref: refs/heads/main\n")

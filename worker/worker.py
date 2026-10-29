@@ -749,6 +749,11 @@ CODE_SKIP_DIRS = {"dist", "build", ".venv", "venv", ".next", ".pytest_cache", ".
 PANDA_SKIP_DIRS = {"browser", "stt-lib"}
 PANDA_SKIP_FILES = {"dev.env", "secrets.env", "drive.json", "browser.json", "dev-latest.json", "engine.pid",
                     "codex-installing", "browser-installing"}
+# Regenerable scratch under ~/work: render frames, temp outputs, download staging. Agents are told to
+# put throwaway work in ~/work/tmp; it is local-only (not saved, not restored), so it never bloats the
+# backup or slows a Start. Work that must survive a restart (the studio project, etc.) lives elsewhere
+# in ~/work and is still saved.
+WORK_SKIP_DIRS = {"tmp"}
 
 
 class Entry(NamedTuple):
@@ -763,6 +768,8 @@ def _dir_skipped(root: str, depth: int, name: str) -> bool:
     if name in ALWAYS_SKIP_DIRS:
         return True
     if root in CODE_ROOTS and name in CODE_SKIP_DIRS:
+        return True
+    if root == "work" and depth == 1 and name in WORK_SKIP_DIRS:
         return True
     return root == ".panda" and depth == 1 and name in PANDA_SKIP_DIRS
 
