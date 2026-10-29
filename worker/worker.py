@@ -1727,6 +1727,36 @@ THINK = {}          # slot -> accumulated thinking text of the running turn
 THINK_REPLY = {}    # slot -> assistant message id being streamed
 THINK_SENT = {}     # slot -> length already written to Supabase
 THINK_LOCK = threading.Lock()
+# Replies whose thinking their chat flusher writes itself (thinking_pusher leaves them alone), and a lock
+# so a thinking push still in flight can never land after a reply's final write.
+STREAM_ROWS: set = set()
+THINK_PUSH_LOCK = threading.Lock()
+THINK_PUSH_AT: dict = {}   # slot -> when thinking_pusher last wrote it
+# Streaming writes are the database's biggest load. On 29 Oct each live reply rewrote ~35 KB (30 KB of it
+# thinking) about 4 times a second, and `messages` keeps the whole old row in the WAL too (replica
+# identity full, for Realtime): 11-14 MB of WAL a minute for a 25 MB database. While a reply streams
+# only the newest thinking goes up (the final write has all of it), and big rows are written less often.
+# The app types text out from a ~2 s buffer (smoothText.ts), so slower writes do not show.
+THINK_LIVE_MAX = 4000      # characters of thinking sent while a reply streams
+STREAM_BPS = 12_000        # streaming writes per reply stay near this many bytes a second
+STREAM_GAP_MIN, STREAM_GAP_MAX = 0.4, 2.0
+THINK_PUSH_EVERY = 1.5     # seconds between thinking-only writes of one follow-up reply
+
+
+def live_thinking(th: str) -> str:
+    """The thinking shown while a reply streams: its newest THINK_LIVE_MAX characters."""
+    if len(th) <= THINK_LIVE_MAX:
+        return th
+    tail = th[-THINK_LIVE_MAX:]
+    cut = tail.find("\n")
+    if 0 <= cut < 400:  # start at a line break when one is near
+        tail = tail[cut + 1:]
+    return "…\n\n" + tail
+
+
+def stream_gap(nbytes: int) -> float:
+    """Seconds between two streaming writes of a row this big."""
+    return min(STREAM_GAP_MAX, max(STREAM_GAP_MIN, nbytes / STREAM_BPS))
 # slot -> live view of a follow-up turn (one Panda did not start: a helper/job wake). Crew streams those
 # only on its websocket, so the listener fills this: {"t0", "tools", "at", "text", "seg"}.
 LIVE = {}
@@ -1836,17 +1866,27 @@ def thinking_listener(gw: "Gateway", stop: threading.Event):
 
 
 def thinking_pusher(sb: "Supabase", stop: threading.Event):
-    """Write new thinking to the streaming reply every ~0.7 s (the chat stream is silent meanwhile)."""
+    """Write new thinking of a follow-up reply (no chat flusher runs for it): the newest part, at most
+    every THINK_PUSH_EVERY s. A chat turn's flusher writes its own (STREAM_ROWS), and a follow-up's
+    final write in followup_step carries all of it."""
     while not stop.is_set():
+        now = time.time()
         with THINK_LOCK:
             todo = [(slot, THINK_REPLY[slot], THINK.get(slot, "")) for slot in THINK_REPLY
-                    if len(THINK.get(slot, "")) != THINK_SENT.get(slot, 0)]
+                    if THINK_REPLY[slot] not in STREAM_ROWS
+                    and len(THINK.get(slot, "")) != THINK_SENT.get(slot, 0)
+                    and now - THINK_PUSH_AT.get(slot, 0) >= THINK_PUSH_EVERY]
         for slot, rid, text in todo:
-            try:
-                sb.rest("PATCH", "messages", params={"id": f"eq.{rid}"}, body={"thinking": scrub(text)})
-                THINK_SENT[slot] = len(text)
-            except Exception as exc:
-                log("thinking push:", type(exc).__name__)
+            with THINK_PUSH_LOCK:
+                with THINK_LOCK:  # finished meanwhile: never write after the reply's final write
+                    if THINK_REPLY.get(slot) != rid or rid in STREAM_ROWS:
+                        continue
+                try:
+                    sb.rest("PATCH", "messages", params={"id": f"eq.{rid}"},
+                            body={"thinking": live_thinking(scrub(text))})
+                    THINK_SENT[slot], THINK_PUSH_AT[slot] = len(text), time.time()
+                except Exception as exc:
+                    log("thinking push:", type(exc).__name__)
         stop.wait(0.7)
 
 
@@ -3259,6 +3299,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
         tl["typ"] = step_typical(step_kind(step))
     with THINK_LOCK:
         THINK[slot], THINK_REPLY[slot], THINK_SENT[slot] = "", reply["id"], 0
+        STREAM_ROWS.add(reply["id"])  # this turn's flusher writes its thinking, not thinking_pusher
     meta = lambda: {**base_meta, "replayed": needs_replay,
                     "tools": tools[-30:], "steps_at": tool_at[-30:], "n_steps": len(tools), "tl": dict(tl) if tl else None,
                     "usage": usage, "secs": round(time.time() - t0, 1)}
@@ -3276,8 +3317,11 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             if not (text or thinking or tools) or cancelled.is_set():
                 return
             state["dirty"], state["last"] = False, time.time()
-            row = sb.rest("PATCH", "messages", params={"id": f"eq.{reply['id']}"}, prefer="return=representation",
-                          body={"content": scrub(text), "thinking": scrub(thinking), "meta": meta()})
+            body = {"content": scrub(text), "thinking": live_thinking(scrub(thinking)), "meta": meta()}
+            state["gap"] = stream_gap(len(body["content"]) + len(body["thinking"]) + len(json.dumps(body["meta"])))
+            # Only the cancel flag comes back: the whole row was ~35 KB of egress on every push.
+            row = sb.rest("PATCH", "messages", params={"id": f"eq.{reply['id']}", "select": "cancel"},
+                          prefer="return=representation", body=body)
             if row and row[0].get("cancel") and not cancelled.is_set():  # "Stop generating" pressed in the app
                 cancelled.set()
                 try:
@@ -3348,7 +3392,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                 n = len(THINK.get(slot, ""))
             if n != seen_think:
                 seen_think, state["dirty"] = n, True
-            if state["dirty"] and time.time() - state["last"] >= 0.4:
+            if state["dirty"] and time.time() - state["last"] >= state.get("gap", STREAM_GAP_MIN):
                 try:
                     push_now()
                 except Exception as exc:
@@ -3407,7 +3451,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             elif kind == "assistant" and c.get("content"):
                 text = c["content"] if len(c["content"]) >= len(text) else text
             state["dirty"] = True
-            if time.time() - state["last"] > 0.4:
+            if time.time() - state["last"] > state.get("gap", STREAM_GAP_MIN):
                 push_now()
             if cancelled.is_set():
                 add_step("paused: Panda restarted" if RESTARTING.is_set() else "stopped by you")
@@ -3429,6 +3473,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
         with THINK_LOCK:
             thinking = THINK.get(slot, thinking)
             THINK_REPLY.pop(slot, None)
+            STREAM_ROWS.discard(reply["id"])
         res = turn_result(gw, slot, want_stats=not cmd)
         usage = context_usage(gw, slot, t0, usage)
         final = res["text"] or text
@@ -3486,6 +3531,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             pass
         with THINK_LOCK:
             THINK_REPLY.pop(slot, None)
+            STREAM_ROWS.discard(reply["id"])
         err = scrub(exc)[:500]
         sb.rest("PATCH", "messages", params={"id": f"eq.{reply['id']}"},
                 body={"content": scrub(text), "thinking": scrub(thinking), "status": "error",
@@ -3629,21 +3675,27 @@ def followup_step(sb: Supabase, gw: Gateway):
         else:
             published = publish_outputs(sb, chat, w["row"], w["before"] or {}, text)
             text = scrub(link_files(text, published))
-            sb.rest("PATCH", "messages", params={"id": f"eq.{w['row']}"}, body={
-                "content": text, "status": "done",
-                "meta": {"followup": True, **steps,
-                         "files": [r["id"] for _, r, inline in published if not inline]}})
+            done = {"content": text, "status": "done",
+                    "meta": {"followup": True, **steps,
+                             "files": [r["id"] for _, r, inline in published if not inline]}}
+            if live and live.get("thinking"):
+                done["thinking"] = scrub(live["thinking"])  # streaming sent only its newest part
+            sb.rest("PATCH", "messages", params={"id": f"eq.{w['row']}"}, body=done)
             push(sb, w["owner"], "Panda finished with the helpers", re.sub(r"[#*_`>\[\]]", "", text)[:180],
                  f"./?c={chat_id}")
         w["row"], w["before"], w["stopped"] = None, None, False
 
 
 def followup_unlive(w: dict) -> dict | None:
-    """Stop streaming a follow-up row: returns its live view (steps, text) or None."""
+    """Stop streaming a follow-up row: returns its live view (steps, text, full thinking) or None."""
     with THINK_LOCK:
         live = LIVE.pop(w["slot"], None)
         if THINK_REPLY.get(w["slot"]) == w.get("row"):
             THINK_REPLY.pop(w["slot"], None)
+            if live is not None:
+                live["thinking"] = THINK.get(w["slot"], "")
+    with THINK_PUSH_LOCK:  # a thinking push already on its way lands before the final write, not after
+        pass
     return live
 
 
