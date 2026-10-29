@@ -16,7 +16,7 @@ import sys
 import time
 import uuid
 
-BOX = os.path.expanduser("~/.panda/remote")
+BOX = os.environ.get("PANDA_REMOTE_BOX") or os.path.expanduser("~/.panda/remote")
 
 
 def main():
@@ -28,10 +28,20 @@ def main():
     ap.add_argument("--setup", default="")
     ap.add_argument("--cwd", default=os.getcwd())
     ap.add_argument("--cmd", required=True)
+    ap.add_argument("--agent", action="store_true")
+    ap.add_argument("--model", default="claude-sonnet-5.5")
+    ap.add_argument("--effort", default="medium")
     a = ap.parse_args()
     tid = f"{a.name}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     d = f"{BOX}/jobs/{tid}"
     os.makedirs(f"{BOX}/req", exist_ok=True)
+    agent = None
+    if a.agent:
+        res = os.path.expanduser(f"~/work/remote/{a.name}")
+        os.makedirs(res, exist_ok=True)
+        agent = {"prompt": a.cmd, "model": a.model, "effort": a.effort, "results": res}
+        a.out = list(a.out or a.files) + [res]
+        a.cwd = res
 
     def on_term(*_):
         os.makedirs(d, exist_ok=True)
@@ -44,6 +54,8 @@ def main():
     req = {"tid": tid, "cmd": a.cmd, "cwd": os.path.abspath(a.cwd), "setup": a.setup,
            "files": [os.path.abspath(os.path.expanduser(p)) for p in a.files],
            "out": [os.path.abspath(os.path.expanduser(p)) for p in a.out], "at": time.time()}
+    if agent:
+        req["agent"] = agent
     tmp = f"{BOX}/req/.{tid}.tmp"
     json.dump(req, open(tmp, "w"))
     os.rename(tmp, f"{BOX}/req/{tid}.json")

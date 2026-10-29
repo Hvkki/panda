@@ -773,11 +773,17 @@ html:has(.sheet-backdrop), html:has(.sheet-backdrop) body { overscroll-behavior-
 .set-panel { flex: 1; min-width: 0; }
 .set-panel h3 { font-size: 0.72em; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 22px 0 6px; font-weight: 600; }
 .set-panel h3:first-child { margin-top: 4px; }
+.remote-panel h4 { margin: 18px 0 2px; font-size: 13px; color: var(--muted); font-weight: 600; }
+.remote-panel .error { color: var(--danger); }
+.remote-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: middle; }
+.remote-dot.on { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent); }
 .set-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 11px 0; min-height: 58px; border-bottom: 1px solid var(--line); }
 .set-control { flex: none; }
 @media (max-width: 700px) {
-  .settings { flex-direction: column; gap: 10px; }
-  .set-tabs { flex-direction: row; overflow-x: auto; min-width: 0; position: sticky; top: -4px; z-index: 2; background: var(--panel); padding: 2px 0 8px; margin: 0 -4px; scrollbar-width: none; }
+  .settings { flex-direction: column; gap: 10px; min-width: 0; }
+  /* stretch, not flex-start: the row must be as wide as the sheet and scroll itself, or the whole
+     settings body scrolls sideways when a tab at the end is picked */
+  .set-tabs { flex-direction: row; overflow-x: auto; min-width: 0; max-width: 100%; align-self: stretch; position: sticky; top: -4px; z-index: 2; background: var(--panel); padding: 2px 0 8px; margin: 0 -4px; scrollbar-width: none; }
   .set-tabs::-webkit-scrollbar { display: none; }
   .set-tabs button { white-space: nowrap; flex: none; padding: 8px 12px; border: 1px solid var(--line); border-radius: 999px; min-height: 36px; }
   .set-tabs button.active { background: var(--ink); color: var(--bg); border-color: var(--ink); }

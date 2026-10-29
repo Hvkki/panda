@@ -69,6 +69,8 @@ pjob start stems --remote --files ~/work/mix/in.wav ~/work/mix/mix.py --out ~/wo
 - `--setup`: an install step, run once per remote start (pip, npm ci, apt).
 - Everything else works as for local jobs: the log, `--notify` and its Haiku note, `pjob stop`.
 - Use it when a command is heavy for minutes; quick commands stay local (sending files takes time).
+- `--remote --agent --model M --effort E --sh 'TASK'` runs a whole agent task there instead of a command
+  (uses credits); results come back in `~/work/remote/NAME/` with `REPORT.md`. See the `panda-remote` skill.
 
 ## brief: only the answer, not the output
 

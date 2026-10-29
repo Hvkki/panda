@@ -7,6 +7,8 @@
                                      Panda wakes this chat when it ends or looks stuck (no polling)
   pjob start NAME --remote [--files P ...] [--out P ...] [--setup 'CMD'] --notify -- COMMAND
                                      run it on remote Panda (its own 4 CPUs / ~30 GB), files sent and brought back
+  pjob start NAME --remote --agent [--model M] [--effort E] [--files P ...] --notify -- "TASK TEXT"
+                                     an agent does TASK on remote Panda; results come back in ~/work/remote/NAME
   pjob status [NAME]                 running / done (exit code) / lost, with run time and the last log lines
   pjob wait NAME [--max 300]         block until NAME ends or --max seconds pass (default 240), then status
   pjob wait-any A B C [--max 300]    block until the first of them ends
@@ -138,6 +140,8 @@ def cmd_start(a, rest):
     if not line.strip():
         sys.exit("pjob: give a command after -- or use --sh")
     shown = line
+    if a.agent and not a.remote:
+        sys.exit("pjob: --agent needs --remote (for a local helper agent use spawn_run)")
     if a.remote:
         home = os.path.expanduser("~")
         for p in a.files or []:
@@ -145,10 +149,16 @@ def cmd_start(a, rest):
             if not full.startswith(home + "/") or not os.path.exists(full):
                 sys.exit(f"pjob: --files {p}: not found under {home}")
         premote = os.path.join(os.path.dirname(os.path.abspath(__file__)), "premote.py")
+        extra = []
+        if a.agent:
+            # The task text is the "command"; the agent's results land in ~/work/remote/NAME, brought back
+            # with anything under --out (default: --files).
+            line = a.sh if a.sh else " ".join(rest)
+            extra = ["--agent", f"--model={a.model or 'claude-sonnet-5.5'}", f"--effort={a.effort or 'medium'}"]
         line = shlex.join([sys.executable, premote, "run", "--name", a.name, "--cwd", a.cwd or os.getcwd(),
                            "--files", *(a.files or []), "--out", *(a.out or []), f"--setup={a.setup or ''}",
-                           f"--cmd={line}"])
-        shown = f"remote: {shown}"
+                           *extra, f"--cmd={line}"])
+        shown = f"remote {'agent' if a.agent else ''}: {shown}".replace("remote :", "remote:")
     os.makedirs(d, exist_ok=True)
     for f in ("exit", "ended", "log", "notify", "notified", "watch.json"):
         try:
@@ -205,6 +215,10 @@ def main():
     s.add_argument("--files", nargs="+", help="with --remote: files/folders under ~ to send first")
     s.add_argument("--out", nargs="+", help="with --remote: folders/files to bring back (default: --files)")
     s.add_argument("--setup", help="with --remote: install step run once per remote start (pip/apt/npm)")
+    s.add_argument("--agent", action="store_true",
+                   help="with --remote: the text after -- is a TASK for an agent on remote Panda (spends credits)")
+    s.add_argument("--model", help="with --agent: model id (default claude-sonnet-5.5)")
+    s.add_argument("--effort", help="with --agent: low / medium / high / xhigh / max (default medium)")
     s = sub.add_parser("status"); s.add_argument("name", nargs="?"); s.add_argument("-n", type=int, default=12)
     s.add_argument("--json", action="store_true")
     s = sub.add_parser("wait"); s.add_argument("name"); s.add_argument("--max", type=float, default=240)

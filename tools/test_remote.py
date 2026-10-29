@@ -16,6 +16,8 @@ import time
 import requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Its own request box: the live worker on this machine watches ~/.panda/remote and must not take these.
+os.environ["PANDA_REMOTE_BOX"] = os.path.expanduser("~/work/rtest-box")
 sys.path.insert(0, os.path.join(HERE, "..", "worker"))
 import worker as W  # noqa: E402
 
@@ -132,6 +134,21 @@ try:
         assert st["exit"] == 0 and os.path.getsize(f"{big}/result.bin") == 60 << 20, (st, tail)
         print(f"ok: 120 MB there, 60 MB back in {time.time() - t3:.0f}s\n{tail}")
         shutil.rmtree(big, ignore_errors=True)
+    if "--agent" in sys.argv:
+        res = f"{HOME}/work/remote/rt-agent"
+        shutil.rmtree(res, ignore_errors=True)
+        t4 = time.time()
+        print(pjob("start", "rt-agent", "--remote", "--agent", "--model", "claude-haiku-5.5", "--effort", "low",
+                   "--files", SRC, "--sh",
+                   f"Read {SRC}/input.txt. Write the word it contains in UPPERCASE, alone, to {res}/upper.txt. "
+                   "Then write REPORT.md as told.").strip())
+        st = wait_end("rt-agent", 1500)
+        tail = "\n".join(open(st["log"]).read().splitlines()[-8:])
+        print(f"--- rt-agent after {time.time() - t4:.0f}s ---\n{tail}")
+        assert st["exit"] == 0, st
+        assert open(f"{res}/upper.txt").read().strip() == "SEVEN", "agent result not brought back"
+        assert os.path.exists(f"{res}/REPORT.md"), "no REPORT.md"
+        print("ok: remote agent did the task, result and REPORT.md came back")
     leftover = [n for n in os.listdir(f"{W.REMOTE_BOX}/req")] if os.path.isdir(f"{W.REMOTE_BOX}/req") else []
     assert not leftover, leftover
 finally:

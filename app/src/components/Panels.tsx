@@ -3,7 +3,8 @@ import { supabase, type Chat, type Notification } from "../lib/supabase";
 import { useSettings, type Settings } from "../lib/settings";
 import { useT } from "../lib/i18n";
 import { ALL_MODELS, EFFORTS } from "../lib/models";
-import { IconBell, IconCoins, IconCrew, IconGear, IconSliders, IconSparkle, IconUsers, IconX } from "./Icons";
+import { IconBell, IconCloud, IconCoins, IconCrew, IconGear, IconSliders, IconSparkle, IconUsers, IconX } from "./Icons";
+import { RemotePanel } from "./RemotePanel";
 import { disablePush, enablePush, pushState } from "../lib/push";
 import { gw } from "../lib/commands";
 import { CrewSettingsPanel } from "./CrewSettings";
@@ -32,12 +33,13 @@ function Modal({ title, onClose, children, wide }: { title: string; onClose: () 
 
 /* ── Settings ─────────────────────────────────────────────────────────────── */
 
-export type SettingsTab = "general" | "chat" | "crew" | "usage" | "notifications" | "memory" | "account";
+export type SettingsTab = "general" | "chat" | "crew" | "remote" | "usage" | "notifications" | "memory" | "account";
 type Tab = SettingsTab;
-const TAB_LABEL: Record<Tab, string> = { general: "General", chat: "Chat & tools", crew: "Kiro Crew", usage: "Credits",
-  notifications: "Notifications", memory: "Memory", account: "Account" };
+const TAB_LABEL: Record<Tab, string> = { general: "General", chat: "Chat & tools", crew: "Kiro Crew", remote: "Remote Panda",
+  usage: "Credits", notifications: "Notifications", memory: "Memory", account: "Account" };
 const TAB_ICON: Record<Tab, ReactNode> = { general: <IconGear size={16} />, chat: <IconSliders size={16} />, crew: <IconCrew size={16} />,
-  usage: <IconCoins size={16} />, notifications: <IconBell size={16} />, memory: <IconSparkle size={16} />, account: <IconUsers size={16} /> };
+  remote: <IconCloud size={16} />, usage: <IconCoins size={16} />, notifications: <IconBell size={16} />,
+  memory: <IconSparkle size={16} />, account: <IconUsers size={16} /> };
 
 function Row({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return (
@@ -129,6 +131,7 @@ export function SettingsModal({ email, userId, onClose, worker, online, initialT
         <div className="set-panel">
           {tab === "crew" && <CrewSettingsPanel online={online} />}
           {tab === "usage" && <UsagePanel userId={userId} worker={worker} online={online} />}
+          {tab === "remote" && <RemotePanel online={online} />}
           {tab === "general" && <>
             <h3>Appearance</h3>
             <Pick k="theme" label="Theme" options={[["system", "System"], ["light", "Light"], ["dark", "Dark"]]} />

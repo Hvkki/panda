@@ -21,6 +21,8 @@ import glob
 import hashlib
 import json
 import os
+import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -94,6 +96,57 @@ def get_json(*parts):
 
 def put_json(obj, *parts):
     sb.put(key(*parts), json.dumps(obj).encode(), mime="application/json")
+
+
+KIRO_LOCK = threading.Lock()
+KIRO_CLI = os.path.join(HOME, ".local", "bin", "kiro-cli")
+SAFE_ARG = re.compile(r"^[A-Za-z0-9._\-]{1,40}$")
+
+AGENT_BRIEF = """You are a helper agent running on remote Panda, a second Kaggle machine (4 CPUs, ~30 GB) of the
+user's Panda. The main Panda chat gave you the task below; nobody reads your messages live.
+- Files the main chat sent are at the same paths under ~ as on the main machine.
+- Put every result in {results} (and change files under the sent folders only if the task says so).
+  Only those come back to the main machine. Finish by writing {results}/REPORT.md: what you did, the
+  result, the paths of the files you made, and anything that failed. Keep it short.
+- There is no browser, no Kiro Crew tools and no user to ask here. If you cannot do something, say so in
+  REPORT.md instead of guessing.
+- Save credits: combine steps, keep command output short (tail, grep), and stop when the task is done.
+
+TASK:
+{prompt}
+"""
+
+
+def ensure_kiro(note) -> str:
+    """kiro-cli for agent tasks, installed once per remote start (~20-40 s)."""
+    with KIRO_LOCK:
+        if not os.path.exists(KIRO_CLI):
+            t1 = time.time()
+            note("installing kiro-cli for the agent")
+            rc = subprocess.call(["bash", "-c", "curl -fsSL https://cli.kiro.dev/install | bash"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+            if rc != 0 or not os.path.exists(KIRO_CLI):
+                raise RuntimeError(f"kiro-cli install failed (exit {rc})")
+            note(f"kiro-cli ready in {time.time() - t1:.0f}s")
+    return KIRO_CLI
+
+
+def agent_cmd(task: dict, d: str, note) -> tuple[str, dict]:
+    """The bash command and env that run an agent task headless with the account's Kiro API key."""
+    ag = task["agent"]
+    model, effort = ag.get("model") or "claude-sonnet-5.5", ag.get("effort") or "medium"
+    if not SAFE_ARG.match(model) or not SAFE_ARG.match(effort):
+        raise RuntimeError("bad model or effort name")
+    results = os.path.join(HOME, ag.get("results") or "work/remote/task")
+    os.makedirs(results, exist_ok=True)
+    pf = f"{d}/prompt.md"
+    open(pf, "w").write(AGENT_BRIEF.format(results=results, prompt=ag.get("prompt") or ""))
+    cli = ensure_kiro(note)
+    note(f"agent: {model} / {effort}, results in ~/{ag.get('results')}")
+    cmd = (f"{shlex.quote(cli)} chat --no-interactive --trust-all-tools --wrap never "
+           f"--model {model} --effort {effort} \"$(cat {shlex.quote(pf)})\"")
+    env = {"KIRO_API_KEY": W.CFG["kiro_api_key"], "NO_COLOR": "1"}
+    return cmd, env
 
 
 TASKS: dict = {}          # tid -> {"proc", "state", "thread"}
@@ -203,10 +256,13 @@ def run_task(tid: str):
                 raise RuntimeError(f"setup failed with exit {rc}")
             SETUP_DONE.add(h)
         started = time.time() - 1
+        cmd, extra_env = task["cmd"], {}
+        if task.get("agent"):
+            cmd, extra_env = agent_cmd(task, d, note)
         note(f"running on remote Panda ({os.cpu_count()} CPUs, {free_mb()} MB free)")
-        p = subprocess.Popen(["bash", "-c", task["cmd"]], cwd=cwd, stdin=subprocess.DEVNULL, stdout=logf,
+        p = subprocess.Popen(["bash", "-c", cmd], cwd=cwd, stdin=subprocess.DEVNULL, stdout=logf,
                              stderr=subprocess.STDOUT, start_new_session=True,
-                             env={**os.environ, "PYTHONUNBUFFERED": "1", "PANDA_REMOTE": RID})
+                             env={**os.environ, "PYTHONUNBUFFERED": "1", "PANDA_REMOTE": RID, **extra_env})
         x["proc"], x["state"], st["state"] = p, "running", "running"
         last = 0.0
         while p.poll() is None:
