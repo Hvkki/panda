@@ -126,9 +126,75 @@ async function remoteStart(admin: Admin, body: Row): Promise<Response> {
   return json({ kernel: `${kernel} v${out.versionNumber}` });
 }
 
+/** The watchdog: called every 5 min by pg_cron (migration_004_watchdog.sql) with x-watchdog-key. For every
+ * account whose newest run died (error, or no heartbeat for WD_STALE_SECS) without a Stop, it starts a new
+ * run, the same as pressing Start. This catches what the worker itself can't: Kaggle killing the machine,
+ * the worker process dying. A person's Stop is always respected. At most WD_MAX starts per account in
+ * WD_WINDOW_SECS; after that it gives up and leaves a notification, so a broken setup can't loop forever. */
+const WD_STALE_SECS = 5 * 60;
+const WD_GRACE_SECS = 3 * 60;   // after an error: the app's Start retry and the worker's own hand-off go first
+const WD_MAX = 3;
+const WD_WINDOW_SECS = 2 * 3600;
+
+async function watchdog(admin: Admin): Promise<Row> {
+  const since = new Date(Date.now() - 3 * 86400 * 1000).toISOString();
+  const { data: recentRows } = await admin.from("worker_sessions").select("owner").gte("started_at", since);
+  const owners: string[] = [...new Set<string>((recentRows ?? []).map((r: Row) => String(r.owner)))];
+  const done: Row[] = [];
+  for (const owner of owners) {
+    const { data } = await admin.from("worker_sessions").select("*").eq("owner", owner)
+      .order("started_at", { ascending: false }).limit(8);
+    const rows: Row[] = data ?? [];
+    const newest = rows[0];
+    if (!newest || rows.some(isAlive)) continue;
+    if (newest.stop_requested) continue;                                   // the person pressed Stop
+    const info = newest.info ?? {};
+    if (newest.status === "stopped" && !["handoff", "time guard"].includes(info.stop_reason)) continue;
+    const now = Date.now();
+    const beat = newest.heartbeat_at ? (now - Date.parse(newest.heartbeat_at)) / 1000 : Infinity;
+    const ended = newest.stopped_at ? (now - Date.parse(newest.stopped_at)) / 1000 : Infinity;
+    if (["running", "stopping", "requested", "starting"].includes(newest.status) && beat < WD_STALE_SECS) continue;
+    if (["error", "stopped"].includes(newest.status) && ended < WD_GRACE_SECS) continue;
+    const recentStarts = rows.filter((r) => r.info?.by === "watchdog" &&
+      (now - Date.parse(r.started_at)) / 1000 < WD_WINDOW_SECS).length;
+    if (recentStarts >= WD_MAX) {
+      if (!info.watchdog_gave_up) {
+        await admin.from("worker_sessions").update({ info: { ...info, watchdog_gave_up: true } }).eq("id", newest.id);
+        await admin.from("notifications").insert({ owner, source: "panda", text:
+          `Panda stopped and ${WD_MAX} automatic restarts in a row failed (last error: ${String(info.error ?? newest.status).slice(0, 160)}). Press Start, or ask the Developer chat.`,
+          meta: { kind: "watchdog", title: "Panda is off", ts: `watchdog-${now}` } });
+      }
+      done.push({ owner: owner.slice(0, 8), skipped: "gave up" });
+      continue;
+    }
+    // Mark the dead row so the app stops showing it as running.
+    if (["running", "stopping", "requested", "starting"].includes(newest.status)) {
+      await admin.from("worker_sessions").update({ status: "error", stopped_at: new Date().toISOString(),
+        info: { ...info, error: info.error ?? "no heartbeat (the Kaggle machine died)" } }).eq("id", newest.id);
+    }
+    const made = await launch(admin, owner, { by: "watchdog", after: newest.id });
+    if (made.ok) {
+      await admin.from("notifications").insert({ owner, source: "panda", text:
+        "Panda had stopped on its own (" + String(info.error ?? "no heartbeat").slice(0, 120) +
+        "). It is starting again by itself; an answer that was running may need to be sent again.",
+        meta: { kind: "watchdog", title: "Panda restarted itself", ts: `watchdog-${now}` } });
+    }
+    done.push({ owner: owner.slice(0, 8), restarted: made.ok, error: made.ok ? undefined : made.error });
+  }
+  return { checked: owners.length, done };
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   const admin = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+
+  // pg_cron's call: the key lives in panda_private (service role only), not in the code.
+  const wdKey = req.headers.get("x-watchdog-key");
+  if (wdKey) {
+    const { data: row } = await admin.from("panda_private").select("value").eq("key", "watchdog_key").maybeSingle();
+    if (!row?.value || row.value.length < 32 || row.value !== wdKey) return json({ error: "bad watchdog key" }, 401);
+    return json(await watchdog(admin));
+  }
 
   const jwt = (req.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "");
   const { data: who } = await admin.auth.getUser(jwt);
