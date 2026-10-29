@@ -5073,6 +5073,67 @@ def request_successor(sb: Supabase, sid: str) -> dict:
     return body["session"]
 
 
+def owner_alert(sb: Supabase, title: str, text: str, kind: str):
+    """Bell + push to the owner. Never raises."""
+    log(f"{kind}:", text)
+    with contextlib.suppress(Exception):
+        sb.rest("POST", "notifications", body={"owner": OWNER, "source": "panda", "text": text,
+                                               "meta": {"kind": kind, "title": title, "ts": f"{kind}-{int(time.time())}"}})
+        push(sb, OWNER, title, text, "./?panel=notifications")
+
+
+RUNNING = [False]          # set once the run reached its main loop (a crash before that is a failed Start)
+LOOP_ERR_MAX_SECS = int(CFG.get("loop_err_max_secs", 15 * 60))   # main loop: this long with only errors = broken
+CRASH_SNAPSHOT_SECS = int(CFG.get("crash_snapshot_secs", 240))
+
+
+def crash_handoff(sb: Supabase, sid: str, gw_proc, set_sess):
+    """The run hit an error it can't recover from in place. Before it ends: save what can be saved, stop the
+    gateway (two gateways must never run one account), and ask the session function for a fresh notebook,
+    the same hand-off the 11-hour restart uses. So a crash costs a few minutes, not the run. The session
+    function refuses for a run younger than 30 min or after 3 failed successors, which stops restart loops.
+    Never raises. Returns the gateway process (None once stopped)."""
+    if not AUTO_RESTART:
+        return gw_proc
+    t0 = time.time()
+    snap_at = None
+    try:
+        with beating(sb, sid):
+            box = {}
+            th = threading.Thread(target=lambda: box.update(at=snapshot(sb, "crash", files_budget=CRASH_SNAPSHOT_SECS / 2)),
+                                  daemon=True)
+            th.start()
+            th.join(CRASH_SNAPSHOT_SECS)
+            snap_at = box.get("at")
+            log("crash: snapshot", "saved" if snap_at else "not finished", f"in {round(time.time() - t0)} s")
+    except Exception as exc:
+        log("crash: snapshot failed:", scrub(exc)[:200])
+    if gw_proc and gw_proc.poll() is None:
+        with contextlib.suppress(Exception):
+            sh("kirocrew stop", timeout=60)
+        with contextlib.suppress(Exception):
+            gw_proc.wait(timeout=30)
+        with contextlib.suppress(Exception):
+            gw_proc.kill()
+        gw_proc = None
+    if snap_at:
+        with contextlib.suppress(Exception):
+            set_sess(last_snapshot=snap_at)
+    try:
+        nxt = request_successor(sb, sid)
+        SESSION_INFO["handoff"] = {"to": nxt["id"], "at": now_iso(), "mode": "after-crash"}
+        log(f"crash: successor {nxt['id']} requested")
+        owner_alert(sb, "Panda restarted itself",
+                    f"Panda hit an error ({SESSION_INFO.get('error', '')[:120]}) and is starting a fresh notebook. "
+                    "It will be back in a few minutes; an answer that was running may need to be sent again.", "crash")
+    except Exception as exc:
+        SESSION_INFO["handoff_error"] = scrub(exc)[:300]
+        owner_alert(sb, "Panda stopped",
+                    f"Panda hit an error ({SESSION_INFO.get('error', '')[:120]}) and could not restart itself "
+                    f"({scrub(exc)[:120]}). Press Start.", "crash")
+    return gw_proc
+
+
 def handoff_step(sb: Supabase, sid: str, ho: dict, set_sess, at_heartbeat: bool) -> str | None:
     """One look at the hand-off, from the main loop. Returns "handoff" when this run should now drain and stop."""
     if not AUTO_RESTART:
@@ -5244,24 +5305,39 @@ def main():
         last_hb = last_nt = 0.0
         last_snap = time.time()
         reason = "stop requested"
+        loop_err_since = None
+        RUNNING[0] = True
         while True:
             if gw_proc.poll() is not None:
                 # Kiro Crew's gateway died (crash, out of memory...). That used to end the whole run, so the
-                # notebook stopped until someone pressed Start. Restart it in place instead; give up only
-                # if it keeps dying (5 restarts within an hour), which means something is really broken.
+                # notebook stopped until someone pressed Start. Restart it in place instead. If it keeps
+                # dying (5 restarts within an hour) restart_gateway raises, and the crash handler below hands
+                # over to a fresh notebook instead of stopping.
                 gw_proc = restart_gateway(gw, gw_proc, with_beat=lambda: beating(sb, sid))
-                set_sess(heartbeat_at=now_iso(), info=SESSION_INFO)
-            if time.time() - last_hb > HEARTBEAT_SECS:
-                row = sb.rest("GET", "worker_sessions",
-                              params={"id": f"eq.{sid}", "select": "stop_requested"})[0]
-                if row["stop_requested"]:
-                    break
-                set_sess(heartbeat_at=now_iso())
-                last_hb = time.time()
-                beat = True
-            else:
-                beat = False
-            if handoff_step(sb, sid, ho, set_sess, beat) == "handoff":
+                _safe(lambda: set_sess(heartbeat_at=now_iso(), info=SESSION_INFO))
+            # A network blip talking to Supabase must never end the run: it used to raise straight out of
+            # this loop. Errors are retried; only ~15 minutes of nothing but errors counts as broken.
+            try:
+                if time.time() - last_hb > HEARTBEAT_SECS:
+                    row = sb.rest("GET", "worker_sessions",
+                                  params={"id": f"eq.{sid}", "select": "stop_requested"})[0]
+                    if row["stop_requested"]:
+                        break
+                    set_sess(heartbeat_at=now_iso())
+                    last_hb = time.time()
+                    beat = True
+                else:
+                    beat = False
+                step = handoff_step(sb, sid, ho, set_sess, beat)
+                loop_err_since = None
+            except Exception as exc:
+                loop_err_since = loop_err_since or time.time()
+                log("main loop: Supabase call failed, retrying:", scrub(exc)[:200])
+                if time.time() - loop_err_since > LOOP_ERR_MAX_SECS:
+                    raise
+                time.sleep(10)
+                continue
+            if step == "handoff":
                 reason = "handoff"
                 break
             if time.time() - T0 > MAX_RUNTIME:
@@ -5339,8 +5415,10 @@ def main():
     except Exception as exc:
         log("FATAL:", exc)
         log(traceback.format_exc()[-1500:])
+        SESSION_INFO["error"] = scrub(exc)[:500]
+        if RUNNING[0]:
+            gw_proc = crash_handoff(sb, sid, gw_proc, set_sess)
         try:
-            SESSION_INFO["error"] = scrub(exc)[:500]
             set_sess(status="error", stopped_at=now_iso(), info=SESSION_INFO)
         except Exception:
             pass
