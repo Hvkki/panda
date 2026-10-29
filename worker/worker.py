@@ -3917,7 +3917,13 @@ def _uptime() -> float:
 
 
 def _proc_slot(pid: int) -> str:
-    """The chat slot of an agent command, from its KIRO_SESSION_ID (the same lookup pjob does)."""
+    """The chat slot of an agent command: its chat's kiro-cli launcher, else its KIRO_SESSION_ID."""
+    try:
+        slot = _jobs().slot_of_pid(pid)
+        if slot:
+            return slot
+    except Exception:
+        pass
     try:
         env = open(f"/proc/{pid}/environ", "rb").read().split(b"\0")
     except OSError:

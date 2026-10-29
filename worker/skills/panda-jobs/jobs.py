@@ -115,11 +115,47 @@ def show(s: dict, n: int = 12):
 
 
 SESSION_MAP = os.path.expanduser("~/.kiro/crew/session_map.json")
+CREW_DIR = os.path.expanduser("~/.kiro/crew")
+
+
+def _stat(pid: int) -> list:
+    """Fields of /proc/PID/stat after the command name: [0] state, [1] ppid, [19] start time."""
+    try:
+        return open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return []
+
+
+def slot_of_pid(pid: int) -> str:
+    """The chat slot a process belongs to, found by walking up to the chat's kiro-cli launcher.
+
+    Kiro Crew writes ~/.kiro/crew/session_pid_<launcher pid>.txt = '<slot key>\\n<start time>' for each
+    chat's session (helpers get none). The start time guards against a reused pid or a file restored
+    from an older run. This does not depend on KIRO_SESSION_ID, which can go stale in session_map.json.
+    """
+    for _ in range(64):
+        f = _stat(pid)
+        if not f:
+            return ""
+        try:
+            key, start = (open(os.path.join(CREW_DIR, f"session_pid_{pid}.txt")).read().split("\n") + [""])[:2]
+        except OSError:
+            key = start = ""
+        if key.strip() and start.strip() == f[19]:
+            key = key.strip()
+            return key.split(":", 1)[1] if ":" in key else key
+        pid = int(f[1])
+        if pid <= 1:
+            return ""
+    return ""
 
 
 def my_slot() -> str:
-    """The Kiro Crew chat slot this shell belongs to (session_map: 'dashboard:<slot>' -> {sid})."""
-    sid = os.environ.get("KIRO_SESSION_ID", "")
+    """The Kiro Crew chat slot this shell belongs to ('' in a helper run or outside any chat)."""
+    slot = slot_of_pid(os.getpid())
+    if slot:
+        return slot
+    sid = os.environ.get("KIRO_SESSION_ID", "")  # fallback: session_map 'dashboard:<slot>' -> {sid}
     if not sid:
         return ""
     try:
