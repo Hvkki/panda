@@ -144,8 +144,16 @@ class Supabase:
         self._login()
 
     def _auth(self, grant: str, body: dict):
-        r = requests.post(f"{SB_URL}/auth/v1/token?grant_type={grant}", json=body,
-                          headers={"apikey": SB_ANON}, timeout=30)
+        for i in range(5):
+            try:
+                r = requests.post(f"{SB_URL}/auth/v1/token?grant_type={grant}", json=body,
+                                  headers={"apikey": SB_ANON}, timeout=(10, 45))
+                if r.status_code < 500 and r.status_code != 429:
+                    break
+            except requests.RequestException:
+                if i == 4:
+                    raise
+            time.sleep(3 * (i + 1))
         r.raise_for_status()
         d = r.json()
         self.token, self.refresh = d["access_token"], d["refresh_token"]
@@ -168,9 +176,29 @@ class Supabase:
         return h
 
     def rest(self, method: str, path: str, *, params=None, body=None, prefer: str = ""):
-        h = self.headers({"Prefer": prefer} if prefer else None)
-        r = requests.request(method, f"{SB_URL}/rest/v1/{path}", params=params, json=body,
-                             headers=h, timeout=30)
+        """One PostgREST call. Supabase sometimes stalls or answers busy for a while; one such moment
+        used to end a 5-hour run ("Read timed out"). Reads and updates are retried for ~2 minutes;
+        an insert (POST) only when the request surely did not arrive (connect error, 429, 503)."""
+        safe = method != "POST"
+        r = None
+        for i in range(7):
+            h = self.headers({"Prefer": prefer} if prefer else None)
+            try:
+                r = requests.request(method, f"{SB_URL}/rest/v1/{path}", params=params, json=body,
+                                     headers=h, timeout=(10, 45))
+            except requests.ConnectionError as exc:
+                if i == 6 or (not safe and isinstance(exc, requests.exceptions.ReadTimeout)):
+                    raise
+                r = None
+            except requests.Timeout:
+                if i == 6 or not safe:
+                    raise
+                r = None
+            if r is not None and not (r.status_code in (429, 503) or (safe and r.status_code in (500, 502, 504, 520, 522, 524))):
+                break
+            if i == 6:
+                break
+            time.sleep(min(30, 2 * 2 ** i))
         if r.status_code >= 400:
             raise RuntimeError(f"supabase {method} {path}: {r.status_code} {r.text[:300]}")
         return r.json() if r.text else None
