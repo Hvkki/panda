@@ -43,6 +43,23 @@ assert _free_fullbox >> 20 < 2500, f"full box should read low, got {_free_fullbo
 assert W._guard_free_from(_meminfo, "max\n", _mem_cur, _stat_full) >> 20 == 22 * 1024
 print(f"ok guard_free: active+inactive cache counts as free ({_free_new >> 20} MB vs inactive-only {_free_old >> 20} MB)")
 
+# --- OOM-protection pass: raise large NON-core procs to 1000 so the kernel never kills the gateway.
+# The container cannot lower the gateway's own score, so protection is relative. The old group-only
+# marking missed a detached/re-parented hog (not a pjob, not a kiro-cli-chat child) -- this closes it.
+_procs = {
+    1:    {"comm": "python3", "rss": 500 << 20, "start": 1},        # worker -> skip (pid 1)
+    406:  {"comm": "kirocrew", "rss": 500 << 20, "start": 2},       # gateway -> skip (cmdline)
+    900:  {"comm": "kiro-cli-chat", "rss": 300 << 20, "start": 3},  # chat/agent runner -> skip (comm)
+    901:  {"comm": "python3", "rss": 300 << 20, "start": 4},        # MCP server -> skip (cmdline)
+    1234: {"comm": "python3", "rss": 800 << 20, "start": 5},        # DETACHED HOG -> target
+    1235: {"comm": "node", "rss": 10 << 20, "start": 6},            # too small -> skip
+}
+_cmd = {406: "kirocrew gateway --no-open --no-tunnel", 901: "python3 -m kirocrew mcp-core"}
+_targets = W._guard_protect_targets(_procs, 64 << 20, cmd_fn=lambda q: _cmd.get(q, ""))
+assert _targets == [1234], f"OOM-protect targets wrong: {_targets}"
+assert W._guard_disk_free("/") > 0, "disk free read failed"
+print("ok oom-protect: only the large non-core hog is raised; gateway/mcp/chat/worker skipped")
+
 tmp = tempfile.mkdtemp()
 W.JOBS_DIR, W.GUARD_LOG = f"{tmp}/jobs", f"{tmp}/guard.log"
 d = f"{W.JOBS_DIR}/hog"
@@ -83,3 +100,21 @@ print("ok kill:", open(W.GUARD_LOG).read().strip()[:160])
 r = W.guard_step(free_fn=lambda: 100 << 20)
 assert r["killed"] is None, "cooldown ignored"
 print("ok cooldown")
+
+# Disk arm: memory is healthy, but low free disk on WORK must also stop the biggest group.
+W.GUARD_LAST_KILL[0] = 0
+p2 = subprocess.Popen(["bash", "-c", "python3 -c 'b=bytearray(200<<20); import time; time.sleep(60)' & wait"],
+                      start_new_session=True)
+d2 = f"{W.JOBS_DIR}/hog2"
+os.makedirs(d2)
+open(f"{d2}/pid", "w").write(str(p2.pid))
+open(f"{d2}/log", "w").write("working\n")
+time.sleep(1.5)
+W.guard_groups = lambda procs: [g for g in _real_groups(procs) if g["job"] == "hog2"]
+r = W.guard_step(free_fn=lambda: 1 << 40, disk_fn=lambda: 100 << 20, min_disk=1 << 30)
+assert r["killed"] and r["killed"]["job"] == "hog2", r["killed"]
+time.sleep(0.5)
+p2.poll()
+assert p2.returncode is not None, "disk arm did not stop the job"
+assert "disk low" in open(W.GUARD_LOG).read(), open(W.GUARD_LOG).read()[-200:]
+print("ok disk-arm:", open(W.GUARD_LOG).read().strip().splitlines()[-1][:120])

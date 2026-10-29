@@ -3693,10 +3693,17 @@ def job_watch_loop(sb: "Supabase", gw: "Gateway", stop: threading.Event):
 # The container can't make cgroups or lower anyone's OOM score, but it can RAISE them and nice processes.
 # So every command an agent runs (shell tools under kiro-cli-chat, pjob jobs) is marked expendable:
 # oom_score_adj 1000 (the kernel kills it first, never the gateway) and nice 10 (Panda's own processes
-# keep the CPU). If free memory still falls under GUARD_MIN_FREE, the guard kills the biggest
-# expendable command itself, before the kernel has to choose, and writes why to GUARD_LOG.
+# keep the CPU). We cannot LOWER the gateway's own score below 0 in this container, so protection is
+# relative: EVERY large process that is not core Panda (pid 1 worker, the gateway, MCP servers, chat
+# and agent runners) is raised to 1000 -- including a detached or re-parented hog that is neither a
+# pjob nor a child of kiro-cli-chat, which the old group-only marking missed. If free memory falls
+# under GUARD_MIN_FREE, or free disk on the work volume under GUARD_MIN_DISK, the guard stops the
+# biggest expendable command itself, before the kernel (or an ENOSPC) has to, and logs why to GUARD_LOG.
 GUARD_LOG = os.path.expanduser("~/work/panda-guard.log")
 GUARD_MIN_FREE = int(os.environ.get("PANDA_GUARD_MIN_FREE_MB", "2500")) << 20
+GUARD_MIN_DISK = int(os.environ.get("PANDA_GUARD_MIN_DISK_MB", "1024")) << 20      # ENOSPC guard on WORK
+GUARD_PROTECT_RSS = int(os.environ.get("PANDA_GUARD_PROTECT_RSS_MB", "64")) << 20  # raise big non-core to 1000
+GUARD_OOM_MARKED: dict = {}   # pid -> start time, for the ancestry-agnostic OOM-ordering pass
 GUARD_NICE = 10
 GUARD_MARKED: dict = {}               # pid -> start time, so a recycled pid is marked again
 GUARD_LAST_KILL = [0.0]
@@ -3840,7 +3847,37 @@ def _guard_note(text: str):
         pass
 
 
-def guard_step(free_fn=guard_free, min_free: int = None) -> dict:
+def _guard_disk_free(path: str = None) -> int:
+    """Free bytes on the work volume (where snapshots and archives are written). The guard watches
+    this so a render filling the disk can't ENOSPC Panda's own saves while memory still looks fine."""
+    try:
+        s = os.statvfs(path or WORK)
+        return s.f_bavail * s.f_frsize
+    except OSError:
+        return 1 << 62
+
+
+def _guard_protect_targets(procs: dict, rss_min: int, cmd_fn=None) -> list:
+    """Pids of large processes that are NOT core Panda, whose OOM score should be raised to 1000.
+    Core = pid 1 (worker), the gateway, MCP servers, and kiro-cli-chat chat/agent runners. Everything
+    else above rss_min (a detached hog, a render grandchild, anything) must be killable before the
+    gateway, whose own score we cannot lower in this container."""
+    cmd_fn = cmd_fn or _guard_cmdline
+    out = []
+    for pid, p in procs.items():
+        if pid == 1 or p["rss"] < rss_min:
+            continue
+        if p["comm"].startswith("kiro-cli-chat"):
+            continue
+        cmd = cmd_fn(pid)
+        if "kirocrew gateway" in cmd or " mcp-" in cmd:
+            continue
+        out.append(pid)
+    return out
+
+
+def guard_step(free_fn=guard_free, min_free: int = None, disk_fn=_guard_disk_free,
+               min_disk: int = None) -> dict:
     procs = _guard_procs()
     groups = guard_groups(procs)
     marked = 0
@@ -3859,13 +3896,30 @@ def guard_step(free_fn=guard_free, min_free: int = None) -> dict:
                 pass
     for q in [q for q in GUARD_MARKED if q not in procs]:
         GUARD_MARKED.pop(q, None)
+    # Ancestry-agnostic OOM ordering: raise any large non-core process to 1000 so the kernel's OOM
+    # killer never picks the gateway. Raise-only (the container forbids lowering a score), idempotent.
+    for q in _guard_protect_targets(procs, GUARD_PROTECT_RSS):
+        if GUARD_OOM_MARKED.get(q) == procs[q]["start"]:
+            continue
+        try:
+            if int(_guard_readfile(f"/proc/{q}/oom_score_adj") or "0") < 1000:
+                open(f"/proc/{q}/oom_score_adj", "w").write("1000")
+            GUARD_OOM_MARKED[q] = procs[q]["start"]
+        except (OSError, ValueError):
+            pass
+    for q in [q for q in GUARD_OOM_MARKED if q not in procs]:
+        GUARD_OOM_MARKED.pop(q, None)
     free = free_fn()
+    disk = disk_fn()
     floor = GUARD_MIN_FREE if min_free is None else min_free
+    dfloor = GUARD_MIN_DISK if min_disk is None else min_disk
+    low_mem, low_disk = free < floor, disk < dfloor
     killed = None
-    if free < floor and groups and time.time() - GUARD_LAST_KILL[0] > 10:
+    if (low_mem or low_disk) and groups and time.time() - GUARD_LAST_KILL[0] > 10:
         g = max(groups, key=lambda x: x["rss"])
         what = f"pjob {g['job']}" if g["job"] else _guard_cmdline(g["root"])[:160]
-        msg = (f"memory low ({free >> 20} MB free): stopped {what} (pid {g['root']}, "
+        reason = f"memory low ({free >> 20} MB free)" if low_mem else f"disk low ({disk >> 20} MB free)"
+        msg = (f"{reason}: stopped {what} (pid {g['root']}, "
                f"{g['rss'] >> 20} MB in {len(g['pids'])} processes) so Panda keeps running")
         _guard_note(msg)
         if g["job"]:
@@ -3885,7 +3939,7 @@ def guard_step(free_fn=guard_free, min_free: int = None) -> dict:
                 time.sleep(3)
         GUARD_LAST_KILL[0] = time.time()
         killed = g
-    return {"groups": len(groups), "marked": marked, "free": free, "killed": killed}
+    return {"groups": len(groups), "marked": marked, "free": free, "disk": disk, "killed": killed}
 
 
 def _guard_procs_alive(pid: int, start: int) -> bool:
