@@ -3475,6 +3475,8 @@ def steer_pending(sb: Supabase, gw: Gateway):
         try:
             res = gw.call("POST", "/api/chat", {"message": r["content"], "slot": info["slot"], "steer": True}, timeout=30)
             meta["steered"] = "steered" if res.get("steered") else "queued"
+            if not res.get("steered"):
+                meta["steer_slot"], meta["steer_qid"] = info["slot"], res.get("queue_id") or ""
             sb.rest("PATCH", "messages", params={"id": f"eq.{r['id']}"}, body={"status": "done", "meta": meta})
             log(f"chat {r['chat_id']}: message {r['id']} {meta['steered']} into the running turn")
         except Exception as exc:
@@ -4520,6 +4522,52 @@ def claim_loop(sb: Supabase, gw: Gateway, pool: ThreadPoolExecutor, stop: thread
             return
 
 
+def stopped(sb: Supabase, chat_id: str) -> bool:
+    """True when the chat's last answer was stopped (Stop pressed, or a restart paused it)."""
+    with contextlib.suppress(Exception):
+        r = sb.rest("GET", "messages", params={"chat_id": f"eq.{chat_id}", "role": "eq.assistant", "order": "id.desc",
+                                               "limit": "1", "select": "cancel"})
+        return bool(r and r[0].get("cancel"))
+    return False
+
+
+def settle_steers(sb: Supabase, gw: Gateway, chat_id: str):
+    """After a turn ends: a message Crew queued "for next" during it is answered nobody-knows-where
+    (the turn's stream has ended, and Stop leaves it stuck). Take it back from Crew's queue and run
+    it as a normal turn, so it is always answered in the chat. "Panda answers this next" had stayed
+    on screen forever in the Developer chat."""
+    try:
+        rows = sb.rest("GET", "messages", params={"chat_id": f"eq.{chat_id}", "role": "eq.user", "status": "eq.done",
+                                                  "meta->>steered": "eq.queued", "order": "id.asc", "limit": "10",
+                                                  "select": "id,meta"}) or []
+    except Exception as exc:
+        log("steer check:", type(exc).__name__)
+        return
+    for r in rows:
+        meta = dict(r.get("meta") or {})
+        slot, qid = meta.get("steer_slot"), meta.get("steer_qid")
+        if slot and qid:
+            try:
+                gw.call("DELETE", f"/api/chat/slots/{slot}/queue/{qid}")
+            except GatewayError as exc:
+                if getattr(exc, "status", 0) == 404:  # Crew already ran it in a turn of its own
+                    meta["steered"] = "crew"
+                    with contextlib.suppress(Exception):
+                        sb.rest("PATCH", "messages", params={"id": f"eq.{r['id']}"}, body={"meta": meta})
+                    continue
+            except Exception:
+                pass
+        elif not stopped(sb, chat_id):
+            continue  # no queue id to take back: Crew answers it; a second answer would be a duplicate
+        for k in ("steer", "steer_slot", "steer_qid"):
+            meta.pop(k, None)
+        meta["steered"] = "requeued"
+        with contextlib.suppress(Exception):
+            sb.rest("PATCH", "messages", params={"id": f"eq.{r['id']}", "status": "eq.done"},
+                    body={"status": "pending", "meta": meta})
+        log(f"chat {chat_id}: queued message {r['id']} runs as its own turn")
+
+
 def run_message(sb: Supabase, gw: Gateway, msg: dict):
     dev = False
     try:
@@ -4539,6 +4587,7 @@ def run_message(sb: Supabase, gw: Gateway, msg: dict):
             dev_end()
         with BUSY_LOCK:
             BUSY_CHATS.discard(msg["chat_id"])
+        settle_steers(sb, gw, msg["chat_id"])
 
 
 # ── Kiro Crew settings the app may change ────────────────────────────────────
