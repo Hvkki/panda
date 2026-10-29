@@ -3783,28 +3783,45 @@ def guard_groups(procs: dict) -> list:
     return groups
 
 
-def guard_free() -> int:
-    """Bytes the container can still use: the smaller of the host's MemAvailable and the cgroup limit
-    minus what is in use (inactive page cache counts as free, the kernel drops it first)."""
-    free = 1 << 62
+def _guard_readfile(path: str) -> str:
     try:
-        for line in open("/proc/meminfo"):
-            if line.startswith("MemAvailable:"):
-                free = int(line.split()[1]) << 10
+        return open(path).read()
     except OSError:
-        pass
-    try:
-        lim = open("/sys/fs/cgroup/memory.max").read().strip()
-        if lim != "max":
-            cur = int(open("/sys/fs/cgroup/memory.current").read())
-            inactive = 0
-            for line in open("/sys/fs/cgroup/memory.stat"):
-                if line.startswith("inactive_file "):
-                    inactive = int(line.split()[1])
-            free = min(free, int(lim) - cur + inactive)
-    except (OSError, ValueError):
-        pass
+        return ""
+
+
+def _guard_free_from(meminfo: str, mem_max: str, mem_current: str, mem_stat: str) -> int:
+    """Bytes still usable: min(host MemAvailable, cgroup limit - usage + reclaimable file cache).
+    Clean page cache (inactive_file + active_file) is reclaimed by the kernel before it OOM-kills,
+    so it counts as free. Counting only inactive_file (the old bug) made a box with GBs of ACTIVE
+    cache look nearly full, and the guard then stopped every job including tiny ones."""
+    free = 1 << 62
+    for line in meminfo.splitlines():
+        if line.startswith("MemAvailable:"):
+            try:
+                free = int(line.split()[1]) << 10
+            except (ValueError, IndexError):
+                pass
+    mem_max = (mem_max or "").strip()
+    if mem_max and mem_max != "max":
+        try:
+            lim, cur = int(mem_max), int(mem_current)
+            reclaimable = 0
+            for line in mem_stat.splitlines():
+                k = line.split()
+                if len(k) >= 2 and k[0] in ("inactive_file", "active_file"):
+                    reclaimable += int(k[1])
+            free = min(free, lim - cur + reclaimable)
+        except (ValueError, IndexError):
+            pass
     return free
+
+
+def guard_free() -> int:
+    """Bytes the container can still use (see _guard_free_from for the accounting)."""
+    return _guard_free_from(
+        _guard_readfile("/proc/meminfo"), _guard_readfile("/sys/fs/cgroup/memory.max"),
+        _guard_readfile("/sys/fs/cgroup/memory.current"), _guard_readfile("/sys/fs/cgroup/memory.stat"))
 
 
 def _guard_note(text: str):

@@ -21,6 +21,28 @@ if "--list" in sys.argv:
     print("free MB", W.guard_free() >> 20)
     sys.exit(0)
 
+# --- guard_free reclaimable-cache unit test (pure, no processes) --------------------------------
+# Bug 2026-10-29: on a box with 16.6 GB of file cache (mostly ACTIVE), the guard counted the cache
+# as used, saw ~1.3 GB free, and killed every job. Clean page cache (inactive_file + active_file)
+# is reclaimed before OOM and must read as free.
+_g, _kb = 1 << 30, 1 << 10
+_meminfo = f"MemTotal: {32 * _g // _kb} kB\nMemAvailable: {22 * _g // _kb} kB\n"
+_mem_max, _mem_cur = f"{32 * _g}\n", f"{int(30.9 * _g)}\n"
+_stat_full = (f"anon {9 * _g}\nfile {int(16.6 * _g)}\n"
+              f"inactive_file {int(1.3 * _g)}\nactive_file {int(15.3 * _g)}\n")
+_free_new = W._guard_free_from(_meminfo, _mem_max, _mem_cur, _stat_full)
+assert _free_new >> 20 > 10000, f"active_file not counted as free: {_free_new >> 20} MB"
+# Old behaviour (inactive_file only) would have tripped the 2500 MB floor -- that was the bug.
+_free_old = W._guard_free_from(_meminfo, _mem_max, _mem_cur, f"anon {9 * _g}\ninactive_file {int(1.3 * _g)}\n")
+assert _free_old >> 20 < 2500, f"expected inactive-only logic to look low, got {_free_old >> 20} MB"
+# A genuinely full box (no reclaimable cache, low MemAvailable) must still read as low.
+_free_fullbox = W._guard_free_from(f"MemAvailable: {int(0.4 * _g) // _kb} kB\n", _mem_max,
+                                   f"{int(31.6 * _g)}\n", f"anon {32 * _g}\n")
+assert _free_fullbox >> 20 < 2500, f"full box should read low, got {_free_fullbox >> 20} MB"
+# No cgroup limit -> just the host's MemAvailable.
+assert W._guard_free_from(_meminfo, "max\n", _mem_cur, _stat_full) >> 20 == 22 * 1024
+print(f"ok guard_free: active+inactive cache counts as free ({_free_new >> 20} MB vs inactive-only {_free_old >> 20} MB)")
+
 tmp = tempfile.mkdtemp()
 W.JOBS_DIR, W.GUARD_LOG = f"{tmp}/jobs", f"{tmp}/guard.log"
 d = f"{W.JOBS_DIR}/hog"
