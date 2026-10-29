@@ -3296,6 +3296,8 @@ USED_HELPERS = re.compile(r"spawn|sub-?agent|helper|workflow_run", re.I)
 FOLLOW: dict = {}        # chat id -> {"slot", "owner", "seen", "until", "row", "before"}
 FOLLOW_LOCK = threading.Lock()
 FOLLOW_HOURS = 4
+FOLLOWUPS_KEY = "followups.json"   # Storage mirror of FOLLOW so a restart can resume awaiting chats (B1)
+_FOLLOW_SIG = [None]               # last persisted set of awaiting chat ids (change-gates the PUT)
 
 
 def _slot_view(gw: Gateway, slot: str, limit: int = 1) -> dict:
@@ -3317,9 +3319,24 @@ def watch_followups(sb: Supabase, gw: Gateway, chat: dict, slot: str):
     if old.get("row"):  # a follow-up placeholder the new turn overtook: its text is in that turn now
         followup_unlive({"slot": old.get("slot") or slot, "row": old["row"]})
         _safe(lambda: sb.rest("DELETE", "messages", params={"id": f"eq.{old['row']}"}))
+    persist_followups(sb)
+
+
+def persist_followups(sb: "Supabase"):
+    """Mirror the in-memory FOLLOW (awaiting-helpers) set to Storage, so a restart can re-queue those
+    chats instead of dropping their delegated work silently (red-team B1). Change-gated: it writes only
+    when the set of awaiting chat ids changes, so it adds no per-tick Storage traffic."""
+    with FOLLOW_LOCK:
+        data = {cid: {"owner": w["owner"], "slot": w["slot"], "until": w["until"]} for cid, w in FOLLOW.items()}
+    sig = tuple(sorted(data))
+    if sig == _FOLLOW_SIG[0]:
+        return
+    _FOLLOW_SIG[0] = sig
+    _safe(lambda: sb.put(state_key(FOLLOWUPS_KEY), json.dumps(data).encode(), mime="application/json"))
 
 
 def followup_step(sb: Supabase, gw: Gateway):
+    persist_followups(sb)
     with FOLLOW_LOCK:
         items = list(FOLLOW.items())
     with BUSY_LOCK:
@@ -4441,16 +4458,23 @@ CONTINUE_TEXT = (
     "pages from before the restart were stopped. Continue the same task from where it stopped: first check "
     "what already finished (pjob list, ~/work, ~/outputs, logs), don't redo finished steps, start again only "
     "what was cut off, then finish the answer to my request.")
+FOLLOW_CONTINUE_TEXT = (
+    "[Panda restarted] Panda's machine restarted while you were waiting on background helpers or jobs you "
+    "had started, and those were stopped by the restart -- their completion events will not arrive. Pick the "
+    "task back up: first check what already finished -- `spawn_list` / `spawn_status` for helper results and "
+    "their result files, `pjob list`, ~/work, ~/outputs and logs -- then re-run only what was cut off and "
+    "finish the task. Don't restart work that already completed or re-spawn helpers that already returned.")
 
 
-def queue_continue(sb: Supabase, chat_id: str, owner: str, user_msg: dict | None, why: str) -> bool:
+def queue_continue(sb: Supabase, chat_id: str, owner: str, user_msg: dict | None, why: str,
+                   text: str = CONTINUE_TEXT) -> bool:
     """Queue the continue message for a chat whose answer a restart cut off. Returns True if queued."""
     n = int(((user_msg or {}).get("meta") or {}).get("continue_n") or 0) + 1
     if n > CONTINUE_MAX:
         log(f"chat {chat_id}: cut off again, not continuing a {n}th time")
         return False
     sb.rest("POST", "messages", body={"chat_id": chat_id, "owner": owner, "role": "user", "status": "pending",
-                                      "content": CONTINUE_TEXT,
+                                      "content": text,
                                       "meta": {"auto_continue": True, "continue_n": n, "why": why}})
     log(f"chat {chat_id}: queued a continue after the restart ({why})")
     return True
@@ -4489,6 +4513,38 @@ def resume_interrupted(sb: Supabase):
             sb.rest("PATCH", "messages", params={"id": f"eq.{u['id']}"}, body={"status": "pending"})
     if rows or stuck:
         log(f"restart: {len(rows)} cut-off replies, {len(done_chats)} continued, {len(stuck)} questions re-queued")
+
+
+def resume_followups(sb: Supabase):
+    """Startup: chats that were awaiting spawned helpers/jobs live only in the in-memory FOLLOW watcher,
+    which a restart wipes -- so their delegated work used to be dropped silently (red-team B1). FOLLOW is
+    mirrored to Storage (persist_followups); here we re-queue a continue for each still-fresh chat so the
+    agent re-checks its helper/job results and finishes, then clear the mirror (the helpers are gone)."""
+    raw = _safe(lambda: sb.get_fresh(state_key(FOLLOWUPS_KEY)))
+    data = {}
+    if raw:
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            data = {}
+    if not data:
+        return
+    now, done = time.time(), 0
+    for chat_id, w in data.items():
+        if (w.get("until") or 0) < now:
+            continue
+        pend = _safe(lambda cid=chat_id: sb.rest("GET", "messages", params={
+            "chat_id": f"eq.{cid}", "role": "eq.user", "status": "eq.pending",
+            "meta->>auto_continue": "eq.true", "select": "id", "limit": "1"})) or []
+        if pend:
+            continue      # a continue is already queued for this chat
+        if queue_continue(sb, chat_id, w.get("owner") or OWNER, None, "awaiting helpers/jobs at restart",
+                          text=FOLLOW_CONTINUE_TEXT):
+            done += 1
+    _safe(lambda: sb.delete_object(state_key(FOLLOWUPS_KEY)))
+    _FOLLOW_SIG[0] = None
+    if done:
+        log(f"restart: re-queued {done} chat(s) that were awaiting helpers/jobs")
 
 
 STOP_GRACE_SECS = int(CFG.get("stop_grace_secs", 45))     # Stop: answers may finish for this long
@@ -5828,6 +5884,10 @@ def main():
             resume_interrupted(sb)
         except Exception as exc:
             log("restart check failed:", scrub(exc)[:200])
+        try:
+            resume_followups(sb)
+        except Exception as exc:
+            log("follow-up resume failed:", scrub(exc)[:200])
         threading.Thread(target=claim_loop, args=(sb, gw, pool, stop_evt), daemon=True).start()
         SESSION_INFO.update(restored=restored, files_restored=files_state, startup_secs=round(time.time() - T0), crew=CREW_VERSION["v"],
                             start_steps=START_STEPS)
