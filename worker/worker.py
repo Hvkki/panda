@@ -189,9 +189,21 @@ class Supabase:
             raise RuntimeError(f"upload {name}: {r.status_code} {r.text[:200]}")
 
     def get(self, name: str, bucket: str = BUCKET) -> bytes | None:
-        r = requests.get(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
-                         headers=self.headers(), timeout=600)
-        return r.content if r.status_code == 200 else None
+        """The object, or None when it does not exist. Busy answers (429 too many connections, 5xx,
+        dropped connections) are retried: Storage gives them under parallel downloads, and treating
+        them as "missing" made Start fail with "kiro chunk ... is missing"."""
+        for i in range(6):
+            try:
+                r = requests.get(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
+                                 headers=self.headers(), timeout=600)
+            except requests.RequestException:
+                r = None
+            if r is not None and r.status_code == 200:
+                return r.content
+            if r is not None and r.status_code in (400, 404):
+                return None
+            time.sleep(min(20, 1.5 * 2 ** i))
+        raise RuntimeError(f"storage kept refusing {name} ({r.status_code if r is not None else 'no connection'})")
 
     def exists(self, name: str, bucket: str = BUCKET) -> bool:
         r = requests.head(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
