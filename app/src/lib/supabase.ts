@@ -156,7 +156,7 @@ export type Notification = {
 };
 
 /** Start / Stop / Status through the server function (it holds the Kaggle token). */
-export async function sessionAction(action: "start" | "stop" | "status") {
+async function sessionOnce(action: "start" | "stop" | "status") {
   const { data, error } = await supabase.functions.invoke("session", { body: { action } });
   if (error) {
     let detail = error.message;
@@ -167,4 +167,19 @@ export async function sessionAction(action: "start" | "stop" | "status") {
     throw new Error(detail);
   }
   return data as { session: WorkerSession | null; alive: boolean; note?: string };
+}
+
+// Supabase Storage sometimes answers "too many connections" for a moment; the session function then
+// says the worker code is missing although it is there. Such a Start is simply tried again.
+const BUSY = /worker code missing|too many|timed? ?out|Failed to send|fetch|502|503|504/i;
+
+export async function sessionAction(action: "start" | "stop" | "status") {
+  for (let i = 0; ; i++) {
+    try {
+      return await sessionOnce(action);
+    } catch (e) {
+      if (i >= 3 || !BUSY.test((e as Error).message)) throw e;
+      await new Promise((r) => setTimeout(r, 2000 * (i + 1)));
+    }
+  }
 }

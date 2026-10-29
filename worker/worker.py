@@ -231,18 +231,35 @@ class Supabase:
             log(f"storage delete {name.rsplit('/', 1)[-1]}: {r.status_code} {r.text[:120]}")
 
     def download(self, name: str, path: str, bucket: str = BUCKET, fresh: bool = False) -> bool:
+        """Save the object to `path`. False only when it does not exist; busy answers (429, 5xx,
+        dropped connections) are retried, like get()."""
+        for i in range(6):
+            try:
+                got = self._download_once(name, path, bucket, fresh)
+            except requests.RequestException:
+                got = None
+            if got is not None:
+                return got
+            time.sleep(min(20, 1.5 * 2 ** i))
+        raise RuntimeError(f"storage kept refusing {name}")
+
+    def _download_once(self, name: str, path: str, bucket: str, fresh: bool) -> bool | None:
         if fresh:   # past the CDN (see get_fresh): for objects that are overwritten in place
             r = requests.post(f"{SB_URL}/storage/v1/object/sign/{bucket}/{quote(name)}", json={"expiresIn": 600},
                               headers=self.headers(), timeout=60)
+            if r.status_code in (400, 404):
+                return False
             url = r.json().get("signedURL") if r.status_code == 200 else None
             if not url:
-                return False
+                return None
             r = requests.get(f"{SB_URL}/storage/v1{url}", timeout=600, stream=True)
         else:
             r = requests.get(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
                              headers=self.headers(), timeout=600, stream=True)
-        if r.status_code != 200:
+        if r.status_code in (400, 404):
             return False
+        if r.status_code != 200:
+            return None  # busy: try again
         with open(path, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 20):  # decodes gzip/br; r.raw would not
                 f.write(chunk)
@@ -1199,7 +1216,7 @@ def kiro_restore(sb: "Supabase", base: str | None = None) -> int | None:
         return h, zlib.decompress(d)
 
     cache = {}
-    with ThreadPoolExecutor(KIRO_LANES * 2) as pool:
+    with ThreadPoolExecutor(KIRO_LANES) as pool:  # 8 at once drew 429 too_many_connections
         for h, d in pool.map(fetch, need):
             cache[h] = d  # ~1.4 GB of transcripts fits in RAM; Kaggle has 30 GB
     for arc, f in files.items():
