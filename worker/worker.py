@@ -4527,6 +4527,34 @@ def stop_answers(sb: Supabase, gw: "Gateway", reason: str):
         log("stop: some answers did not end in time; their text so far is kept")
 
 
+WARN_LEAD = int(os.environ.get("PANDA_WARN_LEAD_SECS", str(60 * 60)))  # warn busy agents this long before the cap
+SHUTDOWN_WARNED = [False]
+
+
+def warn_before_shutdown(sb: "Supabase", gw: "Gateway"):
+    """Once, about WARN_LEAD before MAX_RUNTIME, tell every busy agent the machine will restart soon so
+    it can checkpoint. Delivered as a steer into the running turn (same path as steer_pending), so the
+    agent sees it mid-work. Fires at ~1 h before the cap, before the handoff itself begins."""
+    if SHUTDOWN_WARNED[0]:
+        return
+    SHUTDOWN_WARNED[0] = True
+    mins = max(1, round((MAX_RUNTIME - (time.time() - T0)) / 60))
+    note = (f"[Panda maintenance] This machine restarts automatically in about {mins} minutes "
+            f"(a fresh notebook takes over, and the restart itself may begin sooner). Checkpoint now: "
+            f"save your state and notes to ~/work, finish or stop the current step, and do not start "
+            f"new long jobs -- anything still mid-flight may be cut off by the restart. After it, pick "
+            f"up from your ~/work state.")
+    with BUSY_LOCK:
+        slots = [(cid, v["slot"]) for cid, v in BUSY_SLOTS.items()]
+    log(f"shutdown warning: {mins} min to cap; steering {len(slots)} busy slot(s)")
+    for cid, slot in slots:
+        try:
+            gw.call("POST", "/api/chat", {"message": note, "slot": slot, "steer": True}, timeout=30)
+            log(f"shutdown warning steered into chat {cid}")
+        except Exception as exc:
+            log("shutdown warning failed for", cid, type(exc).__name__)
+
+
 def drain_turns(sb: Supabase, reason: str):
     """Before a restart, let answers finish for up to DRAIN_SECS, then pause the rest for the next run."""
     if reason not in ("handoff", "time guard"):
@@ -5848,6 +5876,8 @@ def main():
                     raise
                 time.sleep(10)
                 continue
+            if time.time() - T0 > MAX_RUNTIME - WARN_LEAD:
+                _safe(warn_before_shutdown, sb, gw)
             if step == "handoff":
                 reason = "handoff"
                 break
