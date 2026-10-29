@@ -84,9 +84,13 @@ async function launch(admin: Admin, userId: string, info: Row): Promise<
   const code = await admin.storage.from("kirocrew-state").download("code/worker.py");
   if (code.error) return { ok: false, status: 500, error: "worker code missing in storage" };
 
-  const { data: sess, error: insErr } = await admin.from("worker_sessions")
-    .insert({ owner: userId, status: "requested", info, kaggle_kernel: `${kernel} v?` }).select().single();
+  const { data: sess, error: insErr } = await admin.rpc("start_session", {
+    p_owner: userId, p_info: info, p_kernel: `${kernel} v?`, p_exclude: info?.handoff_from ?? null,
+  });
   if (insErr) return { ok: false, status: 500, error: insErr.message };
+  // start_session took a per-owner advisory lock and returned null because another run for this account
+  // is already alive or starting (B2: no second notebook for one account). The caller backs off.
+  if (!sess) return { ok: false, status: 409, error: "another run for this account is already starting" };
   // The run serves exactly this Start press (and so this account).
   const text = (await code.data.text()).replace(/^INJECTED_SESSION_ID = ""$/m, `INJECTED_SESSION_ID = "${sess.id}"`);
 
