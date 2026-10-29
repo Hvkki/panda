@@ -32,6 +32,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import uuid
@@ -691,6 +692,115 @@ def blob_save_drive(sb: "Supabase", name: str, path: str, extra: dict | None = N
     return {"size": size, "parts": 0, "drive": got["id"]}
 
 
+# ── Kaggle dataset: elastic overflow storage ────────────────────────────────────────────────────────
+# Supabase (1 GB bucket) and Drive (15 GB) both have ceilings; a Kaggle dataset is effectively unlimited
+# versioned storage on the same account that runs the notebooks. When an archive is too big for Storage
+# and Drive is full/absent, blob_save_kaggle pushes it to the owner's `panda-backups` dataset and keeps
+# only a small manifest in Storage (mirrors blob_save_drive). Needs Kaggle creds in worker.json
+# (kaggle_username/kaggle_key); without them kaggle_ok() is False and nothing here runs.
+KAGGLE_USER = (CFG.get("kaggle_username") or os.environ.get("KAGGLE_USERNAME") or "").strip()
+_KAGGLE_KEY = (CFG.get("kaggle_key") or os.environ.get("KAGGLE_KEY") or os.environ.get("KAGGLE_API_TOKEN") or "").strip()
+KAGGLE_BACKUP = (CFG.get("kaggle_backup_dataset") or (f"{KAGGLE_USER}/panda-backups" if KAGGLE_USER else "")).strip()
+KAGGLE_PUSH_TIMEOUT = int(CFG.get("kaggle_push_timeout_secs", 1800))
+KAGGLE_MIN_INTERVAL = int(CFG.get("kaggle_min_interval_secs", 2 * 3600))   # don't version more often than this
+_kaggle_last = [0.0]
+_kaggle_ok: list = [None]
+
+
+def kaggle_ok() -> bool:
+    if _kaggle_ok[0] is None:
+        _kaggle_ok[0] = bool(KAGGLE_USER and _KAGGLE_KEY and KAGGLE_BACKUP and shutil.which("kaggle"))
+    return _kaggle_ok[0]
+
+
+def _kaggle_run(args: list, timeout: int):
+    """Run the kaggle CLI with creds in the env (never logged). Returns the CompletedProcess or None."""
+    cfgdir = f"{WORK}/.kaggle-cfg"
+    with contextlib.suppress(OSError):
+        os.makedirs(cfgdir, exist_ok=True)
+    env = {**os.environ, "KAGGLE_USERNAME": KAGGLE_USER, "KAGGLE_KEY": _KAGGLE_KEY, "KAGGLE_CONFIG_DIR": cfgdir}
+    try:
+        return subprocess.run(["kaggle", *args], env=env, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("kaggle:", type(exc).__name__)
+        return None
+
+
+def kaggle_push_file(path: str, name: str) -> dict | None:
+    """Push one file to the panda-backups dataset as a new version (create it the first time)."""
+    if not kaggle_ok():
+        return None
+    d = tempfile.mkdtemp(prefix="kg-", dir=WORK)
+    try:
+        shutil.copy2(path, os.path.join(d, name))
+        with open(os.path.join(d, "dataset-metadata.json"), "w") as f:
+            json.dump({"title": KAGGLE_BACKUP.split("/")[1], "id": KAGGLE_BACKUP, "licenses": [{"name": "other"}]}, f)
+        status = _kaggle_run(["datasets", "status", KAGGLE_BACKUP], 120)
+        exists = bool(status and status.returncode == 0)
+        verb = (["datasets", "version", "-p", d, "-m", f"panda backup {now_iso()}", "--delete-old-versions"]
+                if exists else ["datasets", "create", "-p", d])
+        r = _kaggle_run(verb, KAGGLE_PUSH_TIMEOUT)
+        if not r or r.returncode != 0:
+            log("kaggle push failed:", scrub((r.stderr if r else "no result") or "")[:200])
+            return None
+        return {"version": now_iso()}
+    except OSError as exc:
+        log("kaggle push:", type(exc).__name__)
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def kaggle_pull_file(name: str, dest: str) -> bool:
+    """Download one file from the backup dataset (kaggle wraps a single file in <name>.zip) to dest."""
+    if not kaggle_ok() or not name:
+        return False
+    d = tempfile.mkdtemp(prefix="kg-", dir=WORK)
+    try:
+        r = _kaggle_run(["datasets", "download", "-d", KAGGLE_BACKUP, "-f", name, "-p", d, "--force"], KAGGLE_PUSH_TIMEOUT)
+        if not r or r.returncode != 0:
+            return False
+        zp = os.path.join(d, name + ".zip")
+        if os.path.exists(zp):
+            import zipfile
+            with zipfile.ZipFile(zp) as z:
+                z.extractall(d)
+        src = os.path.join(d, name)
+        if not os.path.exists(src):
+            return False
+        with contextlib.suppress(OSError):
+            os.remove(dest)
+        shutil.move(src, dest)
+        return True
+    except (OSError, zipfile.BadZipFile) as exc:
+        log("kaggle pull:", type(exc).__name__)
+        return False
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def blob_save_kaggle(sb: "Supabase", name: str, path: str, extra: dict | None = None) -> dict | None:
+    """For an archive too big for Storage with no Drive: put it in the Kaggle dataset; Storage keeps only
+    the manifest. Throttled to at most one version per KAGGLE_MIN_INTERVAL (returns None when throttled,
+    so the caller keeps the last full copy and saves only the changes)."""
+    if not kaggle_ok():
+        return None
+    if time.time() - _kaggle_last[0] < KAGGLE_MIN_INTERVAL:
+        log(f"kaggle: skipped, last backup < {KAGGLE_MIN_INTERVAL // 60} min ago")
+        return None
+    fname = name.replace("/", "_")
+    if not kaggle_push_file(path, fname):
+        return None
+    _kaggle_last[0] = time.time()
+    old = _manifest_get(sb, name)
+    size = os.path.getsize(path)
+    _put_manifest(sb, name, {"v": 1, "size": size, "sha256": sha256_file(path), "parts": [],
+                             "kaggle": {"slug": KAGGLE_BACKUP, "file": fname, "version": now_iso()},
+                             "saved_at": now_iso(), **(extra or {})})
+    _forget_old(sb, name, old, keep_single=False, keep_manifest=True)
+    return {"size": size, "parts": 0, "kaggle": KAGGLE_BACKUP}
+
+
 def blob_load(sb: "Supabase", name: str, dest: str) -> bool:
     """Fetch what blob_save / blob_save_drive stored (or an old single object). False if there is none."""
     man = _manifest_get(sb, name)
@@ -699,6 +809,10 @@ def blob_load(sb: "Supabase", name: str, dest: str) -> bool:
     if man.get("drive"):
         if not drive_get(man["drive"].get("id", ""), dest):
             raise RuntimeError("the saved work files are in Google Drive but could not be fetched")
+        sha = sha256_file(dest)
+    elif man.get("kaggle"):
+        if not kaggle_pull_file(man["kaggle"].get("file", ""), dest):
+            raise RuntimeError("the saved work files are in the Kaggle backup dataset but could not be fetched")
         sha = sha256_file(dest)
     else:
         local = []
@@ -1059,9 +1173,13 @@ def files_snapshot(sb: "Supabase", reason: str, budget: float | None = None) -> 
             done = where = None
             if size > FILES_STORAGE_MAX and drive_ok:
                 done, where = blob_save_drive(sb, FILES_BLOB, archive, extra), "Google Drive"
+                if done is None and kaggle_ok():
+                    done, where = blob_save_kaggle(sb, FILES_BLOB, archive, extra), "Kaggle dataset"
                 if done is None:
                     files_alert(sb, "Google Drive did not take the copy of your work files (is it full?). "
                                     "Panda keeps the last full copy and saves only the changes until it works again.")
+            elif size > FILES_STORAGE_MAX and kaggle_ok():
+                done, where = blob_save_kaggle(sb, FILES_BLOB, archive, extra), "Kaggle dataset"
             elif not dropped or not files_base_exists(sb):
                 done, where = blob_save(sb, FILES_BLOB, archive, extra=extra), "Storage"
             if done is None:

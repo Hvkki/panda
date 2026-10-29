@@ -33,6 +33,10 @@ def wanted(env):
         "vapid_private": env["VAPID_PRIVATE_KEY"],
         "vapid_sub": env["VAPID_SUBJECT"],
         "browser_key": env["BROWSER_FERNET_KEY"],
+        # Kaggle API creds so the worker can use a Kaggle dataset as elastic backup storage
+        # (blob_save_kaggle / blob_load). Same account that runs the notebooks.
+        "kaggle_username": env["KAGGLE_USERNAME"],
+        "kaggle_key": env["KAGGLE_API_TOKEN"],
         "drive": {
             "client_id": env["GOOGLE_OAUTH_CLIENT_ID"],
             "client_secret": env["GOOGLE_OAUTH_CLIENT_SECRET"],
