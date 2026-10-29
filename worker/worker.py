@@ -1491,6 +1491,9 @@ THINK = {}          # slot -> accumulated thinking text of the running turn
 THINK_REPLY = {}    # slot -> assistant message id being streamed
 THINK_SENT = {}     # slot -> length already written to Supabase
 THINK_LOCK = threading.Lock()
+# slot -> live view of a follow-up turn (one Panda did not start: a helper/job wake). Crew streams those
+# only on its websocket, so the listener fills this: {"t0", "tools", "at", "text", "seg"}.
+LIVE = {}
 SIDE: dict = {}  # side-chat (/btw) run id -> {"slot", "text", "final"?, "error"?, "at"}, from the websocket
 SIDE_LOCK = threading.Lock()
 CTX = {}            # slot -> latest context_usage reading from Crew's websocket
@@ -1554,6 +1557,24 @@ def thinking_listener(gw: "Gateway", stop: threading.Event):
                     with THINK_LOCK:
                         if slot in THINK_REPLY:
                             THINK[slot] = THINK.get(slot, "") + str(d.get("content") or "")
+                elif msg.get("type") in ("tool_call", "chat_chunk"):
+                    # Steps and text of a follow-up turn (no Panda stream behind it): see LIVE.
+                    d = msg.get("data") or {}
+                    with THINK_LOCK:
+                        live = LIVE.get(d.get("slot"))
+                        if live is not None:
+                            if msg["type"] == "tool_call":
+                                step = clean_step(d.get("tool"))
+                                if step and (not live["tools"] or live["tools"][-1] != step):
+                                    live["tools"].append(step)
+                                    live["at"].append(round(time.time() - live["t0"], 1))
+                                    live["seg"] = bool(live["text"])
+                            else:
+                                c = str(d.get("content") or "")
+                                if c and live["seg"]:
+                                    live["text"] += "\n\n"
+                                    live["seg"] = False
+                                live["text"] += c
                 elif msg.get("type") == "context_usage":
                     # Crew measures the context after the turn, when the chat stream has already ended.
                     d = msg.get("data") or {}
@@ -3287,6 +3308,7 @@ def watch_followups(sb: Supabase, gw: Gateway, chat: dict, slot: str):
         FOLLOW[chat["id"]] = {"slot": slot, "owner": chat["owner"], "seen": total, "row": None, "before": None,
                               "until": time.time() + FOLLOW_HOURS * 3600}
     if old.get("row"):  # a follow-up placeholder the new turn overtook: its text is in that turn now
+        followup_unlive({"slot": old.get("slot") or slot, "row": old["row"]})
         _safe(lambda: sb.rest("DELETE", "messages", params={"id": f"eq.{old['row']}"}))
 
 
@@ -3310,7 +3332,7 @@ def followup_step(sb: Supabase, gw: Gateway):
         if total < w["seen"]:  # the slot was cleared or recreated
             w["seen"] = total
             continue
-        if total == w["seen"] and not (running and not w["row"]):
+        if total == w["seen"] and not running:
             continue
         chat = {"id": chat_id, "owner": w["owner"]}
         if not w["row"]:
@@ -3319,7 +3341,12 @@ def followup_step(sb: Supabase, gw: Gateway):
                 "chat_id": chat_id, "owner": w["owner"], "role": "assistant", "status": "streaming",
                 "content": "", "meta": {"followup": True}})[0]["id"]
             log(f"chat {chat_id}: Panda is answering on its own (helpers finished)")
+            with THINK_LOCK:
+                LIVE[w["slot"]] = {"t0": time.time(), "tools": [], "at": [], "text": "", "seg": False}
+                THINK[w["slot"]], THINK_REPLY[w["slot"]], THINK_SENT[w["slot"]] = "", w["row"], 0
+            w["tl"], w["tl_state"] = {}, {"last": 0.0, "mach": 0.0, "busy": False, "calls": 0}
         if running:
+            followup_live(sb, gw, w)
             try:  # "Stop" on Panda's own follow-up answer
                 row = sb.rest("GET", "messages", params={"id": f"eq.{w['row']}", "select": "cancel"})
                 if row and row[0].get("cancel") and not w.get("stopped"):
@@ -3337,6 +3364,11 @@ def followup_step(sb: Supabase, gw: Gateway):
                                        and (m.get("meta") or {}).get("kind") not in ("compaction", "session_reload"))
                 if t.strip() and not is_compaction_notice(t))
         w["seen"] = total
+        live = followup_unlive(w)
+        steps = {"tools": live["tools"][-30:], "steps_at": live["at"][-30:], "n_steps": len(live["tools"]),
+                 "secs": round(time.time() - live["t0"], 1)} if live else {}
+        if not text.strip() and live and live["text"].strip():
+            text = live["text"]
         # A wake can start the next phase (more helpers): keep watching while the chat keeps working.
         w["until"] = max(w["until"], time.time() + FOLLOW_HOURS * 3600)
         if not text.strip():
@@ -3346,14 +3378,70 @@ def followup_step(sb: Supabase, gw: Gateway):
             text = scrub(link_files(text, published))
             sb.rest("PATCH", "messages", params={"id": f"eq.{w['row']}"}, body={
                 "content": text, "status": "done",
-                "meta": {"followup": True, "files": [r["id"] for _, r, inline in published if not inline]}})
+                "meta": {"followup": True, **steps,
+                         "files": [r["id"] for _, r, inline in published if not inline]}})
             push(sb, w["owner"], "Panda finished with the helpers", re.sub(r"[#*_`>\[\]]", "", text)[:180],
                  f"./?c={chat_id}")
         w["row"], w["before"], w["stopped"] = None, None, False
 
 
+def followup_unlive(w: dict) -> dict | None:
+    """Stop streaming a follow-up row: returns its live view (steps, text) or None."""
+    with THINK_LOCK:
+        live = LIVE.pop(w["slot"], None)
+        if THINK_REPLY.get(w["slot"]) == w.get("row"):
+            THINK_REPLY.pop(w["slot"], None)
+    return live
+
+
+def followup_live(sb: Supabase, gw: Gateway, w: dict):
+    """While a follow-up turn runs: show its text, steps and timeline like a normal answer."""
+    with THINK_LOCK:
+        live = LIVE.get(w["slot"])
+        if live is None:
+            return
+        text, tools, at, t0 = live["text"], list(live["tools"]), list(live["at"]), live["t0"]
+        thinking = THINK.get(w["slot"], "")
+    tl, st = w.setdefault("tl", {}), w.setdefault("tl_state", {"last": 0.0, "mach": 0.0, "busy": False, "calls": 0})
+    el = time.time() - t0
+    if tools and el > TL_AFTER:
+        if time.time() - st["mach"] >= 10:
+            st["mach"] = time.time()
+            try:
+                tl["run"] = machine_now()
+            except Exception as exc:
+                log("machine view failed:", type(exc).__name__)
+        if not st["busy"] and st["calls"] < TL_MAX and time.time() - st["last"] > TL_EVERY:
+            st.update(busy=True, last=time.time(), calls=st["calls"] + 1)
+
+            def run():
+                try:
+                    with TL_SEM:
+                        note = narrate(gw, "Carry the task on after helpers or a background job finished.",
+                                       tools, at, el, thinking, "English", tl.get("run"))
+                    if note.get("now"):
+                        tl.update(now=note["now"], next=note["next"], why=note["why"], at=round(el, 1),
+                                  step=len(tools) - 1,
+                                  step_end=round(el + note["step_left"]) if note["step_left"] is not None else None,
+                                  done_end=round(el + note["total_left"]) if note["total_left"] is not None else None)
+                except Exception as exc:
+                    log("follow-up timeline:", type(exc).__name__)
+                finally:
+                    st["busy"] = False
+            threading.Thread(target=run, daemon=True).start()
+        if tools:
+            tl["typ"] = step_typical(step_kind(tools[-1]))
+    try:
+        sb.rest("PATCH", "messages", params={"id": f"eq.{w['row']}"}, body={
+            "content": scrub(text), "meta": {"followup": True, "tools": tools[-30:], "steps_at": at[-30:],
+                                             "n_steps": len(tools), "tl": dict(tl) if tl else None,
+                                             "secs": round(el, 1)}})
+    except Exception as exc:
+        log("follow-up push:", type(exc).__name__)
+
+
 def followup_loop(sb: Supabase, gw: Gateway, stop: threading.Event):
-    while not stop.wait(6):
+    while not stop.wait(2 if LIVE else 6):
         try:
             followup_step(sb, gw)
         except Exception as exc:
