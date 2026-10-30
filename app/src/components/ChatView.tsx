@@ -118,7 +118,10 @@ export function ChatView({ chat, onModel, onSendMessage, onCommand, online }: Pr
   const [tlOpen, setTlOpen] = useTimelineOpen();
   // The timeline follows the running answer; with nothing running it can show the last one on request.
   const tlMsg = streaming && (streaming.meta.tools?.length || 0) > 0 ? streaming : null;
-  const busy = !!streaming || messages.some((m) => m.role === "user" && (m.status === "processing"));
+  // A question still marked "processing" whose answer already finished is a lost status write, not a
+  // running turn: it must not lock the composer.
+  const busy = !!streaming || messages.some((m) => m.role === "user" && m.status === "processing" &&
+    !messages.some((a) => a.role === "assistant" && a.reply_to === m.id && (a.status === "done" || a.status === "error")));
 
   // Safety net while Panda answers: a live link can drop silently with no error at all, so re-read every
   // few seconds until the answer is done. Nothing runs when the chat is idle.

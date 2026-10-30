@@ -3979,7 +3979,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                 if attempt == 2:
                     raise
                 time.sleep(1.5 * (attempt + 1))
-        _safe(lambda: sb.rest("PATCH", "messages", params={"id": f"eq.{msg['id']}"}, body={"status": "done"}))
+        _patch_retry(sb, msg["id"], {"status": "done"})
         if cancelled.is_set() and RESTARTING.is_set():
             _safe(lambda: sb.rest("PATCH", "messages", params={"id": f"eq.{reply['id']}"},
                                   body={"meta": {**done_meta, "interrupted": True}}))
@@ -4003,10 +4003,11 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             THINK_REPLY.pop(slot, None)
             STREAM_ROWS.discard(reply["id"])
         err = scrub(exc)[:500]
-        sb.rest("PATCH", "messages", params={"id": f"eq.{reply['id']}"},
-                body={"content": scrub(text), "thinking": scrub(thinking), "status": "error",
-                      "meta": {**meta(), "error": err}})
-        sb.rest("PATCH", "messages", params={"id": f"eq.{msg['id']}"}, body={"status": "error"})
+        # Often the failure IS Supabase timing out; a lost PATCH here left the question 'processing' for good,
+        # which locks the chat's composer ("Panda is working") until someone fixes the row by hand.
+        _patch_retry(sb, reply["id"], {"content": scrub(text), "thinking": scrub(thinking), "status": "error",
+                                       "meta": {**meta(), "error": err}})
+        _patch_retry(sb, msg["id"], {"status": "error"})
         log("message failed:", err)
 
 
@@ -5370,9 +5371,13 @@ def resume_interrupted(sb: Supabase):
     for u in stuck:
         if u["chat_id"] in done_chats:
             continue
-        answered = sb.rest("GET", "messages", params={"reply_to": f"eq.{u['id']}", "select": "id", "limit": "1"})
+        answered = sb.rest("GET", "messages", params={"reply_to": f"eq.{u['id']}", "select": "id,status",
+                                                      "order": "id.desc", "limit": "1"})
         if not answered:
             sb.rest("PATCH", "messages", params={"id": f"eq.{u['id']}"}, body={"status": "pending"})
+        elif answered[0].get("status") in ("done", "error"):
+            # Its answer finished but the question's own close was lost: close it, or the chat stays "working".
+            sb.rest("PATCH", "messages", params={"id": f"eq.{u['id']}"}, body={"status": answered[0]["status"]})
     if rows or stuck:
         log(f"restart: {len(rows)} cut-off replies, {len(done_chats)} continued, {len(stuck)} questions re-queued")
 
@@ -6102,6 +6107,19 @@ def side_ask(sb: Supabase, gw: Gateway, chat_id: str, question: str, timeout: fl
     if partial:
         return {"answer": scrub(_ANSI.sub("", partial)), "error": False}
     return {"answer": "", "error": True, "note": "No answer yet. Try again in a moment."}
+
+
+def _patch_retry(sb: "Supabase", msg_id, body: dict, tries: int = 4):
+    """PATCH one message row, retrying through a Supabase blip (2, 5, 10 s). Never raises."""
+    for i in range(tries):
+        try:
+            sb.rest("PATCH", "messages", params={"id": f"eq.{msg_id}"}, body=body)
+            return True
+        except Exception as exc:
+            log(f"message {msg_id}: status write failed ({i + 1}/{tries}):", _reason(exc))
+            if i + 1 < tries:
+                time.sleep((2, 5, 10)[min(i, 2)])
+    return False
 
 
 def _safe(fn, *a):

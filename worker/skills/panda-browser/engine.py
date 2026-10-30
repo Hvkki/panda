@@ -263,6 +263,8 @@ class Engine:
         self.mobile = False                # a phone is watching: real mobile page, touch taps
         self.dpr = 1.0                     # device pixels per CSS pixel of the live picture
         self.emu = None                    # CDP session of the current page for emulation and sharp captures
+        self.guard = None                  # browser-wide CDP session that blocks private-address page loads
+        self.main_frame_id = ""            # CDP id of the current tab's main frame (its target id)
         self.xvfb: subprocess.Popen | None = None  # the virtual screen Chromium draws on
         self.pending_fit: tuple | None = None  # a panel resize that came while Panda was busy
         self.tab_ids: dict = {}            # page -> stable tab id (indexes shift when a tab closes)
@@ -321,6 +323,7 @@ class Engine:
             subprocess.run([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"], check=False)
             self.browser = await self.pw.chromium.launch(headless=headless, executable_path=exe, args=args)
         self.ua_major = self.browser.version.split(".")[0]
+        await self._start_guard()   # before any page exists, so nothing loads unchecked
         await self._new_context(STATE_PATH if STATE_PATH.exists() else None)
         asyncio.create_task(self._frame_sender())
         asyncio.create_task(self._housekeeping())
@@ -342,18 +345,37 @@ class Engine:
             self.ctx = await self.browser.new_context(viewport={"width": VIEW_W, "height": VIEW_H}, user_agent=ua,
                                                       locale="en-US", accept_downloads=True)
         self.ctx.on("page", lambda p: asyncio.create_task(self._adopt(p)))
-        await self.ctx.route("**/*", self._route)
+        # No ctx.route here: Playwright routing copies every request BODY into Python (a 300 MB YouTube
+        # upload crashed the driver with EPIPE). The private-address block is the browser-wide guard below.
         page = await self.ctx.new_page()
         await self._adopt(page)
 
-    async def _route(self, route):
-        req = route.request
-        if req.resource_type == "document" and req.is_navigation_request():
-            ok, why = await asyncio.to_thread(url_ok, req.url)
-            if not ok and not req.url.startswith("about:"):
-                log("blocked navigation:", req.url[:80], why)
-                return await route.abort("blockedbyclient")
-        await route.continue_()
+    async def _start_guard(self):
+        """Block page loads of private/local addresses in every tab, popup, iframe and context.
+
+        A browser-level CDP Fetch that pauses only Document requests: uploads, scripts and images are
+        never paused or copied, so big file uploads run at full speed."""
+        self.guard = await self.browser.new_browser_cdp_session()
+        self.guard.on("Fetch.requestPaused", lambda e: asyncio.create_task(self._guard_check(e)))
+        await self.guard.send("Fetch.enable", {"patterns": [
+            {"urlPattern": "*", "resourceType": "Document", "requestStage": "Request"}]})
+
+    async def _guard_check(self, e):
+        rid, url = e["requestId"], e["request"]["url"]
+        try:
+            ok, why = await asyncio.to_thread(url_ok, url)
+        except Exception as exc:  # fail closed
+            ok, why = False, f"check failed: {exc}"
+        try:
+            if not ok and not url.startswith("about:"):
+                log("blocked navigation:", url[:80], why)
+                await self.guard.send("Fetch.failRequest", {"requestId": rid, "errorReason": "BlockedByClient"})
+                return
+            if e.get("frameId") and e.get("frameId") == self.main_frame_id:
+                self._loading(self.page, True)
+            await self.guard.send("Fetch.continueRequest", {"requestId": rid})
+        except Exception:  # the tab closed meanwhile
+            pass
 
     def _tid(self, page) -> int:
         if page not in self.tab_ids:
@@ -394,19 +416,12 @@ class Engine:
         page.on("download", lambda d: asyncio.create_task(self._download(d)))
         page.on("close", lambda: asyncio.create_task(self._page_closed(page)))
         page.on("framenavigated", lambda f: asyncio.create_task(self._navigated(page)) if f == page.main_frame else None)
-        page.on("request", lambda r: self._nav_request(page, r, True))
-        page.on("requestfailed", lambda r: self._nav_request(page, r, False))
+        # No page "request" listeners: each request event carries its whole body (300 MB upload: 6 s -> 60 s).
+        # The guard turns "loading" on; load, domcontentloaded or an error page turns it off.
         page.on("domcontentloaded", lambda _p: self._loading(page, False))
         page.on("load", lambda _p: self._loading(page, False))
         await self._restart_screencast()
         await self.push_status()
-
-    def _nav_request(self, page, req, on: bool):
-        try:
-            if req.is_navigation_request() and req.frame == page.main_frame:
-                self._loading(page, on)
-        except Exception:  # service-worker requests have no frame
-            pass
 
     def _loading(self, page, on: bool):
         if page is self.page and self.loading != on:
@@ -673,6 +688,9 @@ class Engine:
                         await self.emu.detach()
                 self.emu = await self.ctx.new_cdp_session(page)
                 self.emu._panda_page = page
+                self.main_frame_id = ""
+                with contextlib.suppress(Exception):
+                    self.main_frame_id = (await self.emu.send("Target.getTargetInfo"))["targetInfo"]["targetId"]
             # Density stays 1 here (Playwright's own session also sets it); sharpness comes from the
             # capture scale in _capture, which re-rasterizes the visible area at self.dpr.
             await self.emu.send("Emulation.setDeviceMetricsOverride", {
