@@ -71,6 +71,15 @@ credential (the token lives only in the `session` function's secrets), so it ask
    is stopped, row set to `stopped` (`info.stop_reason = "handoff"`). At `MAX_RUNTIME` it stops anyway.
 4. Messages sent in the gap stay `pending` and are answered by the successor (commands wait up to 3 min).
 
+**One run per account.** A starting run heartbeats from the moment it claims its row until it serves
+(`boot_beating`, capped so a hung start still looks dead), so the app and the watchdog see a successor
+that is restoring as alive. Every run also checks for a rival (`rival_run`): right after claiming its row,
+again before its first save, then every minute. A rival is another live run of the same account that is
+not its hand-off predecessor or successor and was not asked to stop. The older run keeps the account; the
+younger one stops at once without saving anything (`info.stop_reason = "duplicate: ..."`) and leaves a
+bell note. On 30 Oct a successor restored for 10 min with no heartbeat, the app showed Offline, and Start
+launched a second notebook: both answered the same chats and saved over the same state.
+
 The app shows the serving run (a running one first, else the newest), and "Restarting" while a successor
 or a draining old run is the newest. Stop sets `stop_requested` on both, so a waiting successor never takes
 over after a Stop. If the function cannot be reached the worker retries (5 times, 2 min apart), then at the

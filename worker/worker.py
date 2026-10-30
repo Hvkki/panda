@@ -4236,7 +4236,10 @@ def steer_pending(sb: Supabase, gw: Gateway):
             continue
         meta = dict(r.get("meta") or {})
         try:
-            res = gw.call("POST", "/api/chat", {"message": r["content"], "slot": info["slot"], "steer": True}, timeout=30)
+            # sendId tags Crew's queue entry, so settle_steers can find a steer Crew queued without
+            # telling us its queue id (Crew's "requeued at turn end" answer has none).
+            res = gw.call("POST", "/api/chat", {"message": r["content"], "slot": info["slot"], "steer": True,
+                                                "meta": {"sendId": steer_send_id(r["id"])}}, timeout=30)
             meta["steered"] = "steered" if res.get("steered") else "queued"
             if not res.get("steered"):
                 meta["steer_slot"], meta["steer_qid"] = info["slot"], res.get("queue_id") or ""
@@ -5530,50 +5533,80 @@ def claim_loop(sb: Supabase, gw: Gateway, pool: ThreadPoolExecutor, stop: thread
             return
 
 
-def stopped(sb: Supabase, chat_id: str) -> bool:
-    """True when the chat's last answer was stopped (Stop pressed, or a restart paused it)."""
-    with contextlib.suppress(Exception):
-        r = sb.rest("GET", "messages", params={"chat_id": f"eq.{chat_id}", "role": "eq.assistant", "order": "id.desc",
-                                               "limit": "1", "select": "cancel"})
-        return bool(r and r[0].get("cancel"))
-    return False
+def steer_send_id(msg_id) -> str:
+    """The sendId a steer carries into Crew (Crew accepts letters, digits, - and _ only)."""
+    return f"panda-steer-{int(msg_id)}"
 
 
-def settle_steers(sb: Supabase, gw: Gateway, chat_id: str):
-    """After a turn ends: a message Crew queued "for next" during it is answered nobody-knows-where
-    (the turn's stream has ended, and Stop leaves it stuck). Take it back from Crew's queue and run
-    it as a normal turn, so it is always answered in the chat. "Panda answers this next" had stayed
-    on screen forever in the Developer chat."""
+def queued_id(gw: Gateway, slot: str, send_id: str, content: str) -> str:
+    """Id of a message still waiting in Crew's queue for `slot`, found by its sendId, else by its text.
+    "" when it is not queued: Crew already took it into a turn of its own (or dropped it)."""
+    try:
+        queue = _slot_view(gw, slot).get("queue") or []
+    except Exception:
+        return ""
+    entries = [q for q in queue if isinstance(q, dict) and q.get("id")]
+    for q in entries:
+        if (q.get("meta") or {}).get("sendId") == send_id:
+            return str(q["id"])
+    text = (content or "").strip()
+    for q in entries:
+        if text and (q.get("content") or "").strip() == text:
+            return str(q["id"])
+    return ""
+
+
+def settle_steers(sb: Supabase, gw: Gateway, chat_id: str, after: int, owner: str = ""):
+    """After a turn ends: settle the steers Crew queued "for next" DURING THAT TURN (ids after the turn's
+    own message). One still in Crew's queue is taken back and run as a normal turn, so it is always
+    answered in the chat ("Panda answers this next" had stayed on screen forever in the Developer chat).
+    One Crew no longer holds is already Crew's own next turn: it is marked "crew" and the chat's
+    follow-up watcher shows that answer. No steer stays "queued": old ones used to wait there for days
+    and all ran again at the chat's next Stop (30 Oct: 8 messages from 28-29 Oct ran one after another)."""
     try:
         rows = sb.rest("GET", "messages", params={"chat_id": f"eq.{chat_id}", "role": "eq.user", "status": "eq.done",
-                                                  "meta->>steered": "eq.queued", "order": "id.asc", "limit": "10",
-                                                  "select": "id,meta"}) or []
+                                                  "meta->>steered": "eq.queued", "id": f"gt.{int(after)}",
+                                                  "order": "id.asc", "limit": "10",
+                                                  "select": "id,meta,content"}) or []
     except Exception as exc:
         log("steer check:", type(exc).__name__)
         return
+    crew_slot = None
     for r in rows:
         meta = dict(r.get("meta") or {})
         slot, qid = meta.get("steer_slot"), meta.get("steer_qid")
-        if slot and qid:
+        if slot and not qid:  # Crew's "requeued at turn end" answer carries no queue id: look it up
+            qid = queued_id(gw, slot, steer_send_id(r["id"]), r.get("content") or "")
+        take_back = bool(slot and qid)
+        if take_back:
             try:
                 gw.call("DELETE", f"/api/chat/slots/{slot}/queue/{qid}")
             except GatewayError as exc:
-                if getattr(exc, "status", 0) == 404:  # Crew already ran it in a turn of its own
-                    meta["steered"] = "crew"
-                    with contextlib.suppress(Exception):
-                        sb.rest("PATCH", "messages", params={"id": f"eq.{r['id']}"}, body={"meta": meta})
-                    continue
+                # 404: Crew already ran it in a turn of its own. 409: its row is already in Crew's
+                # conversation, so Crew answers it. Running it here as well would answer it twice.
+                if getattr(exc, "status", 0) in (404, 409):
+                    take_back = False
             except Exception:
                 pass
-        elif not stopped(sb, chat_id):
-            continue  # no queue id to take back: Crew answers it; a second answer would be a duplicate
         for k in ("steer", "steer_slot", "steer_qid"):
             meta.pop(k, None)
+        if not take_back:
+            meta["steered"] = "crew"
+            crew_slot = slot or crew_slot
+            with contextlib.suppress(Exception):
+                sb.rest("PATCH", "messages", params={"id": f"eq.{r['id']}"}, body={"meta": meta})
+            log(f"chat {chat_id}: queued message {r['id']} is answered in Crew's next turn")
+            continue
         meta["steered"] = "requeued"
         with contextlib.suppress(Exception):
             sb.rest("PATCH", "messages", params={"id": f"eq.{r['id']}", "status": "eq.done"},
                     body={"status": "pending", "meta": meta})
         log(f"chat {chat_id}: queued message {r['id']} runs as its own turn")
+    if crew_slot and owner:
+        with FOLLOW_LOCK:
+            watched = chat_id in FOLLOW
+        if not watched:  # bring Crew's answer to it into the chat
+            watch_followups(sb, gw, {"id": chat_id, "owner": owner}, crew_slot)
 
 
 def run_message(sb: Supabase, gw: Gateway, msg: dict):
@@ -5595,7 +5628,7 @@ def run_message(sb: Supabase, gw: Gateway, msg: dict):
             dev_end()
         with BUSY_LOCK:
             BUSY_CHATS.discard(msg["chat_id"])
-        settle_steers(sb, gw, msg["chat_id"])
+        settle_steers(sb, gw, msg["chat_id"], msg["id"], msg.get("owner") or OWNER)
 
 
 # ── Kiro Crew settings the app may change ────────────────────────────────────
@@ -6654,6 +6687,68 @@ def beating(sb: Supabase, sid: str):
         stop.set()
 
 
+# ── Never two runs on one account (red-team B2, seen live on 30 Oct) ─────────────────────────
+# A hand-off successor restored for ~10 minutes after its predecessor stopped, without a heartbeat, and
+# its start time was 23 minutes old: the session function saw no live run, the app showed Offline, and
+# Start launched a second notebook. Both served the same chats (two answers at once in one chat, steers
+# landing in the other run's turn) and saved over the same Storage state. Now a starting run heartbeats
+# the whole time, and every run checks for a rival: the OLDER run keeps the account, the younger one
+# stops at once and never saves, so the account's state has one writer.
+BOOT_BEAT_MAX = HANDOFF_WAIT_MAX + 40 * 60   # a start that hangs longer stops beating and looks dead again
+RIVAL_CHECK_SECS = 60
+RUN_ALIVE_SECS, RUN_BOOT_SECS = 90, 15 * 60  # mirror ALIVE_SECS / BOOT_SECS in supabase/functions/session
+
+
+def boot_beating(sb: Supabase, sid: str, stop: threading.Event):
+    """Heartbeat while the run installs, waits for its predecessor and restores (see above)."""
+    t_end = time.time() + BOOT_BEAT_MAX
+    while not stop.wait(HEARTBEAT_SECS) and time.time() < t_end:
+        with contextlib.suppress(Exception):
+            sb.rest("PATCH", "worker_sessions", params={"id": f"eq.{sid}"}, body={"heartbeat_at": now_iso()})
+
+
+def run_alive(r: dict, now: float) -> bool:
+    """Same rule as isAlive() in the session function."""
+    beat, start = parse_ts(r.get("heartbeat_at")), parse_ts(r.get("started_at"))
+    beat_age = now - beat if beat else float("inf")
+    if r.get("status") in ("running", "stopping"):
+        return beat_age < RUN_ALIVE_SECS
+    if r.get("status") in ("requested", "starting"):
+        return (now - start if start else float("inf")) < RUN_BOOT_SECS or beat_age < RUN_ALIVE_SECS
+    return False
+
+
+def rival_run(sb: Supabase, sid: str, started_at) -> dict | None:
+    """An older live run of this account that this run must give way to, else None. A hand-off pair (this
+    run's predecessor or successor) is not a rival, and neither is a run that was asked to stop."""
+    pred = SESSION_INFO.get("handoff_from")
+    rows = sb.rest("GET", "worker_sessions", params={
+        "owner": f"eq.{OWNER}", "status": "in.(requested,starting,running,stopping)",
+        "stop_requested": "not.is.true", "select": "id,status,started_at,heartbeat_at,info",
+        "order": "started_at.asc", "limit": "10"}) or []
+    now, mine = time.time(), (parse_ts(started_at) or 0.0, sid)
+    for r in rows:
+        if r["id"] in (sid, pred) or (r.get("info") or {}).get("handoff_from") == sid or not run_alive(r, now):
+            continue
+        if (parse_ts(r.get("started_at")) or 0.0, r["id"]) < mine:
+            return r
+    return None
+
+
+def yield_to_rival(sb: Supabase, rival: dict, set_sess):
+    """This run is the second one on the account: stop without saving anything, and tell the owner."""
+    note = (f"A second Panda run had started for your account while run {rival['id'][:8]} was already "
+            "starting or serving it. The second one stopped by itself without saving, so your chats and "
+            "files stay as the first run has them.")
+    log(f"another run ({rival['id']}) already serves this account; this run stops and saves nothing")
+    SESSION_INFO["stop_reason"] = f"duplicate: run {rival['id']} already serves this account"
+    with contextlib.suppress(Exception):
+        sb.rest("POST", "notifications", body={"owner": OWNER, "source": "panda", "text": note,
+                                               "meta": {"kind": "duplicate_run", "title": "Panda",
+                                                        "ts": f"dup-{int(time.time())}"}})
+    set_sess(status="stopped", stopped_at=now_iso(), info=SESSION_INFO)
+
+
 def main():
     sb = Supabase()
     sess = claim_session(sb)
@@ -6665,7 +6760,13 @@ def main():
 
     gw_proc = None
     ho = {"to": None, "tries": 0, "last": None}
+    boot_beat = threading.Event()
     try:
+        rival = _safe(rival_run, sb, sid, sess.get("started_at"))
+        if rival:  # before touching anything: the older run keeps the account
+            yield_to_rival(sb, rival, set_sess)
+            return
+        threading.Thread(target=boot_beating, args=(sb, sid, boot_beat), daemon=True, name="boot-beat").start()
         pred = SESSION_INFO.get("handoff_from")
         # Download the saved state while Kiro installs. A successor must not read it before the previous
         # run has saved, so it keeps the old order.
@@ -6709,6 +6810,12 @@ def main():
         # Kiro Crew settings changed in the app, re-applied in case the snapshot predates them.
         apply_overrides(gw, user_settings(sb, OWNER).get("crewOverrides"))
         start_video(sb, gw)
+        # Last check before this run writes anything to the account's state or answers a message.
+        rival = _safe(rival_run, sb, sid, sess.get("started_at"))
+        if rival:
+            boot_beat.set()
+            yield_to_rival(sb, rival, set_sess)
+            return
         # First chunked save in the background now (it uploads everything once, ~1-2 min), so a Stop
         # soon after Start only sends what changed instead of paying for the whole first copy.
         threading.Thread(target=_safe, args=(kiro_save, sb), daemon=True, name="kiro-first-save").start()
@@ -6742,6 +6849,7 @@ def main():
         log("start timings (s since script start):", START_STEPS)
         SESSION_INFO.pop("handoff_ready", None)
         set_sess(status="running", heartbeat_at=now_iso(), info=SESSION_INFO)
+        boot_beat.set()   # the main loop heartbeats from here on
         USAGE_STATE["sid"] = sid
         # Warm the Kiro account total now (a forced scrape can take ~a minute), so the app shows a
         # real number instead of 0 as soon as it opens, not after Crew's 10-minute cache fills.
@@ -6750,7 +6858,7 @@ def main():
 
         seen: set = set()
         last_hb = last_nt = 0.0
-        last_snap = time.time()
+        last_snap = last_rival = time.time()
         reason = "stop requested"
         loop_err_since = None
         RUNNING[0] = True
@@ -6775,6 +6883,12 @@ def main():
                     beat = True
                 else:
                     beat = False
+                if time.time() - last_rival > RIVAL_CHECK_SECS:
+                    last_rival = time.time()
+                    rival = rival_run(sb, sid, sess.get("started_at"))
+                    if rival:
+                        reason = "duplicate"
+                        break
                 step = handoff_step(sb, sid, ho, set_sess, beat)
                 loop_err_since = None
             except Exception as exc:
@@ -6829,6 +6943,14 @@ def main():
 
         log("stopping:", reason)
         stop_evt.set()
+        if reason == "duplicate":
+            # The older run keeps the account: no drain, no browser/Codex copy, no snapshot, no successor.
+            stop_answers(sb, gw, "stop requested")   # a short grace, then running answers are stopped
+            pool.shutdown(wait=False, cancel_futures=True)
+            if gw_proc and gw_proc.poll() is None:
+                sh("kirocrew stop", timeout=60)
+            yield_to_rival(sb, rival, set_sess)
+            return
         set_sess(status="stopping")
         # Keep beating while turns finish and the snapshot uploads: the app and the `session` function
         # treat a run that is silent for 90 s as dead.
@@ -6862,6 +6984,7 @@ def main():
         SESSION_INFO.update(stop_reason=reason, runtime_secs=round(time.time() - T0))
         set_sess(status="stopped", stopped_at=now_iso(), last_snapshot=snap_at, info=SESSION_INFO)
     except Exception as exc:
+        boot_beat.set()
         log("FATAL:", exc)
         log(traceback.format_exc()[-1500:])
         SESSION_INFO["error"] = scrub(exc)[:500]
@@ -6873,6 +6996,7 @@ def main():
             pass
         raise
     finally:
+        boot_beat.set()
         if gw_proc and gw_proc.poll() is None:
             sh("kirocrew stop", timeout=60)
             try:
