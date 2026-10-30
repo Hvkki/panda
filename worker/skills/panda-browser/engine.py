@@ -50,6 +50,39 @@ MOBILE_W = 400
 MOBILE_DPR = 1.5
 MOBILE_FRAME_GAP = 0.12  # sharp frames are bigger: at most ~8 a second
 HOME_URL = "https://www.google.com/"
+UPLOAD_ROOTS = ("outputs", "work", "uploads")    # the only folders a file may be uploaded to a site from
+UPLOAD_MAX = 2 << 30
+
+
+def upload_paths(paths, home: Path | None = None) -> list:
+    """Real paths of files the agent may upload to a website, or ValueError with a one-line reason.
+    Only regular files under ~/outputs, ~/work or ~/uploads (after resolving links), at most 2 GB in all:
+    never Panda's keys, logins or code (~/.panda, ~/.kiro, ~/.ssh) or anything outside the home folder."""
+    home = Path(home or HOME).resolve()
+    roots = [home / r for r in UPLOAD_ROOTS]
+    if not paths:
+        raise ValueError("no file given")
+    out, total = [], 0
+    for p in paths:
+        if not isinstance(p, str) or not p.strip() or "\0" in p:
+            raise ValueError("bad file path")
+        raw = Path(os.path.expanduser(p.strip()))
+        if not raw.is_absolute():
+            raw = home / raw
+        real = Path(os.path.realpath(raw))
+        if not any(real == r or r in real.parents for r in roots):
+            raise ValueError(f"{raw.name}: only files under ~/outputs, ~/work or ~/uploads can be uploaded")
+        try:
+            st = real.stat()
+        except OSError:
+            raise ValueError(f"{raw.name}: file not found") from None
+        if not real.is_file():
+            raise ValueError(f"{raw.name}: not a regular file")
+        total += st.st_size
+        if total > UPLOAD_MAX:
+            raise ValueError("the files add up to more than 2 GB")
+        out.append(str(real))
+    return out
 # The app's language -> what the browser tells websites (navigator.language, Accept-Language).
 LANGS = {"en": "en-US,en", "it": "it-IT,it,en", "uk": "uk-UA,uk,en"}
 SEARCH_URL = "https://www.google.com/search?q="
@@ -970,6 +1003,38 @@ class Engine:
             await self.announce("hover", f"Pointing at {self._target(r['ref'])}", await self._box(loc))
             await loc.hover(timeout=8000)
             await self.settle(0.15)
+        elif op == "upload":
+            try:
+                files = upload_paths(r.get("paths") or [])
+            except ValueError as exc:
+                return {"ok": False, "error": f"upload refused: {exc}"}
+            names = ", ".join(os.path.basename(f) for f in files)
+            loc = self._loc(r["ref"])
+            await self.announce("type", f"Uploading {quoted(names, 50)} to {self._target(r['ref'])}", await self._box(loc))
+            kind = ""
+            with contextlib.suppress(Exception):
+                kind = ((await loc.evaluate("e => e.tagName + ':' + (e.type || '')", timeout=3000)) or "").lower()
+            how = ""
+            if kind == "input:file":
+                await loc.set_input_files(files, timeout=10000)
+                how = "file input"
+            else:
+                try:   # a button that opens the system file picker: answer the picker instead
+                    async with page.expect_file_chooser(timeout=10000) as fc:
+                        await loc.click(timeout=8000)
+                    await (await fc.value).set_files(files, timeout=10000)
+                    how = "file picker"
+                except Exception:
+                    inputs = page.locator("input[type=file]")
+                    if await inputs.count() == 1:   # several: the agent must name the right one by its ref
+                        await inputs.first.set_input_files(files, timeout=10000)
+                        how = "the page's file input"
+            if not how:
+                return {"ok": False, "error": "nothing here accepted the file: no picker opened and the page has "
+                                              "no single file input. Click the upload button first, take a snapshot, "
+                                              "and pass the ref of the file field."}
+            await self.settle(0.8)
+            out_extra = {"uploaded": [os.path.basename(f) for f in files], "via": how}
         elif op == "press":
             await self.announce("key", f"Pressing {r['key']}", key=str(r["key"])[:30])
             await page.keyboard.press(r["key"])
@@ -1054,7 +1119,10 @@ class Engine:
             return {"ok": await self.save_state()}
         else:
             return {"ok": False, "error": f"unknown op {op}"}
-        return await self.summary(snap=want_snap, full=bool(r.get("full")))
+        out = await self.summary(snap=want_snap, full=bool(r.get("full")))
+        if op == "upload" and isinstance(out, dict):
+            out.update(out_extra)
+        return out
 
 
 PID_PATH = HOME / ".panda/engine.pid"

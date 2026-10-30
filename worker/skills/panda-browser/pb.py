@@ -7,6 +7,7 @@
   pb type <ref> "text" [--submit]
   pb select <ref> "value" ["value2" …]   choose option(s) in a dropdown
   pb hover <ref>                point at an element (menus that open on hover)
+  pb upload <ref> FILE [FILE …] put a file in an upload field or button (files under ~/outputs ~/work ~/uploads)
   pb press <Key>                Enter, Tab, Escape, ArrowDown, Control+a …
   pb scroll [down|up] [pixels]
   pb back | forward | reload
@@ -127,6 +128,11 @@ def parse(argv: list[str]) -> dict:
         return {"op": "select", "ref": rest[0], "values": rest[1:], **base}
     if op == "hover":
         return {"op": "hover", "ref": rest[0], **base}
+    if op == "upload":
+        if len(rest) < 2:
+            sys.exit("usage: pb upload <ref> FILE [FILE …]   (files under ~/outputs, ~/work or ~/uploads)")
+        return {"op": "upload", "ref": rest[0],
+                "paths": [os.path.abspath(os.path.expanduser(p)) for p in rest[1:]], **base}
     if op == "press":
         return {"op": "press", "key": rest[0], **base}
     if op == "scroll":
@@ -166,6 +172,8 @@ def main():
         print(out["note"])
     if out.get("saved"):
         print("Saved:", out["saved"])
+    if out.get("uploaded"):
+        print(f"Uploaded {', '.join(out['uploaded'])} (via {out.get('via', '?')}). Check the page for its progress.")
     if "url" in out:
         print("URL:", out["url"])
         print("Title:", out.get("title", ""))

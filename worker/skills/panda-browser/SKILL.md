@@ -15,6 +15,7 @@ pb click e12                    # click by ref
 pb type e7 "my search" --submit # fill a field, press Enter
 pb select e9 "Italy"            # pick an option in a dropdown
 pb hover e4                     # open a menu that appears on hover
+pb upload e21 ~/outputs/banner.png   # a file into an upload field or button (no system picker needed)
 pb scroll down 800
 pb text                         # readable article text (cheaper than the outline)
 pb shot report.png              # save a screenshot to ~/outputs (appears as a file card)
@@ -22,6 +23,12 @@ pb shot report.png              # save a screenshot to ~/outputs (appears as a f
 
 `pb` is an installed command: call it as is. Never define a `pb()` shell function or alias —
 that command can't be auto-approved and the step hangs.
+
+**Uploading a file** (a YouTube banner, a profile picture, an attachment): pass the ref of the upload
+button or file field, e.g. `pb upload e21 ~/outputs/banner.png`. Never click an upload button first: the
+system file picker it opens can't be filled, and the click then times out. Only files under `~/outputs`,
+`~/work` or `~/uploads` can be uploaded (2 GB at most). If it says nothing accepted the file, take a
+snapshot and pass the ref of the file field itself.
 
 
 Each chat and each helper agent gets its own tab automatically, so parallel chats never fight
