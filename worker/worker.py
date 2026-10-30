@@ -48,7 +48,10 @@ import requests
 
 # ── config ───────────────────────────────────────────────────────────────────
 CFG_PATH = (glob.glob("/kaggle/input/**/worker.json", recursive=True) or [None])[0]
-CFG = json.load(open(CFG_PATH)) if CFG_PATH else json.loads(os.environ["KIROCREW_WORKER_CFG"])
+# A test's own fake config wins: on a live Panda machine the real worker.json is present too, and tests
+# that read it acted on the real project (the live worker never sets KIROCREW_WORKER_CFG).
+CFG = (json.loads(os.environ["KIROCREW_WORKER_CFG"]) if os.environ.get("KIROCREW_WORKER_CFG")
+       else json.load(open(CFG_PATH)))
 SB_URL = CFG["supabase_url"].rstrip("/")
 SB_ANON = CFG["supabase_publishable_key"]
 OWNER = CFG["owner_id"]  # replaced by whoever pressed Start (claim_session)
@@ -3810,7 +3813,7 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
             tl_state["busy"] = False
 
     def flusher():
-        seen_think, last_check = 0, 0.0
+        seen_think, last_check, stop_at, hard_sent = 0, 0.0, 0.0, False
         while not stream_done.wait(0.4):
             # "Stop" sets messages.cancel; look for it on its own clock, so it also lands before the
             # first word and during a long silent tool call (when there is nothing to push).
@@ -3820,10 +3823,19 @@ def handle(sb: Supabase, gw: Gateway, msg: dict):
                     row = sb.rest("GET", "messages", params={"id": f"eq.{reply['id']}", "select": "cancel"})
                     if row and row[0].get("cancel"):
                         cancelled.set()
+                        stop_at = time.time()
                         log(f"chat {chat['id']}: stop pressed")
                         gw.call("POST", f"/api/chat/slots/{slot}/stop")
                 except Exception as exc:
                     log("stop check failed:", type(exc).__name__)
+            # Crew's first stop is cooperative: it waits for the running tool to end (a long command kept
+            # the Developer chat "unstoppable" for minutes, and more presses in the app sent nothing). Its
+            # second stop call kills the turn at once, so send it when the first has not worked in time.
+            # Not for a restart's pause, which must keep the session as it is.
+            if stop_at and not hard_sent and not RESTARTING.is_set() and time.time() - stop_at > STOP_HARD_AFTER:
+                hard_sent = True
+                log(f"chat {chat['id']}: still running {STOP_HARD_AFTER} s after Stop; stopping it hard")
+                _safe(gw.call, "POST", f"/api/chat/slots/{slot}/stop")
             if tl_on and tools and time.time() - tl_state.get("mach", 0) >= 10 and time.time() - t0 > TL_AFTER:
                 # What is running on the machine now (free: read from /proc, shared by all chats)
                 tl_state["mach"] = time.time()
@@ -4018,6 +4030,7 @@ def approve_background(gw: Gateway, sb: Supabase):
 BUSY_CHATS: set = set()
 BUSY_LOCK = threading.Lock()
 BUSY_SLOTS: dict = {}  # chat id -> {"slot", "since"} while that chat's turn is streaming (for steering)
+STOP_HARD_AFTER = int(CFG.get("stop_hard_after_secs", 10))   # Stop: then Crew's second (hard) stop
 
 # ── follow-ups: answers Crew writes into a slot with no Panda message behind them ──
 # A chat that starts helpers (spawn_run) ends its turn right away. When they finish, Kiro Crew

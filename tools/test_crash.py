@@ -14,11 +14,19 @@ os.environ.setdefault("KIROCREW_WORKER_CFG", json.dumps({
     "kiro_api_key": "ksk_fake_for_local_tests", "worker_password": "fake-worker-password-123",
     "worker_email": "worker@example.invalid"}))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "worker"))
+# main() runs here: on a live Panda machine it must not touch the real ~/.panda or /kaggle/working.
+# On 30 Oct this test rewrote the live ~/.panda/browser.json with an empty channel (the browser went dark
+# for 1.5 h) and rewrote the live gateway.log under the running gateway.
+_REAL_HOME = os.path.expanduser("~")
+os.environ["HOME"] = tempfile.mkdtemp(prefix="crash-home-")
 _cwd = os.getcwd()
 os.chdir(tempfile.mkdtemp(prefix="crash-cwd-"))
 import worker as W  # noqa: E402
 
 os.chdir(_cwd)
+W.WORK = tempfile.mkdtemp(prefix="crash-work-")
+assert W.BROWSER_CFG != os.path.join(_REAL_HOME, ".panda/browser.json"), "test would write the live browser config"
+assert W.WORK != "/kaggle/working", "test would rewrite the live gateway.log"
 EVENTS: list = []
 
 
@@ -73,7 +81,10 @@ def setup(sb, gw_dead=False, install_raises=False, successor_ok=True):
                  "start_codex", "start_stt", "apply_overrides", "start_video", "kiro_save", "command_loop",
                  "thinking_listener", "followup_loop", "job_watch_loop", "brief_loop", "guard_loop", "remote_loop",
                  "thinking_pusher", "resume_interrupted", "claim_loop", "usage_now", "drain_turns", "stop_answers",
-                 "stop_browser", "codex_backup", "snapshot_files_later", "clean_work", "push"):
+                 "stop_browser", "codex_backup", "snapshot_files_later", "clean_work", "push",
+                 "browser_config", "browser_backup", "mirror_notifications", "mirror_issues", "approve_background",
+                 "refresh_usage", "keys_loop", "hang_loop", "drive_trash_loop", "gc_loop", "resume_followups",
+                 "warn_before_shutdown"):
         setattr(W, name, noop)
     W.user_settings = lambda *a: {}
     W.sh = lambda cmd, **k: EVENTS.append(("sh", cmd))
