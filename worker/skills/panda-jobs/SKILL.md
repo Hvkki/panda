@@ -48,11 +48,12 @@ running answer, or starts a new turn if you already ended yours.
   suites, training. **Not sure? Use a job**: it costs nothing.
 - Two or more independent long commands: start each as its own job so they run at the same time.
 
-### --remote: run it on remote Panda (a second machine)
+### --remote: run it on remote Panda (up to 5 more machines)
 This machine (4 CPUs, ~30 GB) also runs Panda itself. A heavy command (a full video render, many headless
 browsers, big ffmpeg batches, data runs that need lots of memory) can run on **remote Panda** instead: a
-second Kaggle notebook with its own 4 CPUs and ~30 GB. Panda starts it when needed (about 1 minute) and it
-stops itself after 20 idle minutes. It costs no credits; it has ffmpeg, node, npm, git and Python, but
+pool of up to 5 extra Kaggle notebooks, each with its own 4 CPUs and ~30 GB, 2 jobs per notebook. Panda
+starts another notebook when the running ones are full (about 1 minute each) and each stops itself after
+20 idle minutes. Split big work into independent jobs started together, and they run side by side. It costs no credits; it has ffmpeg, node, npm, git and Python, but
 none of your chats or the browser.
 
 ```bash

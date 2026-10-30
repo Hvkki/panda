@@ -113,7 +113,7 @@ async function remoteStart(admin: Admin, body: Row): Promise<Response> {
   if (!token || !fallback || !dataset) return json({ error: "function secrets are not set" }, 500);
   if (body.op !== "start") return json({ error: "unknown remote op" }, 400);
   const rid = String(body.remote_id || "r1");
-  if (!/^r[1-4]$/.test(rid)) return json({ error: "remote_id must be r1-r4" }, 400);
+  if (!/^r[1-5]$/.test(rid)) return json({ error: "remote_id must be r1-r5" }, 400);
   const sid = String(body.session_id || "");
   const { data: cur } = await admin.from("worker_sessions").select("*").eq("id", sid).maybeSingle();
   if (!cur) return json({ error: "no such run" }, 404);

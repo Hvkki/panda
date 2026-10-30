@@ -23,7 +23,8 @@ import worker as W  # noqa: E402
 
 KAGGLE = "--kaggle" in sys.argv
 RID = "r4" if KAGGLE else "rtest"
-W.REMOTE_ID = RID
+W.REMOTE_IDS = [RID]   # only this test notebook: never the live r1-r5
+W.REMOTE = {RID: {"asked": 0.0, "queue": {"tasks": {}}, "failed": 0.0}}
 HOME = os.path.expanduser("~")
 SRC = f"{HOME}/work/rtest-src"
 JOBS = os.path.join(HERE, "..", "worker", "skills", "panda-jobs", "jobs.py")
@@ -32,7 +33,7 @@ sb = W.Supabase()
 procs = []
 
 
-def start_local(_sb) -> str:
+def start_local(_sb, _rid) -> str:
     rhome = f"{HOME}/work/rtest-remote-home"
     shutil.rmtree(rhome, ignore_errors=True)
     os.makedirs(rhome)
@@ -43,7 +44,7 @@ def start_local(_sb) -> str:
     return "local"
 
 
-def start_kaggle(_sb) -> str:
+def start_kaggle(_sb, _rid) -> str:
     """What the session function's remoteStart does, with the dev token."""
     text = open(os.path.join(HERE, "..", "worker", "remote.py")).read()
     text = (text.replace('INJECTED_OWNER = ""', f'INJECTED_OWNER = "{W.OWNER}"', 1)
@@ -112,11 +113,11 @@ try:
     print(pjob("stop", "rt-stop").strip())
     t1 = time.time()
     while time.time() - t1 < 90:
-        b = W.remote_get_json(sb, "beat.json") or {}
+        b = W.remote_get_json(sb, RID, "beat.json") or {}
         if not b.get("running") and time.time() - b.get("at", 0) < 30 and b.get("at", 0) > t1:
             break
         time.sleep(3)
-    b = W.remote_get_json(sb, "beat.json") or {}
+    b = W.remote_get_json(sb, RID, "beat.json") or {}
     assert not b.get("running"), f"remote still runs {b.get('running')}"
     print(f"ok: pjob stop ended the remote command in {time.time() - t1:.0f}s")
     print("remote tools:", b.get("tools"), "cpus", b.get("cpus"), "free MB", b.get("free_mb"))
@@ -152,10 +153,10 @@ try:
     leftover = [n for n in os.listdir(f"{W.REMOTE_BOX}/req")] if os.path.isdir(f"{W.REMOTE_BOX}/req") else []
     assert not leftover, leftover
 finally:
-    W.remote_queue_edit(sb, lambda q: q.__setitem__("stop", True))
+    W.remote_queue_edit(sb, RID, lambda q: q.__setitem__("stop", True))
     t2 = time.time()
     while time.time() - t2 < 60:
-        b = W.remote_get_json(sb, "beat.json") or {}
+        b = W.remote_get_json(sb, RID, "beat.json") or {}
         if b.get("state") == "stopped":
             print("ok: remote stopped itself when asked")
             break
@@ -167,4 +168,4 @@ finally:
         except subprocess.TimeoutExpired:
             p.kill()
     for n in ("queue.json", "beat.json"):
-        sb.delete_object(W.state_key(W.rkey(n)))
+        sb.delete_object(W.state_key(W.rkey(RID, n)))

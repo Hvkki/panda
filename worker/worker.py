@@ -4989,39 +4989,44 @@ def hang_loop(sb: "Supabase", gw, stop: threading.Event):
 # through the session function (the Kaggle token stays there), uploads --files, queues the task, copies
 # the remote log back as it grows, and brings back changed files under the --out paths.
 REMOTE_BOX = os.environ.get("PANDA_REMOTE_BOX") or os.path.expanduser("~/.panda/remote")
-REMOTE_ID = os.environ.get("PANDA_REMOTE_ID", "r1")
+# Up to REMOTE_MAX notebooks r1..rN (the session function allows r1-r5). A task goes to a live one with a free
+# slot, else a new one is started, else it waits on the least busy one.
+REMOTE_MAX = max(1, min(5, int(CFG.get("remote_max", 5))))
+REMOTE_IDS = [f"r{i}" for i in range(1, REMOTE_MAX + 1)]
+REMOTE_PARALLEL = int(CFG.get("remote_parallel", 2))      # = remote.py's MAX_PARALLEL
 REMOTE_MAX_IN = int(CFG.get("remote_max_in_mb", 3000)) * MiB
 REMOTE_BOOT_WAIT = 900
 REMOTE_ASK_GAP = 480
 REMOTE_WAIT_NOTE = 240     # while a task waits (boot or a free slot), a progress line this often
-REMOTE = {"lock": threading.Lock(), "asked": 0.0, "queue": {"tasks": {}}}
+REMOTE_LOCK = threading.Lock()
+REMOTE = {rid: {"asked": 0.0, "queue": {"tasks": {}}, "failed": 0.0} for rid in REMOTE_IDS}
 REMOTE_SEEN: set = set()
 
 
-def rkey(*parts) -> str:
-    return "/".join(["remote", REMOTE_ID, *parts])
+def rkey(rid: str, *parts) -> str:
+    return "/".join(["remote", rid, *parts])
 
 
-def remote_get_json(sb: "Supabase", *parts):
-    raw = sb.get_fresh(state_key(rkey(*parts)))
+def remote_get_json(sb: "Supabase", rid: str, *parts):
+    raw = sb.get_fresh(state_key(rkey(rid, *parts)))
     try:
         return json.loads(raw) if raw else None
     except ValueError:
         return None
 
 
-def remote_put_json(sb: "Supabase", obj, *parts):
-    sb.put(state_key(rkey(*parts)), json.dumps(obj).encode(), mime="application/json")
+def remote_put_json(sb: "Supabase", obj, rid: str, *parts):
+    sb.put(state_key(rkey(rid, *parts)), json.dumps(obj).encode(), mime="application/json")
 
 
 def remote_alive(b) -> bool:
     return bool(b) and b.get("state") == "running" and time.time() - float(b.get("at") or 0) < 90
 
 
-def remote_request_start(sb: "Supabase") -> str:
+def remote_request_start(sb: "Supabase", rid: str) -> str:
     """Ask the session function to push remote.py to this account's remote notebook. Returns its name."""
     r = requests.post(f"{SB_URL}/functions/v1/session", headers=sb.headers(), timeout=120,
-                      json={"action": "remote", "op": "start", "remote_id": REMOTE_ID,
+                      json={"action": "remote", "op": "start", "remote_id": rid,
                             "session_id": USAGE_STATE.get("sid", "")})
     try:
         body = r.json()
@@ -5038,43 +5043,72 @@ def remote_request_start(sb: "Supabase") -> str:
 REMOTE_STARTER = remote_request_start      # tests swap this for a direct Kaggle push
 
 
-def remote_queue_edit(sb: "Supabase", fn):
-    """queue.json has one writer, this worker; the remote only reads it."""
-    with REMOTE["lock"]:
-        fn(REMOTE["queue"])
-        REMOTE["queue"]["at"] = time.time()
-        remote_put_json(sb, REMOTE["queue"], "queue.json")
+def remote_queue_edit(sb: "Supabase", rid: str, fn):
+    """Each queue.json has one writer, this worker; its remote only reads it."""
+    with REMOTE_LOCK:
+        q = REMOTE[rid]["queue"]
+        fn(q)
+        q["at"] = time.time()
+        remote_put_json(sb, q, rid, "queue.json")
 
 
-def remote_ensure(sb: "Supabase", note, cancelled) -> bool:
+def remote_load(rid: str) -> int:
+    """Tasks this worker has given notebook `rid` that have not ended (queued or running there)."""
+    return len(REMOTE[rid]["queue"].get("tasks") or {}) + len(REMOTE[rid].get("held") or ())
+
+
+def remote_pick(sb: "Supabase", tid: str, avoid=()) -> str:
+    """Choose a notebook for task `tid` and hold a place on it (released by remote_release)."""
+    beats = {rid: remote_get_json(sb, rid, "beat.json") for rid in REMOTE_IDS if rid not in avoid}
+    with REMOTE_LOCK:
+        now = time.time()
+        alive = [r for r, b in beats.items() if remote_alive(b)]
+        booting = [r for r in beats if r not in alive and now - REMOTE[r]["asked"] < REMOTE_BOOT_WAIT]
+        free = [r for r in beats if r not in alive and r not in booting and now - REMOTE[r]["failed"] > 600]
+        pick = (min((r for r in alive + booting if remote_load(r) < REMOTE_PARALLEL), key=remote_load, default="")
+                or (free[0] if free else "")
+                or min(alive + booting or list(beats) or REMOTE_IDS[:1], key=remote_load))
+        REMOTE[pick].setdefault("held", set()).add(tid)
+        return pick
+
+
+def remote_release(rid: str, tid: str):
+    with REMOTE_LOCK:
+        REMOTE[rid].get("held", set()).discard(tid)
+
+
+def remote_ensure(sb: "Supabase", rid: str, note, cancelled) -> bool:
     deadline = time.time() + REMOTE_BOOT_WAIT
     t0 = last_note = time.time()
     while time.time() < deadline:
         if cancelled():
             return False
-        if remote_alive(remote_get_json(sb, "beat.json")):
+        if remote_alive(remote_get_json(sb, rid, "beat.json")):
             return True
-        with REMOTE["lock"]:
-            due = time.time() - REMOTE["asked"] > REMOTE_ASK_GAP
+        with REMOTE_LOCK:
+            due = time.time() - REMOTE[rid]["asked"] > REMOTE_ASK_GAP
             if due:
-                REMOTE["asked"] = time.time()
+                REMOTE[rid]["asked"] = time.time()
         if due:
             last_note = time.time()
-            note("starting remote Panda on Kaggle (usually 1-3 min)")
+            note(f"starting remote Panda {rid} on Kaggle (usually 1-3 min)")
             try:
-                k = REMOTE_STARTER(sb)
+                k = REMOTE_STARTER(sb, rid)
                 note(f"remote notebook {k or '?'} started, waiting for it to come up")
             except Exception as exc:
-                with REMOTE["lock"]:
-                    REMOTE["asked"] = 0.0
-                note(f"could not start remote Panda: {scrub(exc)[:240]}")
+                with REMOTE_LOCK:
+                    REMOTE[rid]["asked"] = 0.0
+                    REMOTE[rid]["failed"] = time.time()   # e.g. Kaggle's limit on notebooks at once
+                note(f"could not start remote Panda {rid}: {scrub(exc)[:240]}")
                 return False
         elif time.time() - last_note >= REMOTE_WAIT_NOTE:
             # A quiet log looks like a hang to the job watcher (--stall): say that this is a wait.
             last_note = time.time()
-            note(f"still waiting for remote Panda to come up ({_fmt_secs(time.time() - t0)})")
+            note(f"still waiting for remote Panda {rid} to come up ({_fmt_secs(time.time() - t0)})")
         time.sleep(10)
-    note(f"remote Panda did not come up in {REMOTE_BOOT_WAIT // 60} min")
+    with REMOTE_LOCK:
+        REMOTE[rid]["failed"] = time.time()
+    note(f"remote Panda {rid} did not come up in {REMOTE_BOOT_WAIT // 60} min")
     return False
 
 
@@ -5098,15 +5132,26 @@ def remote_task(sb: "Supabase", req: dict):
     def cancelled() -> bool:
         return os.path.exists(f"{d}/cancel")
 
-    rc, queued = 255, False
+    rc, queued, rid = 255, False, ""
     try:
         files = [_home_rel(p, True) for p in req.get("files") or []]
         outs = [_home_rel(p, False) for p in req.get("out") or []] or files
         cwd = req.get("cwd") or HOME
         cwd = os.path.relpath(cwd, HOME) if os.path.realpath(cwd).startswith(HOME + "/") else "."
-        if not remote_ensure(sb, note, cancelled):
-            rc = 143 if cancelled() else 255
-            return
+        tried: list = []
+        while True:
+            rid = remote_pick(sb, tid, avoid=tried)
+            open(f"{d}/rid", "w").write(rid)
+            if remote_ensure(sb, rid, note, cancelled):
+                break
+            remote_release(rid, tid)
+            tried.append(rid)
+            alive = [r for r in REMOTE_IDS if r not in tried and remote_alive(remote_get_json(sb, r, "beat.json"))]
+            if cancelled() or not alive:
+                rc = 143 if cancelled() else 255
+                rid = ""
+                return
+            note(f"trying another remote Panda ({len(alive)} already running)")
         if files:
             t1, arc = time.time(), f"{WORK}/remote-{tid}-in.tar.gz"
             try:
@@ -5117,7 +5162,7 @@ def remote_task(sb: "Supabase", req: dict):
                 if size > REMOTE_MAX_IN:
                     raise ValueError(f"--files pack to {size >> 20} MB, over the {REMOTE_MAX_IN >> 20} MB limit; "
                                      "send only what the command needs")
-                blob_save(sb, rkey("tasks", tid, "in.tar.gz"), arc)
+                blob_save(sb, rkey(rid, "tasks", tid, "in.tar.gz"), arc)
                 note(f"sent {len(files)} path(s), {size >> 20} MB packed, in {time.time() - t1:.0f}s")
             finally:
                 with contextlib.suppress(OSError):
@@ -5129,11 +5174,12 @@ def remote_task(sb: "Supabase", req: dict):
                      "effort": str(agent.get("effort") or ""), "results": _home_rel(agent.get("results") or "", False)}
         remote_put_json(sb, {"tid": tid, "cmd": req["cmd"], "cwd": cwd, "setup": req.get("setup") or "",
                              "out": outs, "files": files, "has_input": bool(files), "agent": agent, "at": time.time()},
-                        "tasks", tid, "task.json")
+                        rid, "tasks", tid, "task.json")
         def add(q):
             q.setdefault("tasks", {})[tid] = {"cancel": False}
             q["stop"] = False          # a Stop from the app's panel ends that notebook, not later jobs
-        remote_queue_edit(sb, add)
+        remote_queue_edit(sb, rid, add)
+        remote_release(rid, tid)          # now counted through the queue
         queued = True
         got, stale, cancel_at, last_check = 0, 0, 0.0, time.time()
         t_queued = last_wait_note = time.time()
@@ -5141,10 +5187,10 @@ def remote_task(sb: "Supabase", req: dict):
             time.sleep(4)
             if cancelled() and not cancel_at:
                 cancel_at = time.time()
-                remote_queue_edit(sb, lambda q: q["tasks"].__setitem__(tid, {"cancel": True}))
-            st = remote_get_json(sb, "tasks", tid, "status.json") or {}
+                remote_queue_edit(sb, rid, lambda q: q["tasks"].__setitem__(tid, {"cancel": True}))
+            st = remote_get_json(sb, rid, "tasks", tid, "status.json") or {}
             if int(st.get("log_bytes") or 0) > got:
-                raw = sb.get_fresh(state_key(rkey("tasks", tid, "log"))) or b""
+                raw = sb.get_fresh(state_key(rkey(rid, "tasks", tid, "log"))) or b""
                 frm = int(st.get("log_from") or 0)
                 if os.environ.get("PANDA_REMOTE_DEBUG"):
                     log(f"remote {tid}: status {st.get('state')} log_bytes {st.get('log_bytes')} from {frm}, "
@@ -5160,7 +5206,7 @@ def remote_task(sb: "Supabase", req: dict):
                 if st.get("out"):
                     arc = f"{WORK}/remote-{tid}-out.tar.gz"
                     try:
-                        if blob_load(sb, rkey("tasks", tid, "out.tar.gz"), arc):
+                        if blob_load(sb, rkey(rid, "tasks", tid, "out.tar.gz"), arc):
                             ok, bad = extract_archive(arc, HOME, sorted({o.split("/")[0] for o in outs}))
                             note(f"brought back {ok} file(s), {os.path.getsize(arc) >> 20} MB packed"
                                  + (f", {bad} skipped" if bad else ""))
@@ -5173,10 +5219,10 @@ def remote_task(sb: "Supabase", req: dict):
                 break
             if time.time() - last_check >= 60:
                 last_check = time.time()
-                beat = remote_get_json(sb, "beat.json")
+                beat = remote_get_json(sb, rid, "beat.json")
                 stale = 0 if remote_alive(beat) else stale + 1
                 if stale >= 3:
-                    note("remote Panda stopped while running this (its notebook ended)")
+                    note(f"remote Panda {rid} stopped while running this (its notebook ended)")
                     break
                 # Waiting for a free slot there (it runs a few tasks at once): say so, or the job watcher
                 # takes the quiet log for a hang and wakes the chat for nothing.
@@ -5184,29 +5230,40 @@ def remote_task(sb: "Supabase", req: dict):
                         and time.time() - last_wait_note >= REMOTE_WAIT_NOTE):
                     last_wait_note = time.time()
                     busy = len((beat or {}).get("running") or [])
-                    note(f"waiting for a free slot on remote Panda ({busy} task(s) running there, "
+                    note(f"waiting for a free slot on remote Panda {rid} ({busy} task(s) running there, "
                          f"{_fmt_secs(time.time() - t_queued)} so far)")
     except Exception as exc:
         note(f"error: {scrub(exc)[:300]}")
         rc = 143 if cancelled() else 255
     finally:
         with contextlib.suppress(Exception):
+            if rid:
+                remote_release(rid, tid)
             if queued:
-                remote_queue_edit(sb, lambda q: q["tasks"].pop(tid, None))
-            for n in ("in.tar.gz", "out.tar.gz"):
-                k = rkey("tasks", tid, n)
+                remote_queue_edit(sb, rid, lambda q: q["tasks"].pop(tid, None))
+            for n in ("in.tar.gz", "out.tar.gz") if rid else ():
+                k = rkey(rid, "tasks", tid, n)
                 _forget_old(sb, k, _manifest_get(sb, k), keep_single=False, keep_manifest=False)
-            for n in ("task.json", "status.json", "log"):
-                sb.delete_object(state_key(rkey("tasks", tid, n)))
+            for n in ("task.json", "status.json", "log") if rid else ():
+                sb.delete_object(state_key(rkey(rid, "tasks", tid, n)))
         logf.close()
         open(f"{d}/exit", "w").write(str(rc))   # last: the proxy has the whole log once it sees this
         log(f"remote {tid}: exit {rc}")
 
 
 def remote_status(sb: "Supabase") -> dict:
-    """For the app's Remote Panda panel: is the second notebook up, and what is it running."""
-    b = remote_get_json(sb, "beat.json") or {}
-    alive = remote_alive(b)
+    """For the app's Remote Panda panel: which notebooks are up, and what they run.
+
+    The top-level fields describe the first live notebook (or r1), as before; `boxes` lists all of them."""
+    boxes = []
+    for rid in REMOTE_IDS:
+        b = remote_get_json(sb, rid, "beat.json") or {}
+        on = remote_alive(b)
+        if on or b or rid == "r1":
+            boxes.append({"id": rid, "alive": on, "state": b.get("state") if b else "never started", "at": b.get("at"),
+                          "since": b.get("started"), "cpus": b.get("cpus"), "free_mb": b.get("free_mb"),
+                          "load": b.get("load"), "running": b.get("running") or []})
+    first = next((x for x in boxes if x["alive"]), boxes[0])
     jobs = []
     jd = f"{REMOTE_BOX}/jobs"
     for tid in sorted(os.listdir(jd))[-30:] if os.path.isdir(jd) else []:
@@ -5219,12 +5276,14 @@ def remote_status(sb: "Supabase") -> dict:
             continue
         if ended and time.time() - started > 6 * 3600:
             continue
-        jobs.append({"id": tid, "name": tid.rsplit("-", 2)[0], "running": not ended,
+        rid = ""
+        with contextlib.suppress(OSError):
+            rid = open(f"{d}/rid").read().strip()
+        jobs.append({"id": tid, "name": tid.rsplit("-", 2)[0], "running": not ended, "box": rid,
                      "exit": int(rc) if rc and rc.lstrip("-").isdigit() else None, "started": started,
                      "agent": os.path.exists(f"{d}/agent")})
-    return {"alive": alive, "state": b.get("state") if b else "never started", "at": b.get("at"),
-            "since": b.get("started"), "cpus": b.get("cpus"), "free_mb": b.get("free_mb"), "load": b.get("load"),
-            "running": b.get("running") or [], "jobs": jobs[::-1], "remote_id": REMOTE_ID}
+    return {**{k: v for k, v in first.items() if k != "id"}, "alive": any(x["alive"] for x in boxes),
+            "jobs": jobs[::-1], "remote_id": first["id"], "boxes": boxes, "max": REMOTE_MAX}
 
 
 def remote_stop(sb: "Supabase") -> dict:
@@ -5240,7 +5299,10 @@ def remote_stop(sb: "Supabase") -> dict:
         for t in (q.get("tasks") or {}).values():
             t["cancel"] = True
         q["stop"] = True
-    remote_queue_edit(sb, edit)
+    for rid in REMOTE_IDS:
+        if rid == "r1" or REMOTE[rid]["asked"] or REMOTE[rid]["queue"].get("tasks") \
+                or remote_alive(remote_get_json(sb, rid, "beat.json")):
+            remote_queue_edit(sb, rid, edit)
     return {"ok": True, "cancelled": n}
 
 

@@ -284,16 +284,16 @@ def test_remote_boot_wait_prints_progress():
         time = staticmethod(real.time)
         sleep = staticmethod(lambda s: real.sleep(0.01))
 
-    old = (W.REMOTE_BOOT_WAIT, W.REMOTE_WAIT_NOTE, W.remote_get_json, W.REMOTE["asked"])
+    old = (W.REMOTE_BOOT_WAIT, W.REMOTE_WAIT_NOTE, W.remote_get_json, W.REMOTE["r1"]["asked"])
     W.REMOTE_BOOT_WAIT, W.REMOTE_WAIT_NOTE = 0.5, 0.1
     W.remote_get_json = lambda sb, *p: None              # remote Panda is not up yet
-    W.REMOTE["asked"] = real.time()                     # another task already asked for the start
+    W.REMOTE["r1"]["asked"] = real.time()                     # another task already asked for the start
     W.time = Clock
     try:
-        ok = W.remote_ensure(None, notes.append, lambda: False)
+        ok = W.remote_ensure(None, "r1", notes.append, lambda: False)
     finally:
         W.time = real
-        W.REMOTE_BOOT_WAIT, W.REMOTE_WAIT_NOTE, W.remote_get_json, W.REMOTE["asked"] = old
+        W.REMOTE_BOOT_WAIT, W.REMOTE_WAIT_NOTE, W.remote_get_json, W.REMOTE["r1"]["asked"] = old
     assert not ok and any("still waiting for remote Panda" in n for n in notes), notes
 
 

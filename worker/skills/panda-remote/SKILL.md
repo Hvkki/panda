@@ -1,13 +1,17 @@
 ---
 name: panda-remote
-description: "Use remote Panda, a second Kaggle machine (its own 4 CPUs, ~30 GB), for heavy commands and for whole agent tasks that should not load this machine: full renders, many headless browsers, big ffmpeg/data batches, or a self-contained helper task with its own files. Covers pjob --remote and pjob --remote --agent, what comes back, costs and limits."
+description: "Use remote Panda, up to 5 extra Kaggle machines (each with its own 4 CPUs, ~30 GB), for heavy commands and for whole agent tasks that should not load this machine: full renders, many headless browsers, big ffmpeg/data batches, or a self-contained helper task with its own files. Covers pjob --remote and pjob --remote --agent, what comes back, costs and limits."
 triggers: remote panda, remote, second machine, another notebook, offload, heavy render, out of memory, too heavy, parallel machine, remote agent, remote helper, more cpu, more memory
 ---
 
 # Remote Panda
 
-Remote Panda is a second Kaggle notebook of this account. Panda starts it when work comes in (about 1
-minute) and it stops itself after 20 minutes with nothing to do, or when the main Panda goes offline. It
+Remote Panda is a pool of up to 5 extra Kaggle notebooks of this account (r1-r5). Each runs 2 jobs at
+once. Panda puts a job on a running notebook with a free slot, or starts a new one (about 1 minute) when
+they are full, so up to 10 remote jobs run at the same time; more wait for a free slot. Each notebook
+stops itself after 20 minutes with nothing to do, or when the main Panda goes offline. To spread work,
+start each independent piece as its own job (say, 5 render chunks as 5 jobs); never wait for one to end
+before starting the next. It
 has Python, ffmpeg, node, npm and git, but none of the chats, the browser, Kiro Crew tools or the user's
 logins. The user sees it in Settings -> Remote Panda, with a Stop button.
 
@@ -47,7 +51,7 @@ pjob start research-x --remote --agent --model claude-sonnet-5.5 --effort medium
 ## When to use it
 
 - Use it when a step is heavy for minutes (CPU or memory), when this machine is busy (`free -m`, load),
-  or after Panda's guard stopped a command for memory. Two heavy jobs can run there at once.
+  or after Panda's guard stopped a command for memory. Two heavy jobs run on each notebook at once, on up to 5 notebooks.
 - Keep quick commands local: sending files takes time (about 1-2 min per 100 MB there and back).
 - If the remote can't start, the job ends with a `[remote]` line saying why; run it locally in smaller
   pieces and tell the user.
