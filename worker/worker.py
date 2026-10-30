@@ -136,6 +136,24 @@ def sh(cmd: str, timeout: int = 900, check: bool = False) -> subprocess.Complete
 
 
 # ── Supabase (as the restricted worker user, never the secret key) ──────────
+_HTTP = threading.local()
+
+
+def http() -> requests.Session:
+    """One kept-alive connection pool per thread for Supabase. Opening a new TLS connection for every
+    call cost ~60 ms extra per call from Kaggle (measured 30 Oct: 187 ms with a new connection, 125 ms
+    on a kept-alive one; Supabase is in eu-west-1). Only connection errors before a request is sent are
+    retried here (safe for any method); the callers keep their own retry rules."""
+    s = getattr(_HTTP, "s", None)
+    if s is None:
+        from urllib3.util import Retry
+        s = requests.Session()
+        s.mount("https://", requests.adapters.HTTPAdapter(
+            pool_connections=4, pool_maxsize=8, max_retries=Retry(total=2, connect=2, read=0, status=0, redirect=0)))
+        _HTTP.s = s
+    return s
+
+
 class Supabase:
     def __init__(self):
         self.token = ""
@@ -147,7 +165,7 @@ class Supabase:
     def _auth(self, grant: str, body: dict):
         for i in range(5):
             try:
-                r = requests.post(f"{SB_URL}/auth/v1/token?grant_type={grant}", json=body,
+                r = http().post(f"{SB_URL}/auth/v1/token?grant_type={grant}", json=body,
                                   headers={"apikey": SB_ANON}, timeout=(10, 45))
                 if r.status_code < 500 and r.status_code != 429:
                     break
@@ -185,7 +203,7 @@ class Supabase:
         for i in range(7):
             h = self.headers({"Prefer": prefer} if prefer else None)
             try:
-                r = requests.request(method, f"{SB_URL}/rest/v1/{path}", params=params, json=body,
+                r = http().request(method, f"{SB_URL}/rest/v1/{path}", params=params, json=body,
                                      headers=h, timeout=(10, 45))
             except requests.ConnectionError as exc:
                 if i == 6 or (not safe and isinstance(exc, requests.exceptions.ReadTimeout)):
@@ -206,13 +224,13 @@ class Supabase:
 
     def upload(self, name: str, path: str, bucket: str = BUCKET, mime: str = "application/gzip"):
         with open(path, "rb") as f:
-            r = requests.post(f"{SB_URL}/storage/v1/object/{bucket}/{quote(name)}", data=f, timeout=600,
+            r = http().post(f"{SB_URL}/storage/v1/object/{bucket}/{quote(name)}", data=f, timeout=600,
                               headers=self.headers({"x-upsert": "true", "Content-Type": mime}))
         if r.status_code >= 400:
             raise RuntimeError(f"upload {name}: {r.status_code} {r.text[:200]}")
 
     def put(self, name: str, data: bytes, mime: str = "application/octet-stream", bucket: str = BUCKET):
-        r = requests.post(f"{SB_URL}/storage/v1/object/{bucket}/{quote(name)}", data=data, timeout=600,
+        r = http().post(f"{SB_URL}/storage/v1/object/{bucket}/{quote(name)}", data=data, timeout=600,
                           headers=self.headers({"x-upsert": "true", "Content-Type": mime}))
         if r.status_code >= 400:
             raise RuntimeError(f"upload {name}: {r.status_code} {r.text[:200]}")
@@ -223,7 +241,7 @@ class Supabase:
         them as "missing" made Start fail with "kiro chunk ... is missing"."""
         for i in range(6):
             try:
-                r = requests.get(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
+                r = http().get(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
                                  headers=self.headers(), timeout=600)
             except requests.RequestException:
                 r = None
@@ -235,7 +253,7 @@ class Supabase:
         raise RuntimeError(f"storage kept refusing {name} ({r.status_code if r is not None else 'no connection'})")
 
     def exists(self, name: str, bucket: str = BUCKET) -> bool:
-        r = requests.head(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
+        r = http().head(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
                           headers=self.headers(), timeout=30)
         return r.status_code == 200
 
@@ -243,19 +261,19 @@ class Supabase:
         """Like get(), never from the CDN. Supabase's CDN can serve an OVERWRITTEN object for up to 60 s
         at other edges (remote Panda read its old queue.json and a short log that way); a fresh signed
         URL is its own cache key, so it always reaches the origin."""
-        r = requests.post(f"{SB_URL}/storage/v1/object/sign/{bucket}/{quote(name)}", json={"expiresIn": 60},
+        r = http().post(f"{SB_URL}/storage/v1/object/sign/{bucket}/{quote(name)}", json={"expiresIn": 60},
                           headers=self.headers(), timeout=60)
         url = (r.json() if r.status_code == 200 else {}).get("signedURL") if r.text else None
         if not url:
             return None
-        g = requests.get(f"{SB_URL}/storage/v1{url}", timeout=600)
+        g = http().get(f"{SB_URL}/storage/v1{url}", timeout=600)
         return g.content if g.status_code == 200 else None
 
     def delete_object(self, name: str, bucket: str = BUCKET):
         # No JSON Content-Type here: Supabase refuses an empty JSON body with 400, which made every
         # delete fail silently and left every old snapshot part in Storage (11.5 GB by Oct 2026).
         h = {k: v for k, v in self.headers().items() if k != "Content-Type"}
-        r = requests.delete(f"{SB_URL}/storage/v1/object/{bucket}/{quote(name)}", headers=h, timeout=60)
+        r = http().delete(f"{SB_URL}/storage/v1/object/{bucket}/{quote(name)}", headers=h, timeout=60)
         if r.status_code >= 400 and r.status_code != 404 and "not_found" not in r.text:
             log(f"storage delete {name.rsplit('/', 1)[-1]}: {r.status_code} {r.text[:120]}")
 
@@ -265,7 +283,7 @@ class Supabase:
         out, offset, page = [], 0, 100
         head = prefix.rstrip("/")
         while True:
-            r = requests.post(f"{SB_URL}/storage/v1/object/list/{bucket}", timeout=60,
+            r = http().post(f"{SB_URL}/storage/v1/object/list/{bucket}", timeout=60,
                               headers=self.headers(),
                               json={"prefix": f"{head}/" if head else "", "limit": page, "offset": offset,
                                     "sortBy": {"column": "name", "order": "asc"}})
@@ -287,7 +305,7 @@ class Supabase:
         """Like list(), but recurses into sub-folders (for nested prefixes such as remote/<rid>/tasks/)."""
         out, offset, page = [], 0, 100
         while True:
-            r = requests.post(f"{SB_URL}/storage/v1/object/list/{bucket}", timeout=60,
+            r = http().post(f"{SB_URL}/storage/v1/object/list/{bucket}", timeout=60,
                               headers=self.headers(),
                               json={"prefix": prefix.rstrip("/") + "/", "limit": page, "offset": offset,
                                     "sortBy": {"column": "name", "order": "asc"}})
@@ -322,24 +340,25 @@ class Supabase:
 
     def _download_once(self, name: str, path: str, bucket: str, fresh: bool) -> bool | None:
         if fresh:   # past the CDN (see get_fresh): for objects that are overwritten in place
-            r = requests.post(f"{SB_URL}/storage/v1/object/sign/{bucket}/{quote(name)}", json={"expiresIn": 600},
+            r = http().post(f"{SB_URL}/storage/v1/object/sign/{bucket}/{quote(name)}", json={"expiresIn": 600},
                               headers=self.headers(), timeout=60)
             if r.status_code in (400, 404):
                 return False
             url = r.json().get("signedURL") if r.status_code == 200 else None
             if not url:
                 return None
-            r = requests.get(f"{SB_URL}/storage/v1{url}", timeout=600, stream=True)
+            r = http().get(f"{SB_URL}/storage/v1{url}", timeout=600, stream=True)
         else:
-            r = requests.get(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
+            r = http().get(f"{SB_URL}/storage/v1/object/authenticated/{bucket}/{quote(name)}",
                              headers=self.headers(), timeout=600, stream=True)
-        if r.status_code in (400, 404):
-            return False
-        if r.status_code != 200:
-            return None  # busy: try again
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 20):  # decodes gzip/br; r.raw would not
-                f.write(chunk)
+        with r:     # a kept-alive connection goes back to the pool even on an early return
+            if r.status_code in (400, 404):
+                return False
+            if r.status_code != 200:
+                return None  # busy: try again
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1 << 20):  # decodes gzip/br; r.raw would not
+                    f.write(chunk)
         return True
 
 
