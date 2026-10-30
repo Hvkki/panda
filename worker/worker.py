@@ -396,7 +396,8 @@ def install_skills(sb: "Supabase"):
 # name: the step then waited for an approval nobody saw, and the chat seemed to stop answering.
 SKILL_COMMANDS = {"pb": "panda-browser/pb.py", "drive": "panda-drive/drive.py", "pvideo": "panda-video/video.py",
                   "premote": "panda-jobs/premote.py",
-                  "panda-issue": "panda-issue/issue.py", "pjob": "panda-jobs/jobs.py", "brief": "panda-jobs/brief.py"}
+                  "panda-issue": "panda-issue/issue.py", "pjob": "panda-jobs/jobs.py", "brief": "panda-jobs/brief.py",
+                  "panda-key": "panda-keys/keys.py"}
 
 
 def install_skill_commands():
@@ -453,6 +454,9 @@ def _latest_line() -> str:
                 "`python3 scripts/mark-latest.py push` (the deploy scripts record app/worker themselves).\n")
 
 
+_SECRETS_SYNC = threading.Lock()
+
+
 def sync_secrets(sb: "Supabase") -> list:
     """API keys from the app's vault -> env files the agent and MCP servers read.
 
@@ -460,6 +464,11 @@ def sync_secrets(sb: "Supabase") -> list:
     secrets.env or Crew's .env, and are written to ~/.panda/dev.env only while a turn of the
     Developer chat runs.
     """
+    with _SECRETS_SYNC:     # the app's "keys changed" command and panda-key may run it at the same time
+        return _sync_secrets(sb)
+
+
+def _sync_secrets(sb: "Supabase") -> list:
     rows = sb.rest("GET", "secrets", params={"owner": f"eq.{OWNER}", "select": "name,value"}) or []
     for r in rows:
         if r["value"] not in SECRETS:
@@ -471,7 +480,8 @@ def sync_secrets(sb: "Supabase") -> list:
             _write_dev_env()
     rows = [r for r in rows if not r["name"].startswith(DEV_PREFIX)]
     os.makedirs(os.path.dirname(PANDA_SECRETS), exist_ok=True)
-    lines = [f"export {r['name']}={json.dumps(r['value'])}" for r in rows]
+    # shlex.quote: json.dumps made "export K=\"...\"", and bash expanded any $ or ` inside a key.
+    lines = [f"export {r['name']}={shlex.quote(r['value'])}" for r in rows]
     with open(os.open(PANDA_SECRETS, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         f.write("\n".join(lines) + "\n")
     # Crew's .env: MCP connectors use ${env:NAME} in headers/env.
@@ -492,6 +502,99 @@ def sync_secrets(sb: "Supabase") -> list:
     SECRET_NAMES[:] = [r["name"] for r in rows]
     log(f"vault: {len(rows)} key(s) available, {len(DEV_ROWS)} developer variable(s)")
     return SECRET_NAMES
+
+
+# ── panda-key: an agent saves a key from a file into Customize -> API keys ────────────────────────────
+# Agents could only write ~/.panda/secrets.env, which every start rewrites from the vault, so a key the
+# owner uploaded vanished at each restart and the agent had to ask again (issue #41). `panda-key` drops a
+# private request (0600) here; the worker stores it with worker_set_secret (relay worker only, never a
+# DEV__ Developer variable, an existing key only with --replace), answers in <id>.done with names and
+# outcomes only, reloads secrets.env and tells the owner in the bell. Values are never logged.
+KEYS_OUTBOX = os.path.expanduser("~/.panda/keys-out")
+KEY_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
+KEY_MAX_LEN = 16384
+
+
+def _key_answer(rid: str, results: list):
+    path = os.path.join(KEYS_OUTBOX, f"{rid}.done")
+    with open(os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump({"results": results}, f)
+    os.replace(path + ".tmp", path)
+
+
+def keys_step(sb: "Supabase"):
+    if not os.path.isdir(KEYS_OUTBOX):
+        return
+    for name in sorted(n for n in os.listdir(KEYS_OUTBOX) if n.endswith(".req"))[:10]:
+        rid, path = name[:-4], os.path.join(KEYS_OUTBOX, name)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{6,64}", rid):
+            with contextlib.suppress(OSError):
+                os.remove(path)
+            continue
+        try:
+            st = os.lstat(path)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > 256 * 1024:
+                raise ValueError("bad request file")
+            req = json.load(open(path))
+            keys = req.get("keys") if isinstance(req, dict) else None
+            if not isinstance(keys, list) or not keys:
+                raise ValueError("no keys in the request")
+        except (OSError, ValueError) as exc:
+            with contextlib.suppress(OSError):
+                _key_answer(rid, [{"name": "?", "status": f"refused: {type(exc).__name__}"}])
+            continue
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(path)       # the value never stays on disk longer than needed
+        note = scrub(str(req.get("note") or "Saved by Panda"))[:160]
+        results, saved = [], []
+        for k in keys[:50]:
+            nm = str((k or {}).get("name") or "").strip().upper()
+            val = str((k or {}).get("value") or "")
+            if not KEY_NAME_RE.fullmatch(nm):
+                results.append({"name": nm[:64], "status": "refused: names are A-Z, 0-9 and _, starting with a letter"})
+                continue
+            if nm.startswith(DEV_PREFIX):
+                results.append({"name": nm, "status": "refused: Developer variables are set only in the app"})
+                continue
+            if not val.strip() or len(val) > KEY_MAX_LEN or "\n" in val or "\r" in val:
+                results.append({"name": nm, "status": "refused: the value must be one line, 1 to 16384 characters"})
+                continue
+            if val not in SECRETS:
+                SECRETS.append(val)
+            try:
+                out = sb.rest("POST", "rpc/worker_set_secret", body={
+                    "p_owner": OWNER, "p_name": nm, "p_value": val, "p_note": note,
+                    "p_replace": bool(k.get("replace"))})
+                status = out if isinstance(out, str) else "saved"
+            except Exception as exc:
+                status = f"failed: {scrub(exc)[:160]}"
+            results.append({"name": nm, "status": status})
+            if status in ("saved", "replaced"):
+                saved.append(nm)
+        if saved:
+            with contextlib.suppress(Exception):
+                sync_secrets(sb)
+            with contextlib.suppress(Exception):
+                sb.rest("POST", "notifications", body={
+                    "owner": OWNER, "source": "panda",
+                    "text": f"Panda saved {', '.join(saved)} to Customize -> API keys ({note}).",
+                    "meta": {"kind": "vault_key", "title": "API key saved", "ts": f"key-{rid}"}})
+        summary = ", ".join("%s %s" % (r["name"], r["status"].split(":")[0]) for r in results)
+        log(f"panda-key: {summary}")
+        with contextlib.suppress(OSError):
+            _key_answer(rid, results)
+
+
+def keys_loop(sb: "Supabase", stop: threading.Event):
+    os.makedirs(KEYS_OUTBOX, mode=0o700, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(KEYS_OUTBOX, 0o700)
+    while not stop.wait(2):
+        try:
+            keys_step(sb)
+        except Exception as exc:
+            log("panda-key:", type(exc).__name__)
 
 
 def _write_dev_env():
@@ -6356,6 +6459,7 @@ def main():
         threading.Thread(target=thinking_listener, args=(gw, stop_evt), daemon=True).start()
         threading.Thread(target=followup_loop, args=(sb, gw, stop_evt), daemon=True).start()
         threading.Thread(target=job_watch_loop, args=(sb, gw, stop_evt), daemon=True).start()
+        threading.Thread(target=keys_loop, args=(sb, stop_evt), daemon=True, name="panda-key").start()
         threading.Thread(target=brief_loop, args=(gw, stop_evt), daemon=True).start()
         threading.Thread(target=guard_loop, args=(stop_evt,), daemon=True, name="guard").start()
         threading.Thread(target=hang_loop, args=(sb, gw, stop_evt), daemon=True, name="hang").start()
