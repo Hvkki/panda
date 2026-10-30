@@ -86,16 +86,23 @@ new one is pushed).
 Every snapshot (every 30 min, on Stop, on hand-off) writes to `kirocrew-state` (per account under
 `users/<id>/`): `latest-crew.tar.gz`, `latest-kiro.tar.gz` and `latest-files.tar.gz`. The last is the
 owner's files: `~/dev ~/projects` (without `node_modules dist build .venv venv .next __pycache__ .cache`),
-`~/work ~/outputs ~/uploads`, and `~/.panda` without secrets and machine state (`dev.env secrets.env
-drive.json browser.json browser/ stt-lib/ *.log *.pid`). Files over 100 MB are skipped and logged. It is
-restored before Kiro Crew starts; unchanged file sets are not uploaded again.
+`~/work` (without `~/work/tmp`; its `node_modules` are kept) `~/outputs ~/uploads`, and `~/.panda` without
+secrets and machine state (`dev.env secrets.env drive.json browser.json browser/ stt-lib/ *.log *.pid`).
+Files over 100 MB are skipped and logged (4 GB when the Kaggle store is set up). It is restored before
+Kiro Crew starts; unchanged file sets are not uploaded again.
 
 A Free Supabase project refuses objects over 50 MB, so any of the three files bigger than 40 MB
 (`state_part_mb`) is stored as `name.<gen>.pNNN` parts plus a `name.parts.json` manifest (sha256), written
-last. If the files archive exceeds 200 MB (`state_storage_max_mb`) it goes to Google Drive (`Panda/state`,
-the primary account only) and Storage keeps the manifest; without Drive the oldest files are left out until
-it fits. Work files are not encrypted (the bucket is private); browser cookies and the Codex login still are,
-separately.
+last. The work files are a **full copy plus every change since it**, never trimmed. A full copy under
+200 MB (`state_storage_max_mb`) stays in Storage; a bigger one goes to a private Kaggle dataset
+(`panda-work-a` / `panda-work-b`, a `-<id>` suffix for other accounts; needs `kaggle_username`/`kaggle_key`
+in `worker.json`), Google Drive (`Panda/state`, primary account) only as the fallback. The two datasets take
+turns, and the manifest switches only after Kaggle lists the new file, so a failed push keeps the last
+good copy. Between full copies `latest-files-delta.tar.gz` (Storage) holds every file changed since the
+full copy (`latest-files-index.json.gz` lists what it holds). A new full copy is made when the changes pass
+300 MB (`files_delta_max_mb`), a changed file is over 100 MB, or the copy is 8 h old (`files_base_every_secs`);
+Stop saves only the changes. Work files are not encrypted (the bucket and datasets are private); browser
+cookies and the Codex login still are, separately.
 
 ## Commands
 

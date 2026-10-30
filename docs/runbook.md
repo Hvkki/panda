@@ -59,8 +59,10 @@ set -a; . ./panda-api-keys.env; set +a
   `"handoff_mode": "sequential"`. The pre-handoff snapshot already limits the loss to a few minutes.
 - **Local checks:** `python3 tools/test_autorestart.py` (file selection, parts, timing, snapshot/restore of a
   temp HOME; no network).
-- **Restore a bad files snapshot:** delete `latest-files.tar.gz*` from the `kirocrew-state` bucket (and the
-  Drive file `Panda/state/files.tar.gz`); the next run starts with empty work folders.
+- **Restore a bad files snapshot:** delete `latest-files*` from the `kirocrew-state` bucket (the full copy
+  itself is named in `latest-files.tar.gz.parts.json`: a Kaggle dataset `panda-work-a`/`-b` or the Drive
+  file `Panda/state/files.tar.gz`); the next run starts with empty work folders. To go back one full copy,
+  point the manifest at the other Kaggle dataset's file (`kaggle datasets files <user>/panda-work-b`).
 
 ## Rotate keys
 

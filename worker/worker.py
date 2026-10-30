@@ -739,25 +739,37 @@ def blob_save_drive(sb: "Supabase", name: str, path: str, extra: dict | None = N
     return {"size": size, "parts": 0, "drive": got["id"]}
 
 
-# ── Kaggle dataset: elastic overflow storage ────────────────────────────────────────────────────────
-# Supabase (1 GB bucket) and Drive (15 GB) both have ceilings; a Kaggle dataset is effectively unlimited
-# versioned storage on the same account that runs the notebooks. When an archive is too big for Storage
-# and Drive is full/absent, blob_save_kaggle pushes it to the owner's `panda-backups` dataset and keeps
-# only a small manifest in Storage (mirrors blob_save_drive). Needs Kaggle creds in worker.json
-# (kaggle_username/kaggle_key); without them kaggle_ok() is False and nothing here runs.
+# ── Kaggle datasets: the home of the big full copy of the work files ─────────────────────────────────
+# Supabase (1 GB on the free plan) and Drive (15 GB, shared with the owner's own files) both filled up,
+# and every restart from 28 to 30 Oct then came back with an old copy plus a trimmed change list
+# (agent issues #22, #32, #40). A private Kaggle dataset on the account that runs the notebooks is much
+# bigger and fast from here (measured: 600 MB pushed in 20 s, ready 14 s later, fetched in 5 s).
+# Two datasets take turns (A/B): a new copy goes to the one the manifest does NOT point at, and the
+# manifest is switched only once Kaggle lists the new file. A push that fails or never finishes
+# processing therefore never costs the last good copy. Each copy has a unique file name, so the file
+# itself proves which version a download got. Needs kaggle_username/kaggle_key in worker.json.
 KAGGLE_USER = (CFG.get("kaggle_username") or os.environ.get("KAGGLE_USERNAME") or "").strip()
 _KAGGLE_KEY = (CFG.get("kaggle_key") or os.environ.get("KAGGLE_KEY") or os.environ.get("KAGGLE_API_TOKEN") or "").strip()
-KAGGLE_BACKUP = (CFG.get("kaggle_backup_dataset") or (f"{KAGGLE_USER}/panda-backups" if KAGGLE_USER else "")).strip()
 KAGGLE_PUSH_TIMEOUT = int(CFG.get("kaggle_push_timeout_secs", 1800))
-KAGGLE_MIN_INTERVAL = int(CFG.get("kaggle_min_interval_secs", 2 * 3600))   # don't version more often than this
-_kaggle_last = [0.0]
+KAGGLE_READY_WAIT = int(CFG.get("kaggle_ready_wait_secs", 900))   # a pushed copy must be listed within this
+KAGGLE_FILE_MAX = int(CFG.get("kaggle_file_max_mb", 4096)) * MiB   # biggest single file kept in a full copy
 _kaggle_ok: list = [None]
 
 
 def kaggle_ok() -> bool:
     if _kaggle_ok[0] is None:
-        _kaggle_ok[0] = bool(KAGGLE_USER and _KAGGLE_KEY and KAGGLE_BACKUP and shutil.which("kaggle"))
+        _kaggle_ok[0] = bool(KAGGLE_USER and _KAGGLE_KEY and shutil.which("kaggle"))
     return _kaggle_ok[0]
+
+
+def kaggle_slots() -> tuple:
+    """The two datasets this account's full copies alternate between. OWNER is whoever pressed Start,
+    so it is read at call time: a second account must never overwrite the first one's copies."""
+    base = CFG.get("kaggle_backup_dataset") or "panda-work"
+    base = str(base).split("/")[-1].strip() or "panda-work"
+    if OWNER != PRIMARY_OWNER:
+        base = f"{base}-{re.sub(r'[^a-z0-9]', '', str(OWNER).lower())[:8]}"
+    return f"{KAGGLE_USER}/{base}-a", f"{KAGGLE_USER}/{base}-b"
 
 
 def _kaggle_run(args: list, timeout: int):
@@ -765,7 +777,8 @@ def _kaggle_run(args: list, timeout: int):
     cfgdir = f"{WORK}/.kaggle-cfg"
     with contextlib.suppress(OSError):
         os.makedirs(cfgdir, exist_ok=True)
-    env = {**os.environ, "KAGGLE_USERNAME": KAGGLE_USER, "KAGGLE_KEY": _KAGGLE_KEY, "KAGGLE_CONFIG_DIR": cfgdir}
+    env = {**os.environ, "KAGGLE_USERNAME": KAGGLE_USER, "KAGGLE_KEY": _KAGGLE_KEY,
+           "KAGGLE_API_TOKEN": _KAGGLE_KEY, "KAGGLE_CONFIG_DIR": cfgdir}
     try:
         return subprocess.run(["kaggle", *args], env=env, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -773,79 +786,104 @@ def _kaggle_run(args: list, timeout: int):
         return None
 
 
-def kaggle_push_file(path: str, name: str) -> dict | None:
-    """Push one file to the panda-backups dataset as a new version (create it the first time)."""
+def kaggle_listed(slug: str, fname: str) -> bool | None:
+    """True when the dataset's current version holds `fname`; None when Kaggle could not be asked."""
+    r = _kaggle_run(["datasets", "files", slug, "--csv"], 120)
+    if not r:
+        return None
+    if r.returncode != 0:
+        return False
+    return any(ln.split(",", 1)[0].strip() == fname for ln in (r.stdout or "").splitlines())
+
+
+def kaggle_push_file(path: str, slug: str, fname: str, wait: float | None = None) -> bool:
+    """Make `path` the only file of dataset `slug` (a new version; the dataset is created the first
+    time) and wait until Kaggle lists it. False on any failure. The archive is hard-linked into the
+    upload folder, not copied: a second multi-GB copy could fill the work disk."""
     if not kaggle_ok():
-        return None
+        return False
     d = tempfile.mkdtemp(prefix="kg-", dir=WORK)
     try:
-        shutil.copy2(path, os.path.join(d, name))
+        try:
+            os.link(path, os.path.join(d, fname))
+        except OSError:
+            shutil.copy2(path, os.path.join(d, fname))
         with open(os.path.join(d, "dataset-metadata.json"), "w") as f:
-            json.dump({"title": KAGGLE_BACKUP.split("/")[1], "id": KAGGLE_BACKUP, "licenses": [{"name": "other"}]}, f)
-        status = _kaggle_run(["datasets", "status", KAGGLE_BACKUP], 120)
-        exists = bool(status and status.returncode == 0)
-        verb = (["datasets", "version", "-p", d, "-m", f"panda backup {now_iso()}", "--delete-old-versions"]
-                if exists else ["datasets", "create", "-p", d])
+            json.dump({"title": slug.split("/")[1], "id": slug, "licenses": [{"name": "other"}]}, f)
+        st = _kaggle_run(["datasets", "status", slug], 120)
+        exists = bool(st and st.returncode == 0)
+        verb = (["datasets", "version", "-p", d, "-m", f"panda {now_iso()[:16]}", "-q", "--delete-old-versions"]
+                if exists else ["datasets", "create", "-p", d, "-q"])
         r = _kaggle_run(verb, KAGGLE_PUSH_TIMEOUT)
-        if not r or r.returncode != 0:
-            log("kaggle push failed:", scrub((r.stderr if r else "no result") or "")[:200])
-            return None
-        return {"version": now_iso()}
-    except OSError as exc:
-        log("kaggle push:", type(exc).__name__)
-        return None
+        if not r or r.returncode != 0 or re.search(r"error|exceed|quota", (r.stdout or "") + (r.stderr or ""), re.I):
+            log("kaggle push failed:", scrub(((r.stdout or "") + (r.stderr or "")) if r else "no result")[-240:])
+            return False
     finally:
         shutil.rmtree(d, ignore_errors=True)
+    limit = KAGGLE_READY_WAIT if wait is None else wait
+    deadline = time.time() + limit
+    while time.time() < deadline:
+        if kaggle_listed(slug, fname):
+            return True
+        time.sleep(15)
+    log(f"kaggle: {slug} did not list {fname} within {int(limit)} s; the last good copy stays")
+    return False
 
 
-def kaggle_pull_file(name: str, dest: str) -> bool:
-    """Download one file from the backup dataset (kaggle wraps a single file in <name>.zip) to dest."""
-    if not kaggle_ok() or not name:
+def kaggle_pull_file(slug: str, fname: str, dest: str, wait: float | None = None) -> bool:
+    """Fetch `fname` from dataset `slug` to dest. While its version is still processing the file is not
+    there yet (a copy pushed just before a hand-off): keep trying until `wait` runs out."""
+    if not kaggle_ok() or not slug or not fname:
         return False
-    d = tempfile.mkdtemp(prefix="kg-", dir=WORK)
-    try:
-        r = _kaggle_run(["datasets", "download", "-d", KAGGLE_BACKUP, "-f", name, "-p", d, "--force"], KAGGLE_PUSH_TIMEOUT)
-        if not r or r.returncode != 0:
+    deadline = time.time() + (KAGGLE_READY_WAIT if wait is None else wait)
+    while True:
+        d = tempfile.mkdtemp(prefix="kg-", dir=WORK)
+        try:
+            r = _kaggle_run(["datasets", "download", slug, "-f", fname, "-p", d, "-o", "-q"], KAGGLE_PUSH_TIMEOUT)
+            if r and r.returncode == 0:
+                zp = os.path.join(d, fname + ".zip")
+                if os.path.exists(zp) and not os.path.exists(os.path.join(d, fname)):
+                    import zipfile
+                    with zipfile.ZipFile(zp) as z:
+                        z.extractall(d)
+                src = os.path.join(d, fname)
+                if os.path.exists(src):
+                    with contextlib.suppress(OSError):
+                        os.remove(dest)
+                    shutil.move(src, dest)
+                    return True
+        except Exception as exc:
+            log("kaggle pull:", type(exc).__name__)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        if time.time() >= deadline:
             return False
-        zp = os.path.join(d, name + ".zip")
-        if os.path.exists(zp):
-            import zipfile
-            with zipfile.ZipFile(zp) as z:
-                z.extractall(d)
-        src = os.path.join(d, name)
-        if not os.path.exists(src):
-            return False
-        with contextlib.suppress(OSError):
-            os.remove(dest)
-        shutil.move(src, dest)
-        return True
-    except (OSError, zipfile.BadZipFile) as exc:
-        log("kaggle pull:", type(exc).__name__)
-        return False
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
+        log(f"kaggle: {fname} not in {slug} yet; retrying")
+        time.sleep(20)
 
 
 def blob_save_kaggle(sb: "Supabase", name: str, path: str, extra: dict | None = None) -> dict | None:
-    """For an archive too big for Storage with no Drive: put it in the Kaggle dataset; Storage keeps only
-    the manifest. Throttled to at most one version per KAGGLE_MIN_INTERVAL (returns None when throttled,
-    so the caller keeps the last full copy and saves only the changes)."""
+    """For an archive too big for Storage: put it in this account's Kaggle dataset (the slot the
+    current manifest does not use); Storage keeps only the manifest, switched after Kaggle lists the
+    file. Returns None on failure, and then the last good copy is still the one the manifest names."""
     if not kaggle_ok():
         return None
-    if time.time() - _kaggle_last[0] < KAGGLE_MIN_INTERVAL:
-        log(f"kaggle: skipped, last backup < {KAGGLE_MIN_INTERVAL // 60} min ago")
-        return None
-    fname = name.replace("/", "_")
-    if not kaggle_push_file(path, fname):
-        return None
-    _kaggle_last[0] = time.time()
     old = _manifest_get(sb, name)
+    a, b = kaggle_slots()
+    slug = b if ((old or {}).get("kaggle") or {}).get("slug") == a else a
+    # Not ".tar.gz": Kaggle unpacks archives while it processes a dataset version, and the copy then
+    # never appears as one file. Same gzip'd tar inside; blob_load checks its sha256 either way.
+    fname = f"{name.replace('/', '_').split('.')[0]}-{int(time.time())}{uuid.uuid4().hex[:4]}.pbak"
+    t0 = time.time()
+    if not kaggle_push_file(path, slug, fname):
+        return None
     size = os.path.getsize(path)
     _put_manifest(sb, name, {"v": 1, "size": size, "sha256": sha256_file(path), "parts": [],
-                             "kaggle": {"slug": KAGGLE_BACKUP, "file": fname, "version": now_iso()},
+                             "kaggle": {"slug": slug, "file": fname},
                              "saved_at": now_iso(), **(extra or {})})
-    _forget_old(sb, name, old, keep_single=False, keep_manifest=True)
-    return {"size": size, "parts": 0, "kaggle": KAGGLE_BACKUP}
+    _forget_old(sb, name, old, keep_single=False, keep_manifest=True)   # an old Drive copy is removed too
+    log(f"kaggle: {size / MiB:.0f} MB in {slug} as {fname}, {time.time() - t0:.0f} s")
+    return {"size": size, "parts": 0, "kaggle": slug}
 
 
 def blob_load(sb: "Supabase", name: str, dest: str) -> bool:
@@ -858,8 +896,9 @@ def blob_load(sb: "Supabase", name: str, dest: str) -> bool:
             raise RuntimeError("the saved work files are in Google Drive but could not be fetched")
         sha = sha256_file(dest)
     elif man.get("kaggle"):
-        if not kaggle_pull_file(man["kaggle"].get("file", ""), dest):
-            raise RuntimeError("the saved work files are in the Kaggle backup dataset but could not be fetched")
+        k = man["kaggle"]
+        if not kaggle_pull_file(k.get("slug", ""), k.get("file", ""), dest):
+            raise RuntimeError("the saved work files are in the Kaggle dataset but could not be fetched")
         sha = sha256_file(dest)
     else:
         local = []
@@ -901,7 +940,14 @@ FILES_ROOTS = ["dev", "work", "outputs", "projects", "uploads", ".panda"] + _ext
 FILE_MAX_BYTES = int(CFG.get("state_max_file_mb", 100)) * MiB       # a single file bigger than this is not saved
 FILES_STORAGE_MAX = int(CFG.get("state_storage_max_mb", 200)) * MiB  # bigger archives go to Drive (or are trimmed)
 FILES_BLOB = "latest-files.tar.gz"
-ALWAYS_SKIP_DIRS = {"node_modules", "__pycache__", ".cache"}
+ALWAYS_SKIP_DIRS = {"__pycache__", ".cache"}
+# node_modules is rebuilt by `npm ci` in code trees, but under ~/work the agents' own tools (the video
+# renderer) need theirs after a restart, and losing them broke the render on 30 Oct (issue #40).
+NODE_MODULES_KEEP_ROOTS = {"work"}
+FILES_BASE_EVERY = int(CFG.get("files_base_every_secs", 8 * 3600))       # refresh an old full copy
+FILES_DELTA_RAW_MAX = int(CFG.get("files_delta_max_mb", 300)) * MiB     # changes past this: new full copy
+FILES_FULL_RETRY = int(CFG.get("files_full_retry_secs", 3600))          # after a failed full copy
+_files_full = {"fail_at": 0.0}
 CODE_ROOTS = {"dev", "projects"}                                      # code trees: build output is not saved
 CODE_SKIP_DIRS = {"dist", "build", ".venv", "venv", ".next", ".pytest_cache", ".mypy_cache", ".tox"}
 # ~/.panda also holds machine state the worker rebuilds itself, and secrets that must not sit in Storage
@@ -927,6 +973,8 @@ class Entry(NamedTuple):
 
 def _dir_skipped(root: str, depth: int, name: str) -> bool:
     if name in ALWAYS_SKIP_DIRS:
+        return True
+    if name == "node_modules" and root not in NODE_MODULES_KEEP_ROOTS:
         return True
     if root in CODE_ROOTS and name in CODE_SKIP_DIRS:
         return True
@@ -1086,15 +1134,16 @@ _files_lock = threading.Lock()
 FILES_INDEX = "latest-files-index.json.gz"      # {"id", "files": {arc: [size, mtime]}}: what the full copy holds
 FILES_DELTA_BLOB = "latest-files-delta.tar.gz"  # files changed since that copy, when it could not be replaced
 FILES_DELTA_META = "latest-files-delta.json"    # {"base_id", "files", "saved_at"}: applied only on that base
-_files_alerted = {"at": 0.0}
+_files_alerted: dict = {}
 
 
-def files_alert(sb: "Supabase", text: str):
-    """Tell the owner (bell + push) that saving the work files is degraded. At most once every 6 hours."""
+def files_alert(sb: "Supabase", text: str, kind: str = "save"):
+    """Tell the owner (bell + push) that saving the work files is degraded. At most once every 6 hours
+    per kind, so one kind of warning never hides another."""
     log("files:", text)
-    if time.time() - _files_alerted["at"] < 6 * 3600:
+    if time.time() - _files_alerted.get(kind, 0.0) < 6 * 3600:
         return
-    _files_alerted["at"] = time.time()
+    _files_alerted[kind] = time.time()
     with contextlib.suppress(Exception):
         sb.rest("POST", "notifications", body={"owner": OWNER, "source": "panda", "text": text,
                                                "meta": {"kind": "files_save", "title": "Work files", "ts": f"files-{int(time.time())}"}})
@@ -1135,115 +1184,160 @@ def files_delta_forget(sb: "Supabase"):
     _forget_old(sb, FILES_DELTA_BLOB, _manifest_get(sb, FILES_DELTA_BLOB), keep_single=False, keep_manifest=False)
 
 
-def files_delta_save(sb: "Supabase", entries: list, reason: str, deadline, level: int, skipped: int) -> dict:
-    """The full copy could not be replaced (Drive refused it, or it no longer fits in Storage): keep it, and
-    save only the files that changed since it in Storage. Restore puts this on top of the full copy."""
-    idx = files_index_get(sb)
+def files_changed(entries: list, idx: dict | None, base_saved_at=None) -> list:
+    """Files that differ from what the full copy holds (by size and mtime)."""
     if idx:
-        changed = [e for e in entries if e.kind == "file" and idx["files"].get(e.arc) != [e.size, e.mtime]]
-    else:   # a full copy from before the index existed: what changed since it was saved (10 min margin)
-        man = _manifest_get(sb, FILES_BLOB) or {}
-        since = (parse_ts(man.get("saved_at")) or 0) - 600
-        changed = [e for e in entries if e.kind == "file" and e.mtime >= since]
-    keep = [e for e in entries if e.kind != "file"] + changed      # folders and links are tiny
-    keep.sort(key=lambda e: e.arc)
+        return [e for e in entries if e.kind == "file" and idx["files"].get(e.arc) != [e.size, e.mtime]]
+    since = (parse_ts(base_saved_at) or 0) - 600     # a full copy from before the index existed
+    return [e for e in entries if e.kind == "file" and e.mtime >= since]
+
+
+def files_plan(entries: list, idx: dict | None, have_base: bool, now: float, at_stop: bool,
+               big_store: bool) -> tuple:
+    """("full" | "delta", why), decided BEFORE anything is packed. The old code packed all of ~/work
+    (GBs, minutes of CPU) at every 30-minute save only to learn that Drive would refuse it."""
+    files = [e for e in entries if e.kind == "file"]
+    if sum(e.size for e in files) <= FILES_STORAGE_MAX:
+        return "full", "small enough for Storage"
+    if not have_base or not idx:
+        return "full", "no full copy yet"
+    if at_stop:
+        return "delta", "stop: only the changes"
+    if not big_store:
+        return "delta", "no Kaggle or Drive for big copies"
+    changed = files_changed(entries, idx)
+    craw = sum(e.size for e in changed)
+    if craw > FILES_DELTA_RAW_MAX:
+        return "full", f"{craw // MiB} MB changed since the full copy"
+    if any(e.size > FILE_MAX_BYTES for e in changed):
+        return "full", "a changed file is too big for Storage"
+    age = now - (parse_ts(idx.get("saved_at")) or 0)
+    if age > FILES_BASE_EVERY:
+        return "full", f"the full copy is {age / 3600:.0f} h old"
+    return "delta", f"{len(changed)} files changed"
+
+
+def files_delta_save(sb: "Supabase", entries: list, reason: str, deadline, level: int, skipped: int,
+                     idx: dict | None = None, why: str = "") -> dict:
+    """Keep the full copy, and save in Storage EVERY file that changed since it. Restore puts this on top
+    of the full copy. Never trimmed: dropping the oldest changes to fit a budget is what brought back
+    broken git repos, empty folders and lost videos after the restarts of 28-30 Oct (issues #32, #40);
+    when the changes grow too big, the next save makes a new full copy instead."""
+    idx = idx if idx is not None else files_index_get(sb)
+    changed = files_changed(entries, idx, None if idx else (_manifest_get(sb, FILES_BLOB) or {}).get("saved_at"))
+    keep = sorted([e for e in entries if e.kind != "file"] + changed, key=lambda e: e.arc)  # folders/links are tiny
     arc = f"{WORK}/files-delta.tar.gz"
-    dropped, budget = [], None
     try:
-        for _ in range(4):
-            chosen = keep
-            if budget is not None:
-                chosen, dropped = trim_to_budget(keep, budget)
-            write_archive(chosen, arc, deadline, level)
-            size = os.path.getsize(arc)
-            if size <= FILES_STORAGE_MAX:
-                break
-            budget = int(sum(e.size for e in chosen if e.kind == "file") * FILES_STORAGE_MAX / size * 0.9)
-        for a, sz, why in dropped:
-            log(f"files: change not saved, {why}: ~/{a} ({sz // MiB} MB)")
+        write_archive(keep, arc, deadline, level)
+        size = os.path.getsize(arc)
+        if size > FILES_STORAGE_MAX:
+            files_alert(sb, f"Panda saved {size // MiB} MB of changed work files in Supabase because a new full "
+                            "copy could not be made yet. Nothing was left out; the next full copy clears it.", "big-delta")
         sb.delete_object(state_key(FILES_DELTA_META))     # never a meta pointing at a half-uploaded delta
         done = blob_save(sb, FILES_DELTA_BLOB, arc)
-        n = sum(1 for e in chosen if e.kind == "file")
-        sb.put(state_key(FILES_DELTA_META), json.dumps({"base_id": (idx or {}).get("id"), "files": n,
+        sb.put(state_key(FILES_DELTA_META), json.dumps({"base_id": (idx or {}).get("id"), "files": len(changed),
                                                          "saved_at": now_iso()}).encode(), mime="application/json")
     finally:
         with contextlib.suppress(OSError):
             os.remove(arc)
-    _files_sync["sig"] = None            # try the full copy again at the next save
-    info = {"files": n, "raw_bytes": sum(e.size for e in changed), "archive_bytes": done["size"],
-            "parts": done["parts"], "where": "Storage (changes since the last full copy)",
-            "skipped": skipped + len(dropped)}
-    log(f"files saved ({reason}): only the {n} changed files, {done['size'] / MiB:.1f} MB in Storage; "
-        f"the last full copy stays as it is")
+    info = {"files": len(changed), "raw_bytes": sum(e.size for e in changed), "archive_bytes": done["size"],
+            "parts": done["parts"], "where": "Storage (changes since the last full copy)", "skipped": skipped}
+    log(f"files saved ({reason}): {len(changed)} changed files ({why}), {done['size'] / MiB:.1f} MB in Storage; "
+        f"the full copy stays as it is")
     return info
 
 
 def files_snapshot(sb: "Supabase", reason: str, budget: float | None = None) -> dict | None:
     """Save the owner's work files. Skips the upload when nothing changed since the last save.
 
-    With `budget` (seconds, used at Stop) it compresses fast and gives up when the copy would take
-    longer, keeping the last saved copy (at most SNAPSHOT_EVERY old) instead of holding up the stop.
+    A full copy goes to Storage when small, else to the Kaggle dataset (Drive as the fallback); between
+    full copies only the changes are saved. With `budget` (seconds, used at Stop) it saves only the
+    changes, and gives up when even that would take longer (the previous save stays).
     """
-    deadline = time.time() + budget if budget else None
     level = 1     # was 6 for periodic saves: ~3x the CPU for a few % smaller (most of ~/work is media)
     if not FILES_ENABLED:
         return None
     if _files_restore["failed"]:
         log("files: not saved -- this run could not restore them, so saving would replace the good copy")
         return None
-    with _files_lock:
-        entries, skipped = select_files(HOME, FILES_ROOTS, exclude=(WORK,))
-        for arc, size, why in skipped:
-            log(f"files: not saved, {why}: ~/{arc} ({size // MiB} MB)")
-        sig = files_signature(entries)
-        if sig == _files_sync["sig"]:
-            return {"unchanged": True}
-        archive = f"{WORK}/files.tar.gz"
-        drive_ok = os.path.exists(DRIVE_CFG)
-        raw = sum(e.size for e in entries if e.kind == "file")
-        chosen, dropped, budget = entries, [], None
-        try:
-            for _ in range(4):
-                if budget is not None:
-                    chosen, dropped = trim_to_budget(entries, budget)
-                failed = write_archive(chosen, archive, deadline, level)
-                size = os.path.getsize(archive)
-                if size <= FILES_STORAGE_MAX or drive_ok:
-                    break
-                # No Drive for this account: keep fewer files (oldest first) until the archive fits in Storage.
-                budget = int(sum(e.size for e in chosen if e.kind == "file") * FILES_STORAGE_MAX / size * 0.9)
-            for arc, sz, why in dropped:
-                log(f"files: not saved, {why}: ~/{arc} ({sz // MiB} MB)")
-            for arc in failed:
-                log(f"files: could not read ~/{arc}")
-            extra = {"sig": sig, "files": sum(1 for e in chosen if e.kind == "file")}
-            done = where = None
-            if size > FILES_STORAGE_MAX and drive_ok:
-                done, where = blob_save_drive(sb, FILES_BLOB, archive, extra), "Google Drive"
-                if done is None and kaggle_ok():
-                    done, where = blob_save_kaggle(sb, FILES_BLOB, archive, extra), "Kaggle dataset"
-                if done is None:
-                    files_alert(sb, "Google Drive did not take the copy of your work files (is it full?). "
-                                    "Panda keeps the last full copy and saves only the changes until it works again.")
-            elif size > FILES_STORAGE_MAX and kaggle_ok():
+    # A Stop that meets a background full copy waits for it (it is the fresher copy), but not forever;
+    # a crash save waits only its own budget.
+    wait = (budget if reason == "crash" else FILES_STOP_LOCK_WAIT) if budget else -1
+    if not _files_lock.acquire(timeout=wait):
+        log(f"files: a full copy was still being saved after {int(wait)} s; this save is skipped")
+        return None
+    try:
+        return _files_snapshot_locked(sb, reason, budget, time.time() + budget if budget else None, level)
+    finally:
+        _files_lock.release()
+
+
+FILES_STOP_LOCK_WAIT = int(CFG.get("files_stop_lock_wait_secs", 600))
+
+
+def _files_snapshot_locked(sb: "Supabase", reason: str, budget, deadline, level: int) -> dict | None:
+    drive_ok = os.path.exists(DRIVE_CFG)
+    big_store = kaggle_ok() or drive_ok
+    entries, skipped = select_files(HOME, FILES_ROOTS, max_file=KAGGLE_FILE_MAX if kaggle_ok() else None,
+                                    exclude=(WORK,))
+    for arc, size, why in skipped:
+        log(f"files: not saved, {why}: ~/{arc} ({size // MiB} MB)")
+    if skipped:
+        arc, size, why = max(skipped, key=lambda s: s[1])
+        files_alert(sb, f"{len(skipped)} work file(s) are too big to back up, e.g. ~/{arc} ({size // MiB} MB, "
+                        f"{why}). Keep big finished files in Google Drive (panda-drive).", "too-big")
+    sig = files_signature(entries)
+    if sig == _files_sync["sig"]:
+        return {"unchanged": True}
+    idx = files_index_get(sb)
+    have_base = files_base_exists(sb)
+    plan, why = files_plan(entries, idx, have_base, time.time(), budget is not None, big_store)
+    if plan == "full" and have_base and idx and time.time() - _files_full["fail_at"] < FILES_FULL_RETRY:
+        plan, why = "delta", "the last full copy failed less than an hour ago"
+    if plan == "delta":
+        info = files_delta_save(sb, entries, reason, deadline, level, len(skipped), idx, why)
+        _files_sync["sig"] = sig
+        return info
+    archive = f"{WORK}/files.tar.gz"
+    raw = sum(e.size for e in entries if e.kind == "file")
+    n = sum(1 for e in entries if e.kind == "file")
+    done = where = None
+    try:
+        failed = write_archive(entries, archive, deadline, level)
+        for arc in failed:
+            log(f"files: could not read ~/{arc}")
+        size = os.path.getsize(archive)
+        extra = {"sig": sig, "files": n}
+        if size <= FILES_STORAGE_MAX:
+            done, where = blob_save(sb, FILES_BLOB, archive, extra=extra), "Storage"
+        else:
+            if kaggle_ok():
                 done, where = blob_save_kaggle(sb, FILES_BLOB, archive, extra), "Kaggle dataset"
-            elif not dropped or not files_base_exists(sb):
-                done, where = blob_save(sb, FILES_BLOB, archive, extra=extra), "Storage"
-            if done is None:
-                # Never replace the last full copy with a partial one: a trimmed copy kept only the newest
-                # files, and a restart then lost everything older (28 Oct, Drive full of old copies).
-                return files_delta_save(sb, entries, reason, deadline, level, len(skipped))
-            files_index_put(sb, chosen)     # what this copy holds: later change-only saves build on it
+            if done is None and drive_ok:
+                done, where = blob_save_drive(sb, FILES_BLOB, archive, extra), "Google Drive"
+            if done is None and not have_base:
+                # The very first copy: an over-budget copy in Storage beats having none at all.
+                done, where = blob_save(sb, FILES_BLOB, archive, extra=extra), "Storage (over its budget)"
+        if done is not None:
+            files_index_put(sb, entries)    # what this copy holds: later change-only saves build on it
             files_delta_forget(sb)
-            _files_sync["sig"] = None if dropped else sig  # a trimmed save is tried again next time
-            info = {"files": extra["files"], "raw_bytes": raw, "archive_bytes": done["size"],
-                    "parts": done["parts"], "where": where, "skipped": len(skipped) + len(dropped)}
-            log(f"files saved ({reason}): {info['files']} files, {raw / MiB:.1f} MB -> {done['size'] / MiB:.1f} MB, "
-                f"{info['parts']} part(s) in {where}, {info['skipped']} skipped")
-            return info
-        finally:
-            with contextlib.suppress(OSError):
-                os.remove(archive)
+            _files_sync["sig"] = sig
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(archive)
+    if done is None:
+        _files_full["fail_at"] = time.time()
+        files_alert(sb, "Panda could not store a new full copy of your work files (the Kaggle dataset and "
+                        "Google Drive both refused it). It keeps the last full copy and saves every change "
+                        "on top of it until this works again.", "full-failed")
+        info = files_delta_save(sb, entries, reason, deadline, level, len(skipped), idx, "full copy failed")
+        _files_sync["sig"] = sig
+        return info
+    info = {"files": n, "raw_bytes": raw, "archive_bytes": done["size"], "parts": done["parts"],
+            "where": where, "skipped": len(skipped)}
+    log(f"files saved ({reason}, full copy: {why}): {n} files, {raw / MiB:.1f} MB -> "
+        f"{done['size'] / MiB:.1f} MB in {where}, {len(skipped)} skipped")
+    return info
 
 
 def files_delta_restore(sb: "Supabase", tmp: str):
@@ -1285,6 +1379,9 @@ def restore_files(sb: "Supabase") -> str:
     except Exception as exc:
         log("files could not be restored:", scrub(exc)[:200])
         _files_restore["failed"] = True
+        files_alert(sb, "Panda could not bring back your work files at this start "
+                        f"({scrub(exc)[:120]}). It will not save work files during this run, so the good "
+                        "copy stays safe. Press Stop, then Start, to try again.", "restore-failed")
         return "failed"
     finally:
         with contextlib.suppress(OSError):
