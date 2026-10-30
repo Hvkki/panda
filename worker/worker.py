@@ -1393,8 +1393,11 @@ def _files_snapshot_locked(sb: "Supabase", reason: str, budget, deadline, level:
     if sig == _files_sync["sig"]:
         return {"unchanged": True}
     idx = files_index_get(sb)
-    have_base = files_base_exists(sb)
+    man = _manifest_get(sb, FILES_BLOB)
+    have_base = bool(man) or sb.exists(state_key(FILES_BLOB))
     plan, why = files_plan(entries, idx, have_base, time.time(), budget is not None, big_store)
+    if plan == "delta" and budget is None and kaggle_ok() and (man or {}).get("drive"):
+        plan, why = "full", "moving the full copy from Google Drive to the Kaggle dataset"   # Drive is only the fallback
     if plan == "full" and have_base and idx and time.time() - _files_full["fail_at"] < FILES_FULL_RETRY:
         plan, why = "delta", "the last full copy failed less than an hour ago"
     if plan == "delta":

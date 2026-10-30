@@ -183,6 +183,36 @@ try:
     # 9. a change-only copy made for an OLDER full copy is never applied over a newer one
     sb.put(W.state_key(W.FILES_DELTA_META), b'{"base_id": "someone-else", "files": 1}', mime="application/json")
     check("stale change-only copy ignored")
+    sb.delete_object(W.state_key(W.FILES_DELTA_META))
+
+    # 10. a full copy still in Drive (from before Kaggle) moves to Kaggle at the next save; the Drive file goes
+    DRIVE = {}
+
+    def fake_drive_save(sb_, name, path, extra=None):
+        old = W._manifest_get(sb_, name)
+        fid = f"drive-{len(DRIVE)}"
+        DRIVE[fid] = open(path, "rb").read()
+        W._put_manifest(sb_, name, {"v": 1, "size": os.path.getsize(path), "sha256": W.sha256_file(path),
+                                    "parts": [], "drive": {"id": fid}, "saved_at": W.now_iso(), **(extra or {})})
+        W._forget_old(sb_, name, old, keep_single=False, keep_manifest=True)
+        return {"size": os.path.getsize(path), "parts": 0, "drive": fid}
+
+    W.blob_save_drive = fake_drive_save
+    W.drive_rm = lambda fid: DRIVE.pop(fid, None)
+    W.drive_get = lambda fid, dest: bool(open(dest, "wb").write(DRIVE[fid])) if fid in DRIVE else False
+    W._kaggle_ok[0] = False
+    put("work/studio/new8.bin", os.urandom(1200 << 10))
+    info = save()
+    assert info["where"] == "Google Drive" and len(DRIVE) == 1, info
+    check("full copy in Drive (no Kaggle)")
+    W._kaggle_ok[0] = True
+    put("work/studio/new9.bin", os.urandom(50 << 10))       # a small change: normally only a change-only copy
+    info = save()
+    assert info["where"] == "Kaggle dataset", info
+    assert not DRIVE, "the Drive copy should be deleted once the Kaggle copy is in"
+    check("Drive copy moved to Kaggle")
+    put("work/studio/new10.bin", os.urandom(50 << 10))
+    assert save()["where"].startswith("Storage (changes"), "a Kaggle copy must not be redone at every save"
 finally:
     for n in (W.FILES_BLOB, W.FILES_DELTA_BLOB):
         W._forget_old(sb, n, W._manifest_get(sb, n), keep_single=False, keep_manifest=False)
