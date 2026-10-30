@@ -93,16 +93,22 @@ Kiro Crew starts; unchanged file sets are not uploaded again.
 
 A Free Supabase project refuses objects over 50 MB, so any of the three files bigger than 40 MB
 (`state_part_mb`) is stored as `name.<gen>.pNNN` parts plus a `name.parts.json` manifest (sha256), written
-last. The work files are a **full copy plus every change since it**, never trimmed. A full copy under
-200 MB (`state_storage_max_mb`) stays in Storage; a bigger one goes to a private Kaggle dataset
-(`panda-work-a` / `panda-work-b`, a `-<id>` suffix for other accounts; needs `kaggle_username`/`kaggle_key`
-in `worker.json`), Google Drive (`Panda/state`, primary account) only as the fallback. The two datasets take
-turns, and the manifest switches only after Kaggle lists the new file, so a failed push keeps the last
-good copy. Between full copies `latest-files-delta.tar.gz` (Storage) holds every file changed since the
-full copy (`latest-files-index.json.gz` lists what it holds). A new full copy is made when the changes pass
-300 MB (`files_delta_max_mb`), a changed file is over 100 MB, or the copy is 8 h old (`files_base_every_secs`);
-Stop saves only the changes. Work files are not encrypted (the bucket and datasets are private); browser
-cookies and the Codex login still are, separately.
+last. The work files are a **full copy plus every change since it**, never trimmed. Both go first to the
+account's own **Modal volume** `panda-store` (1 TiB free; keys `MODAL_TOKEN_ID`/`MODAL_TOKEN_SECRET` from that
+account's vault, `modal_store_keys` names another pair; files under `/<account>/<blob>/<unique>.pbak`); the
+manifest switches only after Modal lists the file at its full size, then the previous file is removed.
+Without Modal keys: a full copy under 200 MB (`state_storage_max_mb`) stays in Storage; a bigger one goes to
+a private Kaggle dataset (`panda-work-a` / `panda-work-b`, a `-<id>` suffix for other accounts; needs
+`kaggle_username`/`kaggle_key` in `worker.json`), Google Drive (`Panda/state`, primary account) only as the
+last fallback. The two datasets take turns, and the manifest switches only after Kaggle lists the new
+file, so a failed push keeps the last good copy. A copy in a weaker store moves to the best one at the
+next save. Between full copies `latest-files-delta.tar.gz` holds every file changed since the full copy
+(`latest-files-index.json.gz` lists what it holds). A new full copy is made when the changes pass 300 MB
+(`files_delta_max_mb`), a changed file is over 100 MB, or the copy is 8 h old (`files_base_every_secs`);
+Stop saves only the changes. The storage GC (every 6 h) also removes snapshot parts no manifest names
+(after a day) and the pre-chunk `latest-kiro.tar.gz` once the chunk index has superseded it for a day.
+Work files are not encrypted (the bucket, volume and datasets are private); browser cookies and the Codex
+login still are, separately.
 
 ## Commands
 

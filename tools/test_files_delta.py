@@ -26,6 +26,7 @@ W.OWNER = f"test-delta-{uuid.uuid4().hex[:8]}"
 W.DRIVE_CFG = f"{tmp}/no-drive.json"
 W.FILES_STORAGE_MAX = 2 * W.MiB
 W._kaggle_ok[0] = False
+W._modal_store.update(owner=W.OWNER, env=None, at=time.time() + 1e6)   # this test account: no Modal keys yet
 alerts = []
 W.files_alert = lambda sb, text, kind="save": alerts.append((kind, text))
 sb = W.Supabase()
@@ -213,6 +214,51 @@ try:
     check("Drive copy moved to Kaggle")
     put("work/studio/new10.bin", os.urandom(50 << 10))
     assert save()["where"].startswith("Storage (changes"), "a Kaggle copy must not be redone at every save"
+
+    # 11. with Modal keys in the vault, the next save moves the full copy to the Modal volume, and the
+    #     changes go there too: Supabase keeps only the small manifests
+    MV = {}
+
+    def fake_mstore(sb_, op, *args, volume=None, timeout=None):
+        if op == "put":
+            MV[args[1]] = open(args[0], "rb").read()
+            return {"ok": True}
+        if op == "ls":
+            return [{"path": p, "size": len(d)} for p, d in MV.items() if p.startswith(args[0] + "/")]
+        if op == "get":
+            if args[0] not in MV:
+                return None
+            open(args[1], "wb").write(MV[args[0]])
+            return {"ok": True}
+        if op == "rm":
+            for p in args:
+                MV.pop(p, None)
+            return {"ok": True}
+
+    W._mstore = fake_mstore
+    W._modal_store.update(owner=W.OWNER, env={"MODAL_TOKEN_ID": "x", "MODAL_TOKEN_SECRET": "y"},
+                          at=time.time() + 1e6, pkg=True)
+    put("work/studio/new11.bin", os.urandom(50 << 10))
+    info = save()
+    assert info["where"] == "Modal volume", info
+    man = W._manifest_get(sb, W.FILES_BLOB)
+    assert man["modal"]["path"] in MV and len(MV) == 1, (man, list(MV))
+    check("full copy moved to the Modal volume")
+    put("work/studio/old2.bin", b"edited on Modal\n")
+    info = save()
+    assert info["where"].startswith("the Modal volume (changes") and info["files"] == 1, info
+    assert len(MV) == 2 and not sb.exists(W.state_key(W.FILES_DELTA_BLOB)), "the changes belong in Modal"
+    check("Modal copy + changes in Modal")
+    put("work/studio/new12.bin", os.urandom(50 << 10))
+    info = save(budget=120)
+    assert info["where"].startswith("the Modal volume (changes"), info
+    assert len(MV) == 2, f"the previous change-only copy must be replaced: {list(MV)}"
+    check("stop: changes in Modal")
+    W.FILES_BASE_EVERY = 0          # the full copy is due: a new one replaces the old in the volume
+    put("work/studio/new13.bin", os.urandom(50 << 10))
+    info = save()
+    assert info["where"] == "Modal volume" and len(MV) == 1, (info, list(MV))
+    check("new full copy in Modal, old copy and change-only copy removed")
 finally:
     for n in (W.FILES_BLOB, W.FILES_DELTA_BLOB):
         W._forget_old(sb, n, W._manifest_get(sb, n), keep_single=False, keep_manifest=False)

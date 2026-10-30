@@ -261,12 +261,13 @@ class Supabase:
 
     def list(self, prefix: str, bucket: str = BUCKET) -> list:
         """Objects directly under `prefix` (paginated). Each: {name (full path), size, updated_at}.
-        Sub-folder placeholders (id is null) are skipped."""
+        Sub-folder placeholders (id is null) are skipped. prefix "" is the bucket root."""
         out, offset, page = [], 0, 100
+        head = prefix.rstrip("/")
         while True:
             r = requests.post(f"{SB_URL}/storage/v1/object/list/{bucket}", timeout=60,
                               headers=self.headers(),
-                              json={"prefix": prefix.rstrip("/") + "/", "limit": page, "offset": offset,
+                              json={"prefix": f"{head}/" if head else "", "limit": page, "offset": offset,
                                     "sortBy": {"column": "name", "order": "asc"}})
             if r.status_code >= 400:
                 raise RuntimeError(f"storage list {prefix}: {r.status_code} {r.text[:200]}")
@@ -274,7 +275,7 @@ class Supabase:
             for o in batch:
                 if o.get("id") is None:
                     continue
-                out.append({"name": f"{prefix.rstrip('/')}/{o['name']}",
+                out.append({"name": f"{head}/{o['name']}" if head else o["name"],
                             "size": int((o.get("metadata") or {}).get("size") or 0),
                             "updated_at": o.get("updated_at") or o.get("created_at")})
             if len(batch) < page:
@@ -782,6 +783,8 @@ def _forget_old(sb: "Supabase", name: str, old: dict | None, keep_single: bool, 
             sb.delete_object(state_key(n))
         if old.get("drive"):
             drive_rm(old["drive"].get("id", ""))
+        if old.get("modal") and old["modal"].get("path"):
+            _mstore(sb, "rm", old["modal"]["path"], volume=old["modal"].get("volume"), timeout=120)
     if not keep_single:
         sb.delete_object(state_key(name))
     if not keep_manifest:
@@ -855,7 +858,7 @@ KAGGLE_USER = (CFG.get("kaggle_username") or os.environ.get("KAGGLE_USERNAME") o
 _KAGGLE_KEY = (CFG.get("kaggle_key") or os.environ.get("KAGGLE_KEY") or os.environ.get("KAGGLE_API_TOKEN") or "").strip()
 KAGGLE_PUSH_TIMEOUT = int(CFG.get("kaggle_push_timeout_secs", 1800))
 KAGGLE_READY_WAIT = int(CFG.get("kaggle_ready_wait_secs", 900))   # a pushed copy must be listed within this
-KAGGLE_FILE_MAX = int(CFG.get("kaggle_file_max_mb", 4096)) * MiB   # biggest single file kept in a full copy
+BIG_FILE_MAX = int(CFG.get("big_file_max_mb", CFG.get("kaggle_file_max_mb", 4096))) * MiB  # biggest file kept when a big store (Modal, Kaggle) holds the full copy
 _kaggle_ok: list = [None]
 
 
@@ -989,6 +992,152 @@ def blob_save_kaggle(sb: "Supabase", name: str, path: str, extra: dict | None = 
     return {"size": size, "parts": 0, "kaggle": slug}
 
 
+# ── Modal Volume: the first home of the big copies (1 TiB free per workspace) ────────────────────────
+# Modal includes 1 TiB of Volume storage a month for free (https://modal.com/pricing). Measured from
+# Kaggle: 600 MB stored in 28 s and fetched in 9 s, with no processing wait. The keys are this account's
+# own vault keys (MODAL_TOKEN_ID / MODAL_TOKEN_SECRET, the pair the Video tab uses; `modal_store_keys` in
+# worker.json names another pair), so each account's files sit in its own Modal workspace, and an account
+# without Modal keys uses the Kaggle datasets instead. Every copy gets a unique path, and the manifest is
+# switched only once Modal lists the file at its full size, so a failed upload never costs the last good
+# copy; the previous file is removed after the switch.
+MODAL_STORE_VOLUME = str(CFG.get("modal_store_volume") or "panda-store")
+MODAL_STORE_KEYS = str(CFG.get("modal_store_keys") or "MODAL_TOKEN")
+MODAL_STORE_TIMEOUT = int(CFG.get("modal_store_timeout_secs", 1800))
+_modal_store: dict = {"owner": None, "env": None, "at": 0.0, "pkg": None}
+_modal_pkg_lock = threading.Lock()
+
+# Runs in a child process: the Modal client never loads into the worker, and a hang is killed by a timeout.
+_MSTORE_PY = r'''
+import json, os, sys
+import modal
+from modal.exception import NotFoundError
+op, vol = sys.argv[1], sys.argv[2]
+v = modal.Volume.from_name(vol, create_if_missing=True)
+if op == "put":
+    with v.batch_upload(force=True) as b:
+        b.put_file(sys.argv[3], sys.argv[4])
+    out = {"ok": True}
+elif op == "ls":
+    try:
+        out = [{"path": "/" + e.path.lstrip("/"), "size": e.size} for e in v.listdir(sys.argv[3], recursive=True)]
+    except NotFoundError:
+        out = []
+elif op == "get":
+    tmp = sys.argv[4] + ".part"
+    with open(tmp, "wb") as f:
+        v.read_file_into_fileobj(sys.argv[3], f)
+    os.replace(tmp, sys.argv[4])
+    out = {"ok": True, "size": os.path.getsize(sys.argv[4])}
+elif op == "rm":
+    gone = 0
+    for p in sys.argv[3:]:
+        try:
+            v.remove_file(p, recursive=True)
+            gone += 1
+        except NotFoundError:
+            pass
+    out = {"ok": True, "removed": gone}
+print("\nMSTORE " + json.dumps(out))
+'''
+
+
+def ensure_modal_pkg() -> bool:
+    """The Modal client, installed once per run (the Video tab and the file store share it)."""
+    if _modal_store["pkg"] is None:
+        with _modal_pkg_lock:
+            if _modal_store["pkg"] is None:
+                import importlib.util
+                ok = importlib.util.find_spec("modal") is not None
+                if not ok:
+                    ok = sh(f"{sys.executable} -m pip install -q {MODAL_PKG}", timeout=600).returncode == 0
+                    importlib.invalidate_caches()
+                _modal_store["pkg"] = ok
+    return bool(_modal_store["pkg"])
+
+
+def modal_store_env(sb: "Supabase") -> dict | None:
+    """MODAL_TOKEN_ID / MODAL_TOKEN_SECRET of this account's own Modal workspace, read from its vault
+    (Start reads them before secrets.env exists). None when the account has no Modal keys."""
+    st = _modal_store
+    if st["owner"] == OWNER and time.time() - st["at"] < 600:
+        return st["env"]
+    try:
+        rows = sb.rest("GET", "secrets", params={
+            "owner": f"eq.{OWNER}", "select": "name,value",
+            "name": f"in.({MODAL_STORE_KEYS}_ID,{MODAL_STORE_KEYS}_SECRET)"}) or []
+    except Exception as exc:
+        log("modal store: could not read the keys:", type(exc).__name__)
+        return st["env"] if st["owner"] == OWNER else None
+    keys = {r["name"]: r["value"] for r in rows}
+    tid, sec = keys.get(f"{MODAL_STORE_KEYS}_ID"), keys.get(f"{MODAL_STORE_KEYS}_SECRET")
+    env = None
+    if tid and sec:
+        for v in (tid, sec):
+            if v not in SECRETS:
+                SECRETS.append(v)
+        env = {"MODAL_TOKEN_ID": tid, "MODAL_TOKEN_SECRET": sec}
+    st.update(owner=OWNER, env=env, at=time.time())
+    return env
+
+
+def modal_store_ok(sb: "Supabase") -> bool:
+    return bool(modal_store_env(sb)) and ensure_modal_pkg()
+
+
+def _mstore(sb: "Supabase", op: str, *args: str, volume: str | None = None, timeout: float | None = None):
+    """One store operation in a child process. Returns its decoded answer, or None on any failure."""
+    env = modal_store_env(sb)
+    if not env or not ensure_modal_pkg():
+        return None
+    try:
+        r = subprocess.run([sys.executable, "-c", _MSTORE_PY, op, volume or MODAL_STORE_VOLUME, *args],
+                           env={**os.environ, **env, "MODAL_CONFIG_PATH": f"{WORK}/.modal-store.toml"},
+                           capture_output=True, text=True, timeout=max(30, timeout or MODAL_STORE_TIMEOUT))
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"modal store {op}:", type(exc).__name__)
+        return None
+    m = re.search(r"^MSTORE (.*)$", r.stdout or "", re.M)
+    if r.returncode != 0 or not m:
+        log(f"modal store {op} failed:", scrub((r.stderr or r.stdout or "")[-240:]))
+        return None
+    try:
+        return json.loads(m.group(1))
+    except ValueError:
+        return None
+
+
+def modal_store_dir(name: str) -> str:
+    """Folder of one blob in the volume: per account, so two accounts sharing a workspace never collide."""
+    owner = re.sub(r"[^a-z0-9]", "", str(OWNER).lower())[:12] or "owner"
+    return f"/{owner}/{name.replace('/', '_')}"
+
+
+def blob_save_modal(sb: "Supabase", name: str, path: str, extra: dict | None = None,
+                    timeout: float | None = None) -> dict | None:
+    """Store `path` as `name` in this account's Modal volume; Storage keeps only the manifest. Returns
+    None on failure, and then the manifest still names the last good copy."""
+    if not modal_store_env(sb):
+        return None
+    old = _manifest_get(sb, name)
+    folder = modal_store_dir(name)
+    rpath = f"{folder}/{int(time.time())}{uuid.uuid4().hex[:4]}.pbak"
+    size, t0 = os.path.getsize(path), time.time()
+    sha = sha256_file(path)
+    if not (_mstore(sb, "put", path, rpath, timeout=timeout) or {}).get("ok"):
+        return None
+    listed = _mstore(sb, "ls", folder, timeout=120)
+    if not isinstance(listed, list) or not any(e.get("path") == rpath and e.get("size") == size for e in listed):
+        log(f"modal store: {rpath} is not listed at its full size; the last good copy stays")
+        _mstore(sb, "rm", rpath, timeout=120)
+        return None
+    _put_manifest(sb, name, {"v": 1, "size": size, "sha256": sha, "parts": [],
+                             "modal": {"volume": MODAL_STORE_VOLUME, "path": rpath},
+                             "saved_at": now_iso(), **(extra or {})})
+    _forget_old(sb, name, old, keep_single=False, keep_manifest=True)   # also the previous Modal/Drive copy
+    log(f"modal store: {size / MiB:.0f} MB as {rpath} in {time.time() - t0:.0f} s")
+    return {"size": size, "parts": 0, "modal": MODAL_STORE_VOLUME}
+
+
 def blob_load(sb: "Supabase", name: str, dest: str) -> bool:
     """Fetch what blob_save / blob_save_drive stored (or an old single object). False if there is none."""
     man = _manifest_get(sb, name)
@@ -1002,6 +1151,18 @@ def blob_load(sb: "Supabase", name: str, dest: str) -> bool:
         k = man["kaggle"]
         if not kaggle_pull_file(k.get("slug", ""), k.get("file", ""), dest):
             raise RuntimeError("the saved work files are in the Kaggle dataset but could not be fetched")
+        sha = sha256_file(dest)
+    elif man.get("modal"):
+        mm = man["modal"]
+        got = None
+        for i in range(3):      # a busy moment at Modal must not cost a whole restore
+            got = _mstore(sb, "get", mm.get("path", ""), dest, volume=mm.get("volume"))
+            if (got or {}).get("ok"):
+                break
+            time.sleep(10 * (i + 1))
+        if not (got or {}).get("ok"):
+            raise RuntimeError(f"{name} is in the Modal volume but could not be fetched "
+                               "(are MODAL_TOKEN_ID / MODAL_TOKEN_SECRET still in Customize -> API keys?)")
         sha = sha256_file(dest)
     else:
         local = []
@@ -1330,22 +1491,31 @@ def files_delta_save(sb: "Supabase", entries: list, reason: str, deadline, level
     changed = files_changed(entries, idx, None if idx else (_manifest_get(sb, FILES_BLOB) or {}).get("saved_at"))
     keep = sorted([e for e in entries if e.kind != "file"] + changed, key=lambda e: e.arc)  # folders/links are tiny
     arc = f"{WORK}/files-delta.tar.gz"
+    where = "Storage"
     try:
         write_archive(keep, arc, deadline, level)
         size = os.path.getsize(arc)
-        if size > FILES_STORAGE_MAX:
-            files_alert(sb, f"Panda saved {size // MiB} MB of changed work files in Supabase because a new full "
-                            "copy could not be made yet. Nothing was left out; the next full copy clears it.", "big-delta")
         sb.delete_object(state_key(FILES_DELTA_META))     # never a meta pointing at a half-uploaded delta
-        done = blob_save(sb, FILES_DELTA_BLOB, arc)
+        done = None
+        if modal_store_ok(sb):
+            done = blob_save_modal(sb, FILES_DELTA_BLOB, arc,
+                                   timeout=max(30, deadline - time.time()) if deadline else None)
+            where = "the Modal volume"
+        if done is None:
+            where = "Storage"
+            if size > FILES_STORAGE_MAX:
+                files_alert(sb, f"Panda saved {size // MiB} MB of changed work files in Supabase because a new full "
+                                "copy could not be made yet. Nothing was left out; the next full copy clears it.",
+                            "big-delta")
+            done = blob_save(sb, FILES_DELTA_BLOB, arc)
         sb.put(state_key(FILES_DELTA_META), json.dumps({"base_id": (idx or {}).get("id"), "files": len(changed),
                                                          "saved_at": now_iso()}).encode(), mime="application/json")
     finally:
         with contextlib.suppress(OSError):
             os.remove(arc)
     info = {"files": len(changed), "raw_bytes": sum(e.size for e in changed), "archive_bytes": done["size"],
-            "parts": done["parts"], "where": "Storage (changes since the last full copy)", "skipped": skipped}
-    log(f"files saved ({reason}): {len(changed)} changed files ({why}), {done['size'] / MiB:.1f} MB in Storage; "
+            "parts": done["parts"], "where": f"{where} (changes since the last full copy)", "skipped": skipped}
+    log(f"files saved ({reason}): {len(changed)} changed files ({why}), {done['size'] / MiB:.1f} MB in {where}; "
         f"the full copy stays as it is")
     return info
 
@@ -1378,10 +1548,17 @@ def files_snapshot(sb: "Supabase", reason: str, budget: float | None = None) -> 
 FILES_STOP_LOCK_WAIT = int(CFG.get("files_stop_lock_wait_secs", 600))
 
 
+def _store_rank(man: dict | None) -> int:
+    """Where a full copy lives, best first: Modal volume 3, Kaggle 2, Drive 1, Supabase Storage 0."""
+    man = man or {}
+    return 3 if man.get("modal") else 2 if man.get("kaggle") else 1 if man.get("drive") else 0
+
+
 def _files_snapshot_locked(sb: "Supabase", reason: str, budget, deadline, level: int) -> dict | None:
     drive_ok = os.path.exists(DRIVE_CFG)
-    big_store = kaggle_ok() or drive_ok
-    entries, skipped = select_files(HOME, FILES_ROOTS, max_file=KAGGLE_FILE_MAX if kaggle_ok() else None,
+    modal_ok = modal_store_ok(sb)
+    big_store = modal_ok or kaggle_ok() or drive_ok
+    entries, skipped = select_files(HOME, FILES_ROOTS, max_file=BIG_FILE_MAX if (modal_ok or kaggle_ok()) else None,
                                     exclude=(WORK,))
     for arc, size, why in skipped:
         log(f"files: not saved, {why}: ~/{arc} ({size // MiB} MB)")
@@ -1396,8 +1573,11 @@ def _files_snapshot_locked(sb: "Supabase", reason: str, budget, deadline, level:
     man = _manifest_get(sb, FILES_BLOB)
     have_base = bool(man) or sb.exists(state_key(FILES_BLOB))
     plan, why = files_plan(entries, idx, have_base, time.time(), budget is not None, big_store)
-    if plan == "delta" and budget is None and kaggle_ok() and (man or {}).get("drive"):
-        plan, why = "full", "moving the full copy from Google Drive to the Kaggle dataset"   # Drive is only the fallback
+    small = sum(e.size for e in entries if e.kind == "file") <= FILES_STORAGE_MAX
+    best = 3 if modal_ok else 0 if small else 2 if kaggle_ok() else 1 if drive_ok else 0   # small ones fit Storage
+    if plan == "delta" and budget is None and have_base and best > _store_rank(man):
+        where_to = {3: "the Modal volume", 2: "the Kaggle dataset", 1: "Google Drive"}[best]
+        plan, why = "full", f"moving the full copy to {where_to}"     # once; a failure waits an hour
     if plan == "full" and have_base and idx and time.time() - _files_full["fail_at"] < FILES_FULL_RETRY:
         plan, why = "delta", "the last full copy failed less than an hour ago"
     if plan == "delta":
@@ -1414,9 +1594,12 @@ def _files_snapshot_locked(sb: "Supabase", reason: str, budget, deadline, level:
             log(f"files: could not read ~/{arc}")
         size = os.path.getsize(archive)
         extra = {"sig": sig, "files": n}
-        if size <= FILES_STORAGE_MAX:
+        if modal_ok:
+            done, where = blob_save_modal(sb, FILES_BLOB, archive, extra,
+                                          timeout=max(30, deadline - time.time()) if deadline else None), "Modal volume"
+        if done is None and size <= FILES_STORAGE_MAX:
             done, where = blob_save(sb, FILES_BLOB, archive, extra=extra), "Storage"
-        else:
+        elif done is None:
             if kaggle_ok():
                 done, where = blob_save_kaggle(sb, FILES_BLOB, archive, extra), "Kaggle dataset"
             if done is None and drive_ok:
@@ -1651,8 +1834,63 @@ def storage_gc(sb: "Supabase") -> dict:
         log("storage GC: remote sweep skipped:", scrub(exc)[:120])
     if rrem:
         log(f"storage GC: removed {rrem} stale remote task files, freed {rfreed // (1 << 20)} MB")
-    return {"removed": removed, "freed": freed + rfreed, "referenced": len(referenced),
-            "total": len(objs), "remote_removed": rrem}
+    try:
+        pg = gc_part_generations(sb, now)
+    except Exception as exc:
+        log("storage GC: snapshot-part sweep skipped:", scrub(exc)[:120])
+        pg = {}
+    return {"removed": removed, "freed": freed + rfreed + pg.get("freed", 0), "referenced": len(referenced),
+            "total": len(objs), "remote_removed": rrem, "parts_removed": pg.get("removed", 0)}
+
+
+PARTS_RE = re.compile(r"^(?P<base>.+)\.(?P<gen>[0-9a-f]{12,})\.p(?P<n>\d{3})$")
+PARTS_GC_GRACE = 24 * 3600          # a save may be uploading these right now
+PARTS_GC_NO_MANIFEST = 7 * 86400    # parts of a blob that has no manifest at all
+LEGACY_KIRO = "latest-kiro.tar.gz"  # kiro-cli's files in one archive, from before the chunk store
+
+
+def gc_part_generations(sb: "Supabase", now: float | None = None, dry: bool = False) -> dict:
+    """Remove snapshot parts (<name>.<gen>.pNNN) of a generation the blob's manifest does not name: left by
+    a save that crashed before its manifest, or by a cleanup that failed. One account held 10 generations
+    of a 40 MB-part snapshot (4.3 GB) and only one was ever read. Also the pre-chunk copy of kiro-cli's
+    files (latest-kiro.tar.gz) once the chunk index has superseded it for a day: restore reads that copy
+    only when there is no index. A manifest that cannot be read for sure leaves its blob alone."""
+    now = now or time.time()
+    by_name = {o["name"].rsplit("/", 1)[-1]: o for o in sb.list(state_key("").rstrip("/"))}
+    groups: dict = {}
+    for leaf, o in by_name.items():
+        m = PARTS_RE.match(leaf)
+        if m:
+            groups.setdefault(m["base"], []).append((m["gen"], o))
+    idx = by_name.get(KIRO_INDEX)
+    legacy = by_name.get(_manifest_name(LEGACY_KIRO)) or by_name.get(LEGACY_KIRO)
+    legacy_dead = bool(idx and legacy and (parse_ts(idx.get("updated_at")) or 0)
+                       - (parse_ts(legacy.get("updated_at")) or now) > 86400)
+    drop = []
+    for base, items in groups.items():
+        if legacy_dead and base == LEGACY_KIRO:
+            drop += [o for _, o in items]
+            continue
+        try:
+            raw = sb.get(state_key(_manifest_name(base)))   # strict: None only when it truly is missing
+            man = json.loads(raw) if raw else None
+        except Exception:
+            continue
+        live = {m["gen"] for n in (man or {}).get("parts") or []
+                if (m := PARTS_RE.match(str(n).rsplit("/", 1)[-1]))}
+        grace = PARTS_GC_GRACE if man else PARTS_GC_NO_MANIFEST
+        drop += [o for gen, o in items
+                 if gen not in live and now - (parse_ts(o.get("updated_at")) or now) >= grace]
+    if legacy_dead:
+        drop += [o for o in (by_name.get(LEGACY_KIRO), by_name.get(_manifest_name(LEGACY_KIRO))) if o]
+    freed = sum(o["size"] for o in drop)
+    if not dry:
+        for o in drop:
+            _safe_delete(sb, o["name"])
+    if drop:
+        log(f"storage GC: {'would remove' if dry else 'removed'} {len(drop)} unused snapshot parts, "
+            f"{freed // MiB} MB" + (" (with the pre-chunk kiro copy)" if legacy_dead else ""))
+    return {"removed": len(drop), "freed": freed, "legacy": legacy_dead, "names": [o["name"] for o in drop]}
 
 
 def gc_loop(sb: "Supabase", stop: threading.Event):
@@ -2698,10 +2936,8 @@ def video_llm(gw: "Gateway"):
 def _video_install(sb: "Supabase", gw: "Gateway"):
     VIDEO["state"] = "installing"
     try:
-        try:
-            import modal  # noqa: F401
-        except ImportError:
-            sh(f"{sys.executable} -m pip install -q {MODAL_PKG}", timeout=900, check=True)
+        if not ensure_modal_pkg():
+            raise RuntimeError("the Modal client could not be installed")
         path = f"{HOME}/.kiro/crew/skills/panda-video"
         if path not in sys.path:
             sys.path.insert(0, path)
