@@ -3651,9 +3651,42 @@ def auto_title(sb: "Supabase", gw: "Gateway", chat: dict, question: str, answer:
         log("auto title:", _reason(exc))
 
 
+TITLE_BACKFILL_DAYS = int(CFG.get("title_backfill_days", 14))
+TITLE_BACKFILL_MAX = 60
+
+
+def backfill_titles(sb: "Supabase", gw: "Gateway"):
+    """Startup: chats from before Haiku titles (or whose title call failed) still show the cut first message.
+    Name them now, one at a time and in the background. A chat drops out once titled or renamed."""
+    since = (datetime.now(timezone.utc) - timedelta(days=TITLE_BACKFILL_DAYS)).isoformat()
+    chats = sb.rest("GET", "chats", params={"owner": f"eq.{OWNER}", "updated_at": f"gte.{since}", "order": "updated_at.desc",
+                                            "limit": str(TITLE_BACKFILL_MAX), "select": "id,title,agent"}) or []
+    n = 0
+    for c in chats:
+        if c.get("agent") == "incognito" or not c.get("title"):
+            continue
+        qs = sb.rest("GET", "messages", params={"chat_id": f"eq.{c['id']}", "role": "eq.user", "order": "id.asc",
+                                                "limit": "4", "select": "content"}) or []
+        if not qs or not title_wanted(c, {"content": qs[0].get("content") or ""}):
+            continue
+        ans = sb.rest("GET", "messages", params={"chat_id": f"eq.{c['id']}", "role": "eq.assistant", "status": "eq.done",
+                                                 "order": "id.asc", "limit": "1", "select": "content"}) or []
+        if not ans:
+            continue
+        # A first message like "hi" says nothing about the chat: give Haiku the first few.
+        q = "\n---\n".join((r.get("content") or "")[:600] for r in qs)[:2000]
+        auto_title(sb, gw, c, q, ans[0].get("content") or "")
+        n += 1
+    if n:
+        log(f"titles: asked Haiku to name {n} older chats")
+
+
 def lite_ask(gw: "Gateway", text: str, model: str, name: str, timeout: int = 60) -> str:
     """One short answer from a throw-away kirocrew-lite slot (no tools, nothing remembered)."""
-    created = gw.call("POST", "/api/chat/slots", {"name": name, "agent": "kirocrew-lite", "memory_mode": "incognito"})
+    # Crew keys a slot by its name: two calls with one name shared a slot, mixed their answers and deleted
+    # each other's slot ("not found"). A unique suffix gives every call its own.
+    created = gw.call("POST", "/api/chat/slots", {"name": f"{name} {uuid.uuid4().hex[:6]}", "agent": "kirocrew-lite",
+                                                  "memory_mode": "incognito"})
     slot = created.get("key") or created.get("id") or created.get("slot") or created.get("name")
     if not slot:
         raise RuntimeError("no narrator slot")
@@ -6977,6 +7010,7 @@ def main():
         except Exception as exc:
             log("follow-up resume failed:", scrub(exc)[:200])
         threading.Thread(target=claim_loop, args=(sb, gw, pool, stop_evt), daemon=True).start()
+        threading.Thread(target=_safe, args=(backfill_titles, sb, gw), daemon=True, name="titles").start()
         SESSION_INFO.update(restored=restored, files_restored=files_state, startup_secs=round(time.time() - T0), crew=CREW_VERSION["v"],
                             start_steps=START_STEPS)
         log("start timings (s since script start):", START_STEPS)

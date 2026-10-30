@@ -46,4 +46,30 @@ sb = FakeSB()
 W.auto_title(sb, None, chat, q, "x")
 assert not sb.patches, "empty answer must not blank the title"
 print("ok first turn only, placeholder only, rename-safe, cleaned title")
+
+# Startup backfill: only owner chats still on their placeholder, with an answer; Haiku sees the first few questions.
+CHATS = [{"id": "hi1", "title": "hi"}, {"id": "ren", "title": "My name"}, {"id": "inc", "title": "hi", "agent": "incognito"},
+         {"id": "noans", "title": "x"}]
+MSGS = {"hi1": (["hi", "make me an image of an elephant"], ["Hello!"]), "ren": (["hello"], ["Hi"]),
+        "inc": (["hi"], ["Hi"]), "noans": (["x"], [])}
+
+
+class BackSB(FakeSB):
+    def rest(self, method, table, params=None, body=None):
+        if method == "PATCH":
+            return super().rest(method, table, params, body)
+        if table == "chats":
+            assert params["owner"] == f"eq.{W.OWNER}"
+            return CHATS
+        users, answers = MSGS[params["chat_id"][3:]]
+        return [{"content": c} for c in (users if params["role"] == "eq.user" else answers)]
+
+
+seen = []
+W.lite_ask = lambda gw, text, *a, **k: seen.append(text) or "Elephant image"
+sb = BackSB()
+W.backfill_titles(sb, None)
+assert [p[1]["id"] for p in sb.patches] == ["eq.hi1"], sb.patches
+assert "elephant" in seen[0], "later questions not given to Haiku"
+print("ok startup backfill names only placeholder chats with an answer")
 print("all passed")
