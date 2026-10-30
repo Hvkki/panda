@@ -13,7 +13,7 @@
   pjob wait NAME [--max 300]         block until NAME ends or --max seconds pass (default 240), then status
   pjob wait-any A B C [--max 300]    block until the first of them ends
   pjob log NAME [-n 40]              last lines of the log
-  pjob stop NAME                     stop it (whole process group)
+  pjob stop NAME                     stop it: every process of the job (also `timeout`-wrapped commands)
   pjob list                          every job, newest first
 
 Jobs live in ~/work/jobs/<NAME>/ (cmd, pid, log, exit, started, ended). A job that was running when
@@ -81,9 +81,13 @@ def state(name: str) -> dict:
     else:
         st = "lost"   # Panda restarted (or the process was killed) before it finished
     end = float(ended) if ended else time.time()
-    return {"name": name, "state": st, "exit": int(ex) if ex.lstrip("-").isdigit() else None,
-            "secs": round(end - started) if started else None, "cmd": _read(d, "cmd")[:300],
-            "log": os.path.join(d, "log")}
+    out = {"name": name, "state": st, "exit": int(ex) if ex.lstrip("-").isdigit() else None,
+           "secs": round(end - started) if started else None, "cmd": _read(d, "cmd")[:300],
+           "log": os.path.join(d, "log")}
+    guard = _read(d, "guard")
+    if guard and st != "running":
+        out["guard"] = guard[:300]     # Panda's resource guard stopped it (low memory or disk)
+    return out
 
 
 def tail(name: str, n: int = 15) -> str:
@@ -107,6 +111,8 @@ def show(s: dict, n: int = 12):
     t = f"{s['secs']}s" if s.get("secs") is not None else "?"
     extra = f" exit={s['exit']}" if s.get("exit") is not None else ""
     print(f"{s['name']}: {s['state']}{extra} after {t}")
+    if s.get("guard"):
+        print(f"  stopped by Panda's guard: {s['guard']}")
     if s["state"] != "missing" and n:
         out = tail(s["name"], n)
         if out:
@@ -148,6 +154,82 @@ def slot_of_pid(pid: int) -> str:
         if pid <= 1:
             return ""
     return ""
+
+
+def _procs() -> dict:
+    """pid -> (ppid, session id, start time) for every live process."""
+    out = {}
+    for n in os.listdir("/proc"):
+        if n.isdigit():
+            f = _stat(int(n))
+            if len(f) > 19 and f[0] != "Z":
+                try:
+                    out[int(n)] = (int(f[1]), int(f[3]), f[19])
+                except ValueError:
+                    pass
+    return out
+
+
+def job_procs(pid: int) -> dict:
+    """Every process of the job whose wrapper is `pid`: pid -> start time.
+
+    pjob starts each job in its own session, so its members share session id == pid even after the
+    wrapper dies and they are re-parented to PID 1. GNU `timeout` (and anything else that calls
+    setpgid) leaves the process GROUP but stays in the session, which is why stopping only the group
+    used to leave `timeout -k 10 600 node render.mjs` running. Descendants by parent pid are added too,
+    for a command that started its own session (setsid). Linux never reuses a pid while it is still a
+    live session id, so a dead leader's session members are always this job's."""
+    procs = _procs()
+    if not pid or pid <= 1:
+        return {}
+    kids: dict = {}
+    for q, (pp, _, _) in procs.items():
+        kids.setdefault(pp, []).append(q)
+    keep = {os.getpid()}
+    q = os.getpid()
+    for _ in range(64):        # never stop pjob itself or the shell that called it
+        f = _stat(q)
+        if not f or int(f[1]) <= 1:
+            break
+        q = int(f[1])
+        keep.add(q)
+    todo = [q for q, (_, sid, _) in procs.items() if sid == pid] + ([pid] if pid in procs else [])
+    seen: dict = {}
+    while todo:
+        q = todo.pop()
+        if q in seen or q not in procs or q <= 1 or q in keep:
+            continue
+        seen[q] = procs[q][2]
+        todo += kids.get(q, [])
+    return seen
+
+
+def stop_procs(pid: int, grace: float = 3.0) -> int:
+    """TERM every process of the job, wait up to `grace` seconds, then KILL what is left (also anything
+    the job started meanwhile). Returns how many processes were signalled."""
+    hit = job_procs(pid)
+
+    def live(q, start):
+        f = _stat(q)
+        return len(f) > 19 and f[19] == start and f[0] != "Z"
+
+    for q, start in hit.items():
+        if live(q, start):
+            try:
+                os.kill(q, signal.SIGTERM)
+            except OSError:
+                pass
+    t0 = time.time()
+    while time.time() - t0 < grace and any(live(q, s) for q, s in hit.items()):
+        time.sleep(0.2)
+    rest = {**job_procs(pid), **{q: s for q, s in hit.items() if live(q, s)}}
+    for q, start in rest.items():
+        if live(q, start):
+            try:
+                os.kill(q, signal.SIGKILL)
+            except OSError:
+                pass
+    return len(set(hit) | set(rest))
 
 
 def my_slot() -> str:
@@ -196,7 +278,7 @@ def cmd_start(a, rest):
                            *extra, f"--cmd={line}"])
         shown = f"remote {'agent' if a.agent else ''}: {shown}".replace("remote :", "remote:")
     os.makedirs(d, exist_ok=True)
-    for f in ("exit", "ended", "log", "notify", "notified", "watch.json"):
+    for f in ("exit", "ended", "log", "notify", "notified", "watch.json", "guard", "slot"):
         try:
             os.remove(os.path.join(d, f))
         except OSError:
@@ -204,6 +286,9 @@ def cmd_start(a, rest):
     open(os.path.join(d, "cmd"), "w").write(shown)
     open(os.path.join(d, "started"), "w").write(str(time.time()))
     open(os.path.join(d, "boot"), "w").write(_boot())
+    slot = my_slot()
+    if slot:   # even without --notify: if Panda's guard has to stop this job, it tells this chat
+        open(os.path.join(d, "slot"), "w").write(slot)
     # The wrapper records the exit code and end time itself, so status works after this process is gone.
     q = shlex.quote
     wrapper = (f"cd {q(a.cwd or os.getcwd())} && ( {line} ) ; rc=$? ; "
@@ -214,7 +299,6 @@ def cmd_start(a, rest):
     open(os.path.join(d, "pid"), "w").write(str(p.pid))
     print(f"started {a.name} (pid {p.pid}). Log: {d}/log")
     if a.notify:
-        slot = my_slot()
         if not slot:  # a helper (subagent) run or a shell outside any chat: nobody to wake
             print("No chat to wake from here (helper run): wait with "
                   f"`pjob wait {a.name} --max 900` in few long slices instead of polling often.")
@@ -294,19 +378,16 @@ def main():
     elif a.op == "log":
         print(tail(a.name, a.n))
     elif a.op == "stop":
-        pid = int(_read(_dir(a.name), "pid", "0") or 0)
-        if pid and state(a.name)["state"] == "running":
-            try:
-                os.killpg(pid, signal.SIGTERM)
-                time.sleep(2)
-                if _alive(pid):
-                    os.killpg(pid, signal.SIGKILL)
-            except OSError:
-                pass
-            d = _dir(a.name)
-            open(os.path.join(d, "ended"), "w").write(str(time.time()))
-            open(os.path.join(d, "exit"), "w").write("-15")
-            print(f"stopped {a.name}")
+        d = _dir(a.name)
+        pid = int(_read(d, "pid", "0") or 0)
+        st = state(a.name)["state"]
+        same_boot = _read(d, "boot") == _boot()
+        if pid and same_boot and (st == "running" or (st == "lost" and job_procs(pid))):
+            n = stop_procs(pid)
+            if st == "running":
+                open(os.path.join(d, "ended"), "w").write(str(time.time()))
+                open(os.path.join(d, "exit"), "w").write("-15")
+            print(f"stopped {a.name} ({n} process{'es' if n != 1 else ''})")
         else:
             print(f"{a.name} is not running")
     elif a.op == "list":
