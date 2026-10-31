@@ -263,14 +263,36 @@ class Supabase:
     def get_fresh(self, name: str, bucket: str = BUCKET) -> bytes | None:
         """Like get(), never from the CDN. Supabase's CDN can serve an OVERWRITTEN object for up to 60 s
         at other edges (remote Panda read its old queue.json and a short log that way); a fresh signed
-        URL is its own cache key, so it always reaches the origin."""
-        r = http().post(f"{SB_URL}/storage/v1/object/sign/{bucket}/{quote(name)}", json={"expiresIn": 60},
-                          headers=self.headers(), timeout=60)
-        url = (r.json() if r.status_code == 200 else {}).get("signedURL") if r.text else None
-        if not url:
-            return None
-        g = http().get(f"{SB_URL}/storage/v1{url}", timeout=600)
-        return g.content if g.status_code == 200 else None
+        URL is its own cache key, so it always reaches the origin.
+
+        Dropped connections, timeouts, 429 and 5xx are retried (~1 min) like get(): remote jobs poll
+        through this for hours, and one "Connection reset by peer" used to end a job that was waiting
+        for a slot. Only a clear "not there" (400/404) returns None at once."""
+        why = "no connection"
+        for i in range(6):
+            if i:
+                time.sleep(min(20, 1.5 * 2 ** i))
+            try:
+                r = http().post(f"{SB_URL}/storage/v1/object/sign/{bucket}/{quote(name)}",
+                                json={"expiresIn": 60}, headers=self.headers(), timeout=60)
+                if r.status_code in (400, 404):
+                    return None
+                if r.status_code != 200:
+                    why = str(r.status_code)
+                    continue
+                url = (r.json() if r.text else {}).get("signedURL")
+                if not url:
+                    return None
+                g = http().get(f"{SB_URL}/storage/v1{url}", timeout=600)
+            except (requests.RequestException, ValueError) as exc:
+                why = type(exc).__name__
+                continue
+            if g.status_code == 200:
+                return g.content
+            if g.status_code in (400, 404):
+                return None
+            why = str(g.status_code)
+        raise RuntimeError(f"storage kept refusing {name} ({why})")
 
     def delete_object(self, name: str, bucket: str = BUCKET):
         # No JSON Content-Type here: Supabase refuses an empty JSON body with 400, which made every
@@ -5071,6 +5093,7 @@ REMOTE_MAX_IN = int(CFG.get("remote_max_in_mb", 3000)) * MiB
 REMOTE_BOOT_WAIT = 900
 REMOTE_ASK_GAP = 480
 REMOTE_WAIT_NOTE = 240     # while a task waits (boot or a free slot), a progress line this often
+REMOTE_NET_GRACE = 900     # a running/queued task survives this long without reaching Supabase
 REMOTE_LOCK = threading.Lock()
 REMOTE = {rid: {"asked": 0.0, "queue": {"tasks": {}}, "failed": 0.0} for rid in REMOTE_IDS}
 REMOTE_SEEN: set = set()
@@ -5256,14 +5279,30 @@ def remote_task(sb: "Supabase", req: dict):
         queued = True
         got, stale, cancel_at, last_check = 0, 0, 0.0, time.time()
         t_queued = last_wait_note = time.time()
+        net_fail = 0.0           # when Supabase reads started failing (0 = they work)
         while True:
             time.sleep(4)
-            if cancelled() and not cancel_at:
-                cancel_at = time.time()
-                remote_queue_edit(sb, rid, lambda q: q["tasks"].__setitem__(tid, {"cancel": True}))
-            st = remote_get_json(sb, rid, "tasks", tid, "status.json") or {}
-            if int(st.get("log_bytes") or 0) > got:
-                raw = sb.get_fresh(state_key(rkey(rid, "tasks", tid, "log"))) or b""
+            try:
+                if cancelled() and not cancel_at:
+                    remote_queue_edit(sb, rid, lambda q: q["tasks"].__setitem__(tid, {"cancel": True}))
+                    cancel_at = time.time()
+                st = remote_get_json(sb, rid, "tasks", tid, "status.json") or {}
+                raw = (sb.get_fresh(state_key(rkey(rid, "tasks", tid, "log"))) or b""
+                       if int(st.get("log_bytes") or 0) > got else None)
+                beat = (remote_get_json(sb, rid, "beat.json") if time.time() - last_check >= 60 else None)
+                net_fail = 0.0
+            except (requests.RequestException, RuntimeError) as exc:
+                # The task keeps running there; only this worker's view of it is cut off. Keep polling
+                # through a network or Storage outage instead of dropping a job that waited for hours.
+                net_fail = net_fail or time.time()
+                if time.time() - net_fail > REMOTE_NET_GRACE:
+                    raise
+                if time.time() - last_wait_note >= REMOTE_WAIT_NOTE:
+                    last_wait_note = time.time()
+                    note(f"cannot reach Supabase for {_fmt_secs(time.time() - net_fail)}, still trying "
+                         f"({scrub(exc)[:120]})")
+                continue
+            if raw is not None:
                 frm = int(st.get("log_from") or 0)
                 if os.environ.get("PANDA_REMOTE_DEBUG"):
                     log(f"remote {tid}: status {st.get('state')} log_bytes {st.get('log_bytes')} from {frm}, "
@@ -5292,7 +5331,6 @@ def remote_task(sb: "Supabase", req: dict):
                 break
             if time.time() - last_check >= 60:
                 last_check = time.time()
-                beat = remote_get_json(sb, rid, "beat.json")
                 stale = 0 if remote_alive(beat) else stale + 1
                 if stale >= 3:
                     note(f"remote Panda {rid} stopped while running this (its notebook ended)")
