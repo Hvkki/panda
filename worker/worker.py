@@ -5446,6 +5446,77 @@ def remote_status(sb: "Supabase") -> dict:
             "jobs": jobs[::-1], "remote_id": first["id"], "boxes": boxes, "max": REMOTE_MAX}
 
 
+# ── Settings -> Credits: change the Kiro API key ─────────────────────────────────────────────────
+# The key lives in worker.json in the private Kaggle dataset every Panda notebook attaches (main, hand-off
+# and remote). Saving writes a new version of that dataset, so the key is used from the next Start; the
+# running gateway keeps the key it started with. Only the account worker.json belongs to may change it.
+KIRO_KEY_NEXT = {"key": ""}       # saved this run, not in use yet
+_KIRO_KEY_LOCK = threading.Lock()
+
+
+def _key_tail(k: str) -> str:
+    return f"…{k[-4:]}" if len(k) >= 12 else "set" if k else ""
+
+
+def _config_dataset() -> str:
+    """owner/slug of the dataset holding worker.json, from where the notebook mounted it."""
+    if CFG.get("config_dataset"):
+        return str(CFG["config_dataset"])
+    parts = (CFG_PATH or "").split("/")
+    return "/".join(parts[-3:-1]) if len(parts) >= 3 else os.environ.get("KAGGLE_DATASET", "")
+
+
+def kiro_key_command(args: dict) -> dict:
+    action = args.get("action") or "status"
+    if action == "status":
+        nxt = KIRO_KEY_NEXT["key"]
+        return {"tail": _key_tail(CFG.get("kiro_api_key") or ""), "next_tail": _key_tail(nxt),
+                "can_change": OWNER == PRIMARY_OWNER}
+    if action != "set":
+        raise ValueError("unknown action")
+    if OWNER != PRIMARY_OWNER:
+        raise ValueError("only the account this Panda was set up for can change its Kiro API key")
+    key = str(args.get("key") or "").strip()
+    if key and key not in SECRETS:
+        SECRETS.append(key)         # never let it show up in a log or a reply
+    if not re.fullmatch(r"[A-Za-z0-9._~+/=:\-]{20,4096}", key):
+        raise ValueError("that doesn't look like a Kiro API key")
+    if key == (KIRO_KEY_NEXT["key"] or CFG.get("kiro_api_key")):
+        raise ValueError("Panda already has this key")
+    plan = kiro_plan_by_api_key(key)
+    if not plan:
+        raise ValueError("Kiro didn't accept this key (or couldn't be reached), so nothing was changed")
+    slug = _config_dataset()
+    if not slug or not kaggle_ok():
+        raise ValueError("Panda can't reach its Kaggle config dataset, so nothing was changed")
+    with _KIRO_KEY_LOCK:
+        d = tempfile.mkdtemp(prefix="kcfg-")       # /tmp, 0700, never in the saved work folder
+        try:
+            r = _kaggle_run(["datasets", "download", slug, "-p", d, "--unzip", "-q"], 300)
+            path = os.path.join(d, "worker.json")
+            if not r or r.returncode != 0 or not os.path.exists(path):
+                raise ValueError("couldn't download the config dataset, so nothing was changed")
+            os.chmod(path, 0o600)
+            cur = json.load(open(path))
+            cur["kiro_api_key"] = key
+            with open(os.open(path, os.O_WRONLY | os.O_TRUNC, 0o600), "w") as f:
+                json.dump(cur, f)
+            with open(os.path.join(d, "dataset-metadata.json"), "w") as f:
+                json.dump({"title": slug.split("/")[1], "id": slug, "licenses": [{"name": "other"}]}, f)
+            r = _kaggle_run(["datasets", "version", "-p", d, "-m", "kiro key from Panda settings", "-q",
+                             "--delete-old-versions"], 600)
+            if not r or r.returncode != 0 or re.search(r"error|exceed|quota", (r.stdout or "") + (r.stderr or ""), re.I):
+                log("kiro key: dataset upload failed:", scrub(((r.stdout or "") + (r.stderr or "")) if r else "")[-240:])
+                raise ValueError("Kaggle didn't take the new config version, so nothing was changed")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        KIRO_KEY_NEXT["key"] = key
+    log("kiro key: saved a new key to the config dataset; used from the next Start")
+    left = plan.get("credits_plan", 0) - plan.get("credits_used", 0)
+    return {"ok": True, "next_tail": _key_tail(key), "plan": plan.get("plan", ""),
+            "credits_left": round(left, 2), "credits_plan": plan.get("credits_plan")}
+
+
 def remote_agents(slot: str) -> dict:
     """For the chat's helper list: the remote agents (`pjob start --remote --agent`) this chat started,
     with their steps from the job log. Read-only, local files only."""
@@ -6173,14 +6244,14 @@ def _num(v) -> float | None:
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
-def kiro_plan_by_api_key() -> dict:
-    """The Kiro plan total, read with Panda's own KIRO_API_KEY.
+def kiro_plan_by_api_key(key: str | None = None) -> dict:
+    """The Kiro plan total, read with Panda's own KIRO_API_KEY (or `key`, to check a new one).
 
     Kiro Crew skips this under API-key sign-in (reason "api_key_auth"), but Kiro's
     GetUsageLimits accepts the key when the request says it is one (TokenType: API_KEY).
     Returns {} when it can't be read, so the caller keeps whatever Crew said.
     """
-    key = CFG.get("kiro_api_key") or ""
+    key = key if key is not None else CFG.get("kiro_api_key") or ""
     if not key:
         return {}
     headers = {"Authorization": f"Bearer {key}", "TokenType": "API_KEY",
@@ -6619,6 +6690,8 @@ def run_command(sb: Supabase, gw: Gateway, cmd: dict):
             result = video_command(op, args)
         elif op == "remote.status":
             result = remote_status(sb)
+        elif op == "kiro.key":
+            result = kiro_key_command(args)
         elif op == "remote.agents":
             result = remote_agents(str(args.get("slot") or "")[:200])
         elif op == "remote.stop":
@@ -6629,11 +6702,11 @@ def run_command(sb: Supabase, gw: Gateway, cmd: dict):
             raise ValueError(f"unknown op {op}")
         sb.rest("PATCH", "commands", params={"id": f"eq.{cmd['id']}"},
                 body={"status": "done", "result": json.loads(scrub(json.dumps(result if result is not None else {}))),
-                      **({"args": {}} if op == "stt" else {})})  # the voice clip is not kept
+                      **({"args": {}} if op in ("stt", "kiro.key") else {})})  # the voice clip is not kept
     except Exception as exc:
         sb.rest("PATCH", "commands", params={"id": f"eq.{cmd['id']}"},
                 body={"status": "error", "result": {"error": scrub(exc)[:500]},
-                      **({"args": {}} if op == "stt" else {})})
+                      **({"args": {}} if op in ("stt", "kiro.key") else {})})
 
 
 # Requests the app makes while Panda is offline time out in the app after a minute; running them

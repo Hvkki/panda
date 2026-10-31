@@ -1222,3 +1222,6 @@ html:has(.sheet-backdrop), html:has(.sheet-backdrop) body { overscroll-behavior-
   .timeline .timeline-list { overflow: visible; flex: none; }
 }
 .restart-note { display: flex; align-items: center; justify-content: center; gap: 6px; text-align: center; }
+.kiro-key { display: grid; gap: .35em; margin-bottom: 1em; }
+.kiro-key-row { display: flex; gap: .5em; }
+.kiro-key-row .text-input { flex: 1; min-width: 0; }

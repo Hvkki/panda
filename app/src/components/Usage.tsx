@@ -6,6 +6,7 @@ import { modelName } from "../lib/models";
 import { useT } from "../lib/i18n";
 import { fmtCredits, hasPlan, resetsLabel, useAccountUsage, useLedger } from "../lib/usage";
 import { IconCoins, IconRetry, IconSpinner } from "./Icons";
+import { KiroKeyBar } from "./KiroKey";
 
 const pctOf = (used: number, plan: number) => Math.max(0, Math.min(100, (used / plan) * 100));
 
@@ -39,6 +40,7 @@ export function UsagePanel({ userId, worker, online }: { userId: string; worker:
 
   return (
     <div className="usage">
+      <KiroKeyBar online={online} />
       <section className={`usage-hero ${plan ? "" : "muted-hero"}`}>
         <div className="usage-hero-top">
           <span className="usage-icon"><IconCoins size={18} /></span>
