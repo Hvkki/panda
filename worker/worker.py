@@ -6147,11 +6147,22 @@ def crew_settings(gw: Gateway) -> dict:
     entries = schema.get("entries") if isinstance(schema, dict) else schema
     cfg = gw.call("GET", "/api/config/kirocrew", timeout=60)
     spec = editable_spec()
-    items = []
+    rows = []
     for e in entries or []:
         if not isinstance(e, dict) or e.get("hasChildren") or e.get("deprecated") or not e.get("path"):
             continue
         path = str(e["path"])
+        if path.endswith(".*"):
+            # A map setting (agent.role_models.*): show one row per key Crew lets a dashboard change.
+            base = path[:-1]
+            keys = sorted(k for k in spec if k.startswith(base) and "." not in k[len(base):])
+            if keys:
+                for k in keys:
+                    rows.append((k, {**e, "path": k, "defaultValue": None, "label": f"{base[:-1].split('.')[-1].replace('_', ' ').capitalize()}: {k[len(base):]}"}))
+                continue
+        rows.append((path, e))
+    items = []
+    for path, e in rows:
         it = {"p": path, "t": e.get("type") or "", "l": str(e.get("label") or path)[:120]}
         h = str(e.get("help") or "").strip()
         if h:
