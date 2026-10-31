@@ -76,6 +76,11 @@ WORKDIR = os.path.expanduser("~/work")             # working files (images for a
 MAX_PARALLEL_CHATS = 3
 
 WORK = "/kaggle/working" if os.path.isdir("/kaggle/working") else os.path.abspath("work")
+# Big temporary files (backup archives, their split parts, restores) go here, on the large disk:
+# /kaggle/working is only 20 GB, and an archive plus its parts filled it (31 Oct), which made the
+# guard stop every chat's agent runtime.
+STAGE = "/var/tmp/panda-stage" if WORK == "/kaggle/working" else WORK
+os.makedirs(STAGE, exist_ok=True)
 os.makedirs(WORK, exist_ok=True)
 HOME = os.path.expanduser("~")
 BIN = f"{HOME}/.local/bin"
@@ -797,7 +802,7 @@ def _manifest_name(name: str) -> str:
 
 
 def _manifest_get(sb: "Supabase", name: str) -> dict | None:
-    tmp = f"{WORK}/manifest-{uuid.uuid4().hex}.json"
+    tmp = f"{STAGE}/manifest-{uuid.uuid4().hex}.json"
     try:
         if sb.download(state_key(_manifest_name(name)), tmp, fresh=True):   # overwritten at every save
             data = json.load(open(tmp))
@@ -836,7 +841,7 @@ def _forget_old(sb: "Supabase", name: str, old: dict | None, keep_single: bool, 
 
 
 def _put_manifest(sb: "Supabase", name: str, man: dict):
-    mp = f"{WORK}/manifest-{uuid.uuid4().hex}.json"
+    mp = f"{STAGE}/manifest-{uuid.uuid4().hex}.json"
     with open(mp, "w") as f:
         json.dump(man, f)
     try:
@@ -857,7 +862,7 @@ def blob_save(sb: "Supabase", name: str, path: str, part_bytes: int | None = Non
         _forget_old(sb, name, old, keep_single=True, keep_manifest=False)
         return {"size": size, "parts": 1}
     gen = f"{int(time.time())}{uuid.uuid4().hex[:4]}"  # never equal to an earlier generation
-    local = split_file(path, part_bytes, f"{WORK}/blob-{gen}")
+    local = split_file(path, part_bytes, f"{STAGE}/blob-{gen}")
     names = []
     try:
         for i, p in enumerate(local):
@@ -1212,7 +1217,7 @@ def blob_load(sb: "Supabase", name: str, dest: str) -> bool:
         local = []
         try:
             for i, n in enumerate(man.get("parts") or []):
-                p = f"{WORK}/restore-part-{name.replace('/', '_')}-{i:03d}"  # per blob: two blobs may download at once
+                p = f"{STAGE}/restore-part-{name.replace('/', '_')}-{i:03d}"  # per blob: two blobs may download at once
                 if not sb.download(state_key(n), p):
                     raise RuntimeError(f"saved part {n} is missing")
                 local.append(p)
@@ -1534,7 +1539,7 @@ def files_delta_save(sb: "Supabase", entries: list, reason: str, deadline, level
     idx = idx if idx is not None else files_index_get(sb)
     changed = files_changed(entries, idx, None if idx else (_manifest_get(sb, FILES_BLOB) or {}).get("saved_at"))
     keep = sorted([e for e in entries if e.kind != "file"] + changed, key=lambda e: e.arc)  # folders/links are tiny
-    arc = f"{WORK}/files-delta.tar.gz"
+    arc = f"{STAGE}/files-delta.tar.gz"
     where = "Storage"
     try:
         write_archive(keep, arc, deadline, level)
@@ -1628,7 +1633,7 @@ def _files_snapshot_locked(sb: "Supabase", reason: str, budget, deadline, level:
         info = files_delta_save(sb, entries, reason, deadline, level, len(skipped), idx, why)
         _files_sync["sig"] = sig
         return info
-    archive = f"{WORK}/files.tar.gz"
+    archive = f"{STAGE}/files.tar.gz"
     raw = sum(e.size for e in entries if e.kind == "file")
     n = sum(1 for e in entries if e.kind == "file")
     done = where = None
@@ -1698,7 +1703,7 @@ def restore_files(sb: "Supabase") -> str:
     """Put the saved work files back. Runs before Kiro Crew starts; a broken copy never stops Panda."""
     if not FILES_ENABLED:
         return "off"
-    tmp = f"{WORK}/restore-files.tar.gz"
+    tmp = f"{STAGE}/restore-files.tar.gz"
     try:
         if not blob_load(sb, FILES_BLOB, tmp):
             log("files: nothing saved yet")
@@ -1990,17 +1995,17 @@ def prefetch_state(sb: Supabase) -> dict:
     out: dict = {}
 
     def crew():
-        p = f"{WORK}/restore-crew.tar.gz"
+        p = f"{STAGE}/restore-crew.tar.gz"
         out["crew"] = p if blob_load(sb, "latest-crew.tar.gz", p) else ""
 
     def kiro():
-        stage = f"{WORK}/kiro-stage"
+        stage = f"{STAGE}/kiro-stage"
         shutil.rmtree(stage, ignore_errors=True)
         n = kiro_restore(sb, stage)
         if n is not None:
             out["kiro_stage"], out["kiro_n"] = stage, n
         else:
-            p = f"{WORK}/restore-kiro.tar.gz"
+            p = f"{STAGE}/restore-kiro.tar.gz"
             out["kiro_tar"] = p if blob_load(sb, "latest-kiro.tar.gz", p) else ""
 
     for fn in (crew, kiro):
@@ -2016,8 +2021,8 @@ def prefetch_state(sb: Supabase) -> dict:
 
 
 def restore(sb: Supabase, pre: dict | None = None) -> str:
-    snap = f"{WORK}/restore-crew.tar.gz"
-    extra = f"{WORK}/restore-kiro.tar.gz"
+    snap = f"{STAGE}/restore-crew.tar.gz"
+    extra = f"{STAGE}/restore-kiro.tar.gz"
     if pre is not None:
         for t in pre.get("threads", []):
             t.join()
@@ -2071,7 +2076,7 @@ def _save_files_note(sb: Supabase, reason: str, budget: float | None = None):
 
 
 def snapshot(sb: Supabase, reason: str, files: bool = True, files_budget: float | None = None) -> str:
-    out = f"{WORK}/snap"
+    out = f"{STAGE}/snap"
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out)
     sh(f"kirocrew snapshot {out} --keep 1", timeout=900)
@@ -4743,7 +4748,10 @@ def guard_groups(procs: dict) -> list:
     for pid, p in procs.items():
         if p["comm"].startswith("kiro-cli-chat"):
             for c in kids.get(pid, []):
-                if c in taken or " mcp-" in _guard_cmdline(c):
+                cmd = _guard_cmdline(c)
+                # kiro-cli 2.37 runs the agent itself as a node child (kiro-cli/kas/...): it is the
+                # chat, not a tool call, and stopping it kills the reply ("process exited", 31 Oct).
+                if c in taken or " mcp-" in cmd or "/kiro-cli/kas/" in cmd:
                     continue
                 pids = tree(c) - taken
                 groups.append({"root": c, "pids": pids, "job": None})
@@ -4806,11 +4814,14 @@ def _guard_note(text: str):
 def _guard_disk_free(path: str = None) -> int:
     """Free bytes on the work volume (where snapshots and archives are written). The guard watches
     this so a render filling the disk can't ENOSPC Panda's own saves while memory still looks fine."""
-    try:
-        s = os.statvfs(path or WORK)
-        return s.f_bavail * s.f_frsize
-    except OSError:
-        return 1 << 62
+    free = []
+    for p in ([path] if path else sorted({WORK, STAGE})):
+        try:
+            s = os.statvfs(p)
+            free.append(s.f_bavail * s.f_frsize)
+        except OSError:
+            pass
+    return min(free) if free else 1 << 62
 
 
 def _guard_protect_targets(procs: dict, rss_min: int, cmd_fn=None) -> list:
@@ -4826,7 +4837,7 @@ def _guard_protect_targets(procs: dict, rss_min: int, cmd_fn=None) -> list:
         if p["comm"].startswith("kiro-cli-chat"):
             continue
         cmd = cmd_fn(pid)
-        if "kirocrew gateway" in cmd or " mcp-" in cmd:
+        if "kirocrew gateway" in cmd or " mcp-" in cmd or "/kiro-cli/kas/" in cmd:
             continue
         out.append(pid)
     return out
