@@ -1153,6 +1153,9 @@ html:has(.sheet-backdrop), html:has(.sheet-backdrop) body { overscroll-behavior-
   padding: 7px 8px; border-radius: 10px; text-align: left; }
 .helper-row:hover { background: var(--bg-2); }
 .helper-task { font-size: .88em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.helper-remote { font-style: normal; font-weight: 600; font-size: .85em; padding: 0 .4em; margin-right: .4em; border-radius: 4px; background: color-mix(in srgb, var(--accent, #6b8afd) 18%, transparent); color: var(--accent, #6b8afd); }
+.helper-steps { margin: .2em 0 .6em 1.2em; padding: 0; font-size: .8em; max-height: 16em; overflow: auto; }
+.helper-steps code { white-space: pre-wrap; word-break: break-all; }
 .helper-row small { grid-column: 2; font-size: .74em; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .helper-dot { grid-row: 1 / 3; width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; background: var(--bg-3); color: var(--muted); }
 .helper.ok .helper-dot { background: var(--ok); color: #fff; }

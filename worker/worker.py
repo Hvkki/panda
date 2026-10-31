@@ -5446,6 +5446,52 @@ def remote_status(sb: "Supabase") -> dict:
             "jobs": jobs[::-1], "remote_id": first["id"], "boxes": boxes, "max": REMOTE_MAX}
 
 
+def remote_agents(slot: str) -> dict:
+    """For the chat's helper list: the remote agents (`pjob start --remote --agent`) this chat started,
+    with their steps from the job log. Read-only, local files only."""
+    out = []
+    if not slot or not os.path.isdir(JOBS_DIR):
+        return {"agents": out}
+    jm = _jobs()
+    for name in os.listdir(JOBS_DIR):
+        d = f"{JOBS_DIR}/{name}"
+        try:
+            if open(f"{d}/slot").read().strip() != slot:
+                continue
+            cmd = open(f"{d}/cmd").read()
+            if not cmd.startswith("remote agent:"):
+                continue
+            st = jm.state(name)
+            lines = open(f"{d}/log", errors="replace").read()[-400000:].split("\n")
+        except OSError:
+            continue
+        steps, box, model, tail = [], "", "", []
+        for ln in lines:
+            if ln.startswith("[tool] Running:"):
+                steps.append(ln[len("[tool] Running:"):].strip()[:200])
+                tail = []
+            elif ln.startswith("[tool]"):
+                continue
+            elif ln.startswith("[remote]"):
+                m = re.search(r"remote Panda (r\d)", ln)
+                box = m.group(1) if m else box
+                m = re.match(r"\[remote\] agent: (\S+)", ln)
+                model = m.group(1) if m else model
+            elif not re.match(r"(Warning: Kiro CLI is running as root|Hide this warning)", ln):
+                tail.append(ln)
+        state = st.get("state")
+        res = "\n".join(tail).strip() if state != "running" else ""
+        out.append({"id": f"remote:{name}", "name": name, "task": cmd[len("remote agent:"):].strip()[:4000],
+                    "done": state != "running", "state": state, "box": box, "model": model,
+                    "started": os.path.getmtime(f"{d}/cmd"), "elapsed": st.get("secs"),
+                    "turns": len(steps), "steps": steps[-40:], "last_tool": "shell" if steps else "",
+                    "result": res[-6000:] if state == "done" else "",
+                    "error": (res[-3000:] or state) if state in ("failed", "lost") else "",
+                    "stopped": state == "stopped"})
+    out.sort(key=lambda x: x["started"])
+    return {"agents": out[-30:]}
+
+
 def remote_stop(sb: "Supabase") -> dict:
     """The panel's Stop: cancel everything queued or running there, then let the notebook end itself."""
     jd = f"{REMOTE_BOX}/jobs"
@@ -6573,6 +6619,8 @@ def run_command(sb: Supabase, gw: Gateway, cmd: dict):
             result = video_command(op, args)
         elif op == "remote.status":
             result = remote_status(sb)
+        elif op == "remote.agents":
+            result = remote_agents(str(args.get("slot") or "")[:200])
         elif op == "remote.stop":
             result = remote_stop(sb)
         elif op == "ping":
