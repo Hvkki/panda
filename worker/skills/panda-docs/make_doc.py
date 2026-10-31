@@ -75,6 +75,34 @@ def parse(md: str):
     return blocks
 
 
+def plain(t: str) -> str:
+    """Cell text as it reads: no **, *, ` or link targets."""
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)
+    return re.sub(r"[*`]", "", t)
+
+
+def col_fracs(rows, total_chars: float) -> list:
+    """Column widths as fractions of the table, from what is in them.
+
+    Each column wants its longest cell on one line (`want`) and at least its longest word (`least`). If all
+    fit, widths follow `want`; otherwise each gets `least` and the rest of the room is shared by what they
+    still lack, so a long-text column grows and a short one ("Ep.") stays narrow."""
+    cols = max(len(r) for r in rows)
+    want, least = [1.0] * cols, [1.0] * cols
+    for r in rows:
+        for ci, c in enumerate(r):
+            t = plain(c)
+            want[ci] = max(want[ci], min(len(t), 80) + 2)
+            least[ci] = max(least[ci], min(max((len(w) for w in t.split()), default=1), 18) + 2)
+    if sum(want) <= total_chars:
+        w = want
+    else:
+        room = max(0.0, total_chars - sum(least))
+        lack = [a - b for a, b in zip(want, least)]
+        w = [b + (room * x / sum(lack) if sum(lack) else 0) for b, x in zip(least, lack)]
+    return [x / sum(w) for x in w]
+
+
 INLINE = re.compile(r"(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)")
 
 
@@ -158,13 +186,13 @@ def pdf_fonts():
     return "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Courier"
 
 
-def to_pdf(blocks, out, theme, title):
+def to_pdf(blocks, out, theme, title, hr="page"):
     from reportlab.lib import colors
     from reportlab.lib.enums import TA_LEFT
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle
     from reportlab.lib.units import mm
-    from reportlab.platypus import (Image, ListFlowable, ListItem, PageBreak, Paragraph,
+    from reportlab.platypus import (HRFlowable, Image, ListFlowable, ListItem, PageBreak, Paragraph,
                                     SimpleDocTemplate, Spacer, Table, TableStyle)
 
     REG, BOLD, ITAL, MONO = pdf_fonts()
@@ -198,13 +226,18 @@ def to_pdf(blocks, out, theme, title):
                                      bulletColor=accent, leftIndent=14))
         elif kind == "table" and val:
             data = [[Paragraph(rich(c), st["cell"]) for c in r] for r in val]
-            w = (A4[0] - 40 * mm) / max(len(r) for r in val)
-            tb = Table(data, colWidths=[w] * max(len(r) for r in val), repeatRows=1)
+            for r in data:      # short rows: pad, or reportlab misdraws the grid
+                r += [""] * (max(len(x) for x in val) - len(r))
+            total = A4[0] - 40 * mm
+            # ~0.5 em a character at the 9.5 pt cell font, plus 12 pt of padding per column
+            tb = Table(data, colWidths=[f * total for f in col_fracs(val, total / 4.9)], repeatRows=1)
             tb.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), soft), ("FONTNAME", (0, 0), (-1, 0), BOLD),
                 ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D9D2C7")), ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5)]))
             flow += [tb, Spacer(1, 8)]
+        elif kind == "hr" and hr == "rule":
+            flow += [Spacer(1, 4), HRFlowable(width="100%", thickness=0.6, color=colors.HexColor("#D9D2C7")), Spacer(1, 8)]
         elif kind == "hr":
             flow.append(PageBreak())
         elif kind == "img":
@@ -230,7 +263,7 @@ def to_pdf(blocks, out, theme, title):
 
 
 # ── DOCX ───────────────────────────────────────────────────────────────────
-def to_docx(blocks, out, theme, title):
+def to_docx(blocks, out, theme, title, hr="page"):
     from docx import Document
     from docx.enum.text import WD_BREAK
     from docx.shared import Inches, Pt, RGBColor
@@ -265,6 +298,10 @@ def to_docx(blocks, out, theme, title):
             cols = max(len(r) for r in val)
             tb = doc.add_table(rows=len(val), cols=cols)
             tb.style = "Light Grid Accent 1"
+            tb.autofit = False
+            for ci, f in enumerate(col_fracs(val, 95)):     # 6.5 in of text width, ~95 characters at 11 pt
+                for cell in tb.columns[ci].cells:
+                    cell.width = Inches(6.5 * f)
             for ri, r in enumerate(val):
                 for ci, c in enumerate(r):
                     cell = tb.cell(ri, ci)
@@ -273,6 +310,15 @@ def to_docx(blocks, out, theme, title):
                     if ri == 0:
                         for run in cell.paragraphs[0].runs:
                             run.bold = True
+        elif kind == "hr" and hr == "rule":
+            from docx.oxml import OxmlElement
+            from docx.oxml.ns import qn
+            pb = OxmlElement("w:pBdr")
+            bottom = OxmlElement("w:bottom")
+            for k, v in (("w:val", "single"), ("w:sz", "6"), ("w:space", "1"), ("w:color", "D9D2C7")):
+                bottom.set(qn(k), v)
+            pb.append(bottom)
+            doc.add_paragraph()._p.get_or_add_pPr().append(pb)
         elif kind == "hr":
             doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
         elif kind == "img":
@@ -378,13 +424,18 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--theme", default="ember", choices=sorted(THEMES))
     ap.add_argument("--title", default="")
+    ap.add_argument("--hr", default="page", choices=["page", "rule"],
+                    help="what --- becomes in PDF/DOCX: a page break (default) or a thin line")
     a = ap.parse_args()
     md = open(os.path.expanduser(a.source), encoding="utf-8").read() if a.source != "-" else sys.stdin.read()
     out = os.path.expanduser(a.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     blocks = parse(md)
     ext = out.rsplit(".", 1)[-1].lower()
-    {"pdf": to_pdf, "docx": to_docx, "pptx": to_pptx}[ext](blocks, out, a.theme, a.title)
+    if ext == "pptx":
+        to_pptx(blocks, out, a.theme, a.title)
+    else:
+        {"pdf": to_pdf, "docx": to_docx}[ext](blocks, out, a.theme, a.title, hr=a.hr)
     print(f"saved {out} ({os.path.getsize(out) // 1024} KiB)")
 
 

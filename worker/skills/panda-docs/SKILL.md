@@ -16,8 +16,9 @@ python3 ~/.kiro/crew/skills/panda-docs/make_doc.py SOURCE.md ~/outputs/Name.pptx
 ```
 
 Supported Markdown: `#`/`##`/`###` headings, paragraphs, **bold**, *italic*,
-`- ` and `1. ` lists, `> ` quotes, `|` tables, `---` (page break in PDF/DOCX),
-and images `![caption](path-or-url)`.
+`- ` and `1. ` lists, `> ` quotes, `|` tables, `---` (page break in PDF/DOCX; add `--hr rule`
+to get a thin line instead, e.g. after a short intro), and images `![caption](path-or-url)`.
+Table columns get widths from their content: short columns stay narrow, long text gets the room.
 
 ## Slides (.pptx)
 - Each `# ` or `## ` heading starts a new slide; the first `# ` slide is the title slide.
