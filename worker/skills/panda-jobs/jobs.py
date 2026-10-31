@@ -9,6 +9,9 @@
                                      run it on remote Panda (its own 4 CPUs / ~30 GB), files sent and brought back
   pjob start NAME --remote --agent [--model M] [--effort E] [--files P ...] --notify -- "TASK TEXT"
                                      an agent does TASK on remote Panda; results come back in ~/work/remote/NAME
+  pjob send NAME PATH...             send more files to remote job NAME while it runs (same paths there)
+  pjob continue NAME [--notify ...] -- "NEXT STEP"
+                                     give a finished remote agent job its next step; it keeps its conversation
   pjob status [NAME]                 running / done (exit code) / lost, with run time and the last log lines
   pjob wait NAME [--max 300]         block until NAME ends or --max seconds pass (default 240), then status
   pjob wait-any A B C [--max 300]    block until the first of them ends
@@ -273,10 +276,14 @@ def cmd_start(a, rest):
             # with anything under --out (default: --files).
             line = a.sh if a.sh else " ".join(rest)
             extra = ["--agent", f"--model={a.model or 'claude-sonnet-5.5'}", f"--effort={a.effort or 'medium'}"]
+            if getattr(a, "resume", False):
+                extra.append("--resume")
         line = shlex.join([sys.executable, premote, "run", "--name", a.name, "--cwd", a.cwd or os.getcwd(),
                            "--files", *(a.files or []), "--out", *(a.out or []), f"--setup={a.setup or ''}",
                            *extra, f"--cmd={line}"])
         shown = f"remote {'agent' if a.agent else ''}: {shown}".replace("remote :", "remote:")
+        if getattr(a, "resume", False):
+            shown = f"remote agent (continued): {(a.sh or ' '.join(rest))[:300]}"
     os.makedirs(d, exist_ok=True)
     for f in ("exit", "ended", "log", "notify", "notified", "watch.json", "guard", "slot"):
         try:
@@ -314,6 +321,79 @@ def cmd_start(a, rest):
         print(f"Check with: pjob status {a.name}   ·   wait with: pjob wait {a.name} --max 240")
 
 
+REMOTE_BOX = os.environ.get("PANDA_REMOTE_BOX") or os.path.expanduser("~/.panda/remote")
+
+
+def remote_tid(name: str) -> str:
+    """The remote task id of job NAME (premote prints '[remote] queued as <tid>' first)."""
+    try:
+        with open(os.path.join(_dir(name), "log"), errors="replace") as f:
+            for line in f:
+                m = re.match(r"\[remote\] queued as ([A-Za-z0-9._-]+)", line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return ""
+
+
+def cmd_send(a):
+    if state(a.name)["state"] != "running":
+        sys.exit(f"pjob: {a.name} is not running (send works while a remote job runs; pjob status {a.name})")
+    tid = remote_tid(a.name)
+    if not tid:
+        sys.exit(f"pjob: {a.name} is not a remote job")
+    home = os.path.expanduser("~")
+    files = []
+    for p in a.paths:
+        full = os.path.realpath(os.path.expanduser(p))
+        if not full.startswith(home + "/") or not os.path.exists(full):
+            sys.exit(f"pjob: {p}: not found under {home}")
+        files.append(full)
+    sd = os.path.join(REMOTE_BOX, "jobs", tid, "send")
+    os.makedirs(sd, exist_ok=True)
+    n = 1 + max([int(f.split(".")[0]) for f in os.listdir(sd) if f.split(".")[0].isdigit()] or [0])
+    tmp = os.path.join(sd, f".{n}.tmp")
+    json.dump({"files": files, "at": time.time()}, open(tmp, "w"))
+    os.rename(tmp, os.path.join(sd, f"{n}.json"))
+    t0 = time.time()
+    while time.time() - t0 < max(5, min(a.max, 1500)):
+        for ext, ok in (("ok", True), ("err", False)):
+            try:
+                msg = open(os.path.join(sd, f"{n}.{ext}")).read().strip()
+            except OSError:
+                continue
+            if ok and not msg.startswith("failed"):
+                print(f"sent to {a.name}: {msg}; they are at the same paths on remote Panda")
+                return
+            sys.exit(f"pjob: send to {a.name} failed: {msg}")
+        if state(a.name)["state"] != "running":
+            sys.exit(f"pjob: {a.name} ended before it took the files")
+        time.sleep(2)
+    print(f"still sending to {a.name} after {int(time.time() - t0)}s; the job log shows 'send {n}' when it is there")
+
+
+def cmd_continue(a, rest):
+    res = os.path.expanduser(f"~/work/remote/{a.name}")
+    try:
+        prev = json.load(open(os.path.join(res, ".pjob.json")))
+    except (OSError, ValueError):
+        sys.exit(f"pjob: {a.name} was not a remote agent job (no {res}/.pjob.json)")
+    if state(a.name)["state"] == "running":
+        sys.exit(f"pjob: {a.name} is still running; use pjob send for files, or wait for it to end")
+    if not os.path.isdir(os.path.join(res, ".session")):
+        print(f"note: no saved conversation in {res}/.session (it ran before continue existed, or failed early); "
+              "the agent starts fresh with the earlier results and REPORT.md")
+    home = os.path.expanduser("~")
+    a.remote, a.agent, a.resume = True, True, True
+    a.files = [p for p in (prev.get("files") or []) if os.path.exists(p)] + [res]
+    a.out = prev.get("out") or None
+    a.setup = a.setup if a.setup is not None else prev.get("setup") or ""
+    a.model, a.effort = a.model or prev.get("model"), a.effort or prev.get("effort")
+    a.cwd = a.cwd or home
+    cmd_start(a, rest)
+
+
 def _wait(names, mx: float):
     t0 = time.time()
     while True:
@@ -339,6 +419,12 @@ def main():
                    help="with --remote: the text after -- is a TASK for an agent on remote Panda (spends credits)")
     s.add_argument("--model", help="with --agent: model id (default claude-sonnet-5.5)")
     s.add_argument("--effort", help="with --agent: low / medium / high / xhigh / max (default medium)")
+    s = sub.add_parser("send"); s.add_argument("name"); s.add_argument("paths", nargs="+")
+    s.add_argument("--max", type=float, default=600, help="wait this long for the remote to have them")
+    s = sub.add_parser("continue"); s.add_argument("name"); s.add_argument("--sh"); s.add_argument("--cwd")
+    s.add_argument("--notify", action="store_true"); s.add_argument("--want")
+    s.add_argument("--stall", type=float, default=600); s.add_argument("--setup")
+    s.add_argument("--model"); s.add_argument("--effort")
     s = sub.add_parser("status"); s.add_argument("name", nargs="?"); s.add_argument("-n", type=int, default=12)
     s.add_argument("--json", action="store_true")
     s = sub.add_parser("wait"); s.add_argument("name"); s.add_argument("--max", type=float, default=240)
@@ -357,6 +443,10 @@ def main():
 
     if a.op == "start":
         cmd_start(a, rest)
+    elif a.op == "send":
+        cmd_send(a)
+    elif a.op == "continue":
+        cmd_continue(a, rest)
     elif a.op == "status":
         names = [a.name] if a.name else sorted(os.listdir(ROOT))
         sts = [state(n) for n in names]

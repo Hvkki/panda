@@ -112,10 +112,60 @@ user's Panda. The main Panda chat gave you the task below; nobody reads your mes
 - There is no browser, no Kiro Crew tools and no user to ask here. If you cannot do something, say so in
   REPORT.md instead of guessing.
 - Save credits: combine steps, keep command output short (tail, grep), and stop when the task is done.
+- The main chat can send more files while you work (they land at the same paths). If the task says a file
+  comes later, wait for it with one shell loop (say `for i in $(seq 120); do [ -f PATH ] && break; sleep 15;
+  done`), not by checking again and again.
 
 TASK:
 {prompt}
 """
+
+CONTINUE_BRIEF = """The main Panda chat continues the task you did before (same conversation). Your earlier
+results and REPORT.md are in {results}; files it sent again are at their usual paths. Do the next step
+below, then update {results}/REPORT.md the same way.
+
+NEXT STEP:
+{prompt}
+"""
+SESSIONS = os.path.join(HOME, ".kiro", "sessions", "cli")
+
+
+def session_restore(results: str) -> str:
+    """The session id saved in <results>/.session by an earlier run, copied into kiro-cli's store ('' if none)."""
+    sd = os.path.join(results, ".session")
+    ids = [f[:-6] for f in os.listdir(sd) if f.endswith(".jsonl")] if os.path.isdir(sd) else []
+    if len(ids) != 1 or not re.fullmatch(r"[A-Za-z0-9-]{8,64}", ids[0]):
+        return ""
+    os.makedirs(SESSIONS, exist_ok=True)
+    for ext in (".json", ".jsonl"):
+        if os.path.exists(os.path.join(sd, ids[0] + ext)):
+            shutil.copy(os.path.join(sd, ids[0] + ext), SESSIONS)
+    return ids[0]
+
+
+def session_save(results: str, since: float) -> str:
+    """Copy the conversation this agent task wrote into <results>/.session (it comes back with the results,
+    so pjob continue can resume it on any notebook). Returns its id or ''."""
+    best = ""
+    for f in os.listdir(SESSIONS) if os.path.isdir(SESSIONS) else []:
+        if not f.endswith(".jsonl") or os.path.getmtime(os.path.join(SESSIONS, f)) < since:
+            continue
+        sid = f[:-6]
+        try:
+            meta = open(os.path.join(SESSIONS, sid + ".json"), errors="replace").read()
+        except OSError:
+            meta = ""
+        if results in meta:          # its cwd: each agent task runs in its own results folder
+            best = sid
+    if not best:
+        return ""
+    sd = os.path.join(results, ".session")
+    shutil.rmtree(sd, ignore_errors=True)
+    os.makedirs(sd)
+    for ext in (".json", ".jsonl"):
+        with contextlib.suppress(OSError):
+            shutil.copy(os.path.join(SESSIONS, best + ext), sd)     # copy, not copy2: new mtime = sent back
+    return best
 
 
 def ensure_kiro(note) -> str:
@@ -141,10 +191,15 @@ def agent_cmd(task: dict, d: str, note) -> tuple[str, dict]:
     results = os.path.join(HOME, ag.get("results") or "work/remote/task")
     os.makedirs(results, exist_ok=True)
     pf = f"{d}/prompt.md"
-    open(pf, "w").write(AGENT_BRIEF.format(results=results, prompt=ag.get("prompt") or ""))
+    sid = session_restore(results) if ag.get("resume") else ""
+    if ag.get("resume") and not sid:
+        note("no saved conversation in the results folder: starting a new one with the earlier results")
+    brief = CONTINUE_BRIEF if sid else AGENT_BRIEF
+    open(pf, "w").write(brief.format(results=results, prompt=ag.get("prompt") or ""))
     cli = ensure_kiro(note)
-    note(f"agent: {model} / {effort}, results in ~/{ag.get('results')}")
-    cmd = (f"{shlex.quote(cli)} chat --no-interactive --trust-all-tools --wrap never "
+    note(f"agent: {model} / {effort}, results in ~/{ag.get('results')}" + (" (continuing its conversation)" if sid else ""))
+    resume = f"--resume-id {shlex.quote(sid)} " if sid else ""
+    cmd = (f"{shlex.quote(cli)} chat --no-interactive --trust-all-tools --wrap never {resume}"
            f"--model {model} --effort {effort} \"$(cat {shlex.quote(pf)})\"")
     env = {"KIRO_API_KEY": W.CFG["kiro_api_key"], "NO_COLOR": "1"}
     return cmd, env
@@ -407,6 +462,31 @@ def guard_loop(stop: threading.Event):
             say("guard:", type(exc).__name__)
 
 
+def apply_sends(tid: str, x: dict, d: str, st: dict, note):
+    """Unpack files the main chat sent with `pjob send` after the task started (queue entry "sends")."""
+    for s in (x.get("flags") or {}).get("sends") or []:
+        n = int(s.get("n") or 0)
+        if not n or n in st["sends_done"]:
+            continue
+        msg = ""
+        try:
+            arc = f"{d}/in-{n}.tar.gz"
+            if not W.blob_load(sb, f"remote/{RID}/tasks/{tid}/in-{n}.tar.gz", arc):
+                raise RuntimeError("files missing in storage")
+            with tarfile.open(arc) as t:
+                unpacked = sum(m.size for m in t if m.isfile())
+            if unpacked > guard_disk_free() - GUARD_MIN_DISK:
+                raise RuntimeError(f"{unpacked >> 20} MB unpacked, not enough disk")
+            ok, bad = W.extract_archive(arc, HOME, sorted({f.split("/")[0] for f in s.get("files") or []}))
+            os.remove(arc)
+            msg = f"unpacked {ok} file(s)" + (f", {bad} skipped" if bad else "")
+        except Exception as exc:
+            msg = f"failed: {str(exc)[:200]}"
+        note(f"send {n}: {msg}")
+        st["sends_done"].append(n)
+        st.setdefault("sends_msg", {})[str(n)] = msg
+
+
 def run_task(tid: str):
     x = TASKS[tid]
     d = f"{WORK}/remote-{tid}"
@@ -414,7 +494,8 @@ def run_task(tid: str):
     logp = f"{d}/log"
     logf = open(logp, "ab")
     x["log"] = logp                      # the guard writes its reason here
-    st = {"state": "starting", "exit": None, "log_bytes": 0, "log_from": 0, "out": None, "at": time.time()}
+    st = {"state": "starting", "exit": None, "log_bytes": 0, "log_from": 0, "out": None, "at": time.time(),
+          "sends_done": []}
 
     def push_status():
         size = os.path.getsize(logp)
@@ -480,6 +561,7 @@ def run_task(tid: str):
             if rc != 0:
                 raise RuntimeError(f"setup failed with exit {rc}")
             SETUP_DONE.add(h)
+        apply_sends(tid, x, d, st, note)
         started = time.time() - 1
         cmd, extra_env = task["cmd"], {}
         if task.get("agent"):
@@ -492,11 +574,16 @@ def run_task(tid: str):
         last = 0.0
         while p.poll() is None:
             if time.time() - last >= 5:
+                apply_sends(tid, x, d, st, note)
                 push_status()
                 last = time.time()
             time.sleep(1)
         rc = p.returncode
         st["exit"] = rc
+        if task.get("agent"):
+            with contextlib.suppress(Exception):
+                if session_save(os.path.join(HOME, task["agent"].get("results") or "work/remote/task"), started):
+                    note("saved the agent's conversation: pjob continue can pick it up")
         if x.get("guard_stopped"):
             st["guard"] = x["guard_stopped"]
             note(f"stopped by the remote guard: {x['guard_stopped']}")
@@ -561,6 +648,7 @@ def main():
                 if tid not in TASKS:
                     TASKS[tid] = {"state": "queued", "proc": None}
                 x = TASKS[tid]
+                x["flags"] = flags
                 if flags.get("cancel") and x["state"] in ("queued", "starting", "running") and not x.get("cancelled"):
                     x["cancelled"] = True
                     if x.get("proc") and x["proc"].poll() is None:

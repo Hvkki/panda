@@ -5215,6 +5215,51 @@ def _home_rel(p: str, must_exist: bool) -> str:
     return os.path.relpath(full, HOME)
 
 
+def remote_pack(sb: "Supabase", rid: str, tid: str, files: list, name: str) -> int:
+    """Pack `files` (relative to HOME) and store them as remote/<rid>/tasks/<tid>/<name>. Returns bytes."""
+    arc = f"{WORK}/remote-{tid}-{name}"
+    try:
+        with tarfile.open(arc, "w:gz", compresslevel=1) as t:
+            for rel in files:
+                t.add(os.path.join(HOME, rel), arcname=rel)
+        size = os.path.getsize(arc)
+        if size > REMOTE_MAX_IN:
+            raise ValueError(f"the files pack to {size >> 20} MB, over the {REMOTE_MAX_IN >> 20} MB limit; "
+                             "send only what the task needs")
+        blob_save(sb, rkey(rid, "tasks", tid, name), arc)
+        return size
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(arc)
+
+
+def remote_sends(sb: "Supabase", rid: str, tid: str, d: str, sent: list, note):
+    """`pjob send NAME PATH...` drops <d>/send/<n>.json: pack those files and list them on the task's queue
+    entry, where the notebook picks them up while the task runs. <n>.ok / <n>.err is the answer for pjob."""
+    sd = f"{d}/send"
+    for f in sorted(os.listdir(sd), key=lambda x: int(x.split(".")[0]) if x.split(".")[0].isdigit() else 0) \
+            if os.path.isdir(sd) else []:
+        n = f.split(".")[0]
+        if not f.endswith(".json") or not n.isdigit() or int(n) in sent:
+            continue
+        sent.append(int(n))
+        try:
+            files = [_home_rel(p, True) for p in json.load(open(f"{sd}/{f}")).get("files") or []]
+            if not files:
+                raise ValueError("no files given")
+            t1 = time.time()
+            size = remote_pack(sb, rid, tid, files, f"in-{n}.tar.gz")
+
+            def add(q, n=int(n), files=files):
+                e = q.setdefault("tasks", {}).setdefault(tid, {"cancel": False})
+                e.setdefault("sends", []).append({"n": n, "files": files})
+            remote_queue_edit(sb, rid, add)
+            note(f"sent {len(files)} more path(s) (send {n}), {size >> 20} MB packed, in {time.time() - t1:.0f}s")
+        except Exception as exc:
+            note(f"send {n} failed: {scrub(exc)[:200]}")
+            open(f"{sd}/{n}.err", "w").write(scrub(exc)[:300])
+
+
 def remote_task(sb: "Supabase", req: dict):
     tid = req["tid"]
     d = f"{REMOTE_BOX}/jobs/{tid}"
@@ -5249,25 +5294,15 @@ def remote_task(sb: "Supabase", req: dict):
                 return
             note(f"trying another remote Panda ({len(alive)} already running)")
         if files:
-            t1, arc = time.time(), f"{WORK}/remote-{tid}-in.tar.gz"
-            try:
-                with tarfile.open(arc, "w:gz", compresslevel=1) as t:
-                    for rel in files:
-                        t.add(os.path.join(HOME, rel), arcname=rel)
-                size = os.path.getsize(arc)
-                if size > REMOTE_MAX_IN:
-                    raise ValueError(f"--files pack to {size >> 20} MB, over the {REMOTE_MAX_IN >> 20} MB limit; "
-                                     "send only what the command needs")
-                blob_save(sb, rkey(rid, "tasks", tid, "in.tar.gz"), arc)
-                note(f"sent {len(files)} path(s), {size >> 20} MB packed, in {time.time() - t1:.0f}s")
-            finally:
-                with contextlib.suppress(OSError):
-                    os.remove(arc)
+            t1 = time.time()
+            size = remote_pack(sb, rid, tid, files, "in.tar.gz")
+            note(f"sent {len(files)} path(s), {size >> 20} MB packed, in {time.time() - t1:.0f}s")
         agent = req.get("agent")
         if agent:
             open(f"{d}/agent", "w").write(str(agent.get("model") or ""))
             agent = {"prompt": str(agent.get("prompt") or "")[:20000], "model": str(agent.get("model") or ""),
-                     "effort": str(agent.get("effort") or ""), "results": _home_rel(agent.get("results") or "", False)}
+                     "effort": str(agent.get("effort") or ""), "results": _home_rel(agent.get("results") or "", False),
+                     "resume": bool(agent.get("resume"))}
         remote_put_json(sb, {"tid": tid, "cmd": req["cmd"], "cwd": cwd, "setup": req.get("setup") or "",
                              "out": outs, "files": files, "has_input": bool(files), "agent": agent, "at": time.time()},
                         rid, "tasks", tid, "task.json")
@@ -5280,17 +5315,24 @@ def remote_task(sb: "Supabase", req: dict):
         got, stale, cancel_at, last_check = 0, 0, 0.0, time.time()
         t_queued = last_wait_note = time.time()
         net_fail = 0.0           # when Supabase reads started failing (0 = they work)
+        sent: list = []          # pjob send numbers handled
         while True:
             time.sleep(4)
             try:
                 if cancelled() and not cancel_at:
-                    remote_queue_edit(sb, rid, lambda q: q["tasks"].__setitem__(tid, {"cancel": True}))
+                    remote_queue_edit(sb, rid, lambda q: q["tasks"].setdefault(tid, {}).__setitem__("cancel", True))
                     cancel_at = time.time()
+                if not cancel_at:
+                    remote_sends(sb, rid, tid, d, sent, note)
                 st = remote_get_json(sb, rid, "tasks", tid, "status.json") or {}
                 raw = (sb.get_fresh(state_key(rkey(rid, "tasks", tid, "log"))) or b""
                        if int(st.get("log_bytes") or 0) > got else None)
                 beat = (remote_get_json(sb, rid, "beat.json") if time.time() - last_check >= 60 else None)
                 net_fail = 0.0
+                for n in st.get("sends_done") or []:
+                    okf = f"{d}/send/{n}.ok"
+                    if os.path.isdir(f"{d}/send") and not os.path.exists(okf):
+                        open(okf, "w").write(str(st.get("sends_msg", {}).get(str(n)) or "unpacked"))
             except (requests.RequestException, RuntimeError) as exc:
                 # The task keeps running there; only this worker's view of it is cut off. Keep polling
                 # through a network or Storage outage instead of dropping a job that waited for hours.
@@ -5352,7 +5394,10 @@ def remote_task(sb: "Supabase", req: dict):
                 remote_release(rid, tid)
             if queued:
                 remote_queue_edit(sb, rid, lambda q: q["tasks"].pop(tid, None))
-            for n in ("in.tar.gz", "out.tar.gz") if rid else ():
+            for n in sent if os.path.isdir(f"{d}/send") else ():
+                if not os.path.exists(f"{d}/send/{n}.ok") and not os.path.exists(f"{d}/send/{n}.err"):
+                    open(f"{d}/send/{n}.err", "w").write("the job ended before the notebook took these files")
+            for n in ("in.tar.gz", "out.tar.gz", *(f"in-{k}.tar.gz" for k in sent)) if rid else ():
                 k = rkey(rid, "tasks", tid, n)
                 _forget_old(sb, k, _manifest_get(sb, k), keep_single=False, keep_manifest=False)
             for n in ("task.json", "status.json", "log") if rid else ():

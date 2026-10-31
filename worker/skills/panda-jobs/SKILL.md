@@ -68,10 +68,15 @@ pjob start stems --remote --files ~/work/mix/in.wav ~/work/mix/mix.py --out ~/wo
 - `--out`: what to bring back (default: the `--files` paths). Only files the command created or changed
   come back, to the same paths here.
 - `--setup`: an install step, run once per remote start (pip, npm ci, apt).
+- `pjob send NAME PATH...`: send more files to a remote job **while it runs** (say, narration another
+  job just finished). They land at the same paths there; it returns once they are unpacked. The command
+  must wait for them itself (a loop that checks for the file).
 - Everything else works as for local jobs: the log, `--notify` and its Haiku note, `pjob stop`.
 - Use it when a command is heavy for minutes; quick commands stay local (sending files takes time).
 - `--remote --agent --model M --effort E --sh 'TASK'` runs a whole agent task there instead of a command
-  (uses credits); results come back in `~/work/remote/NAME/` with `REPORT.md`. See the `panda-remote` skill.
+  (uses credits); results come back in `~/work/remote/NAME/` with `REPORT.md`. `pjob continue NAME
+  --notify -- 'NEXT STEP'` gives a finished one its next step with its whole conversation. See the
+  `panda-remote` skill.
 
 ## brief: only the answer, not the output
 

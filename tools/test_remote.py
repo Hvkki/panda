@@ -100,6 +100,24 @@ try:
     assert open(f"{SRC}/out.txt").read().strip() == f"made on {RID}", "out.txt not brought back"
     print("ok: files there and back, exit 0")
 
+    # pjob send: a file made after the job started reaches it while it runs.
+    late = f"{SRC}/late.txt"
+    with __import__("contextlib").suppress(OSError):
+        os.remove(late)
+    print(pjob("start", "rt-send", "--remote", "--files", SRC, "--sh",
+               'echo waiting; for i in $(seq 300); do [ -f late.txt ] && break; sleep 1; done; cat late.txt').strip())
+    for _ in range(300):
+        if "waiting" in open(json.loads(pjob("status", "rt-send", "--json"))["log"]).read():
+            break
+        time.sleep(2)
+    open(late, "w").write("arrived-later\n")
+    out = pjob("send", "rt-send", late)
+    print(out.strip())
+    assert out.startswith("sent to rt-send: unpacked 1 file"), out
+    st = wait_end("rt-send", 300)
+    assert st["exit"] == 0 and "arrived-later" in open(st["log"]).read(), (st, open(st["log"]).read()[-600:])
+    print("ok: pjob send reached the running job")
+
     print(pjob("start", "rt-fail", "--remote", "--sh", "echo about to fail; exit 7").strip())
     st = wait_end("rt-fail", 300)
     assert st["exit"] == 7, st
@@ -150,6 +168,17 @@ try:
         assert open(f"{res}/upper.txt").read().strip() == "SEVEN", "agent result not brought back"
         assert os.path.exists(f"{res}/REPORT.md"), "no REPORT.md"
         print("ok: remote agent did the task, result and REPORT.md came back")
+        assert os.listdir(f"{res}/.session"), "the agent's conversation did not come back"
+        t5 = time.time()
+        print(pjob("continue", "rt-agent", "--sh",
+                   "Without reading or searching any file, write the word you wrote in your first step, in "
+                   "lowercase and alone, to second.txt in your results folder. Then update REPORT.md.").strip())
+        st = wait_end("rt-agent", 1500)
+        logtxt = open(st["log"]).read()
+        print(f"--- rt-agent continued after {time.time() - t5:.0f}s ---\n" + "\n".join(logtxt.splitlines()[-6:]))
+        assert st["exit"] == 0 and "continuing its conversation" in logtxt, st
+        assert open(f"{res}/second.txt").read().strip() == "seven", "continued agent lost its conversation"
+        print("ok: pjob continue resumed the agent's conversation")
     leftover = [n for n in os.listdir(f"{W.REMOTE_BOX}/req")] if os.path.isdir(f"{W.REMOTE_BOX}/req") else []
     assert not leftover, leftover
 finally:

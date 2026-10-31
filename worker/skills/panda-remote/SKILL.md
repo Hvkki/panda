@@ -46,6 +46,13 @@ pjob start research-x --remote --agent --model claude-sonnet-5.5 --effort medium
 - Pick the model for the job: `claude-haiku-5.5` + `low` for simple mechanical work, `claude-sonnet-5.5`
   + `medium` (default) for normal work, Opus only when the task needs hard reasoning. Credits come from the
   same plan as this chat.
+- **Files that come later:** `pjob send NAME PATH...` sends more files while the agent works (same
+  paths there). Say in the task text which file will come and that it should wait for it, for example
+  "the narration arrives later at ~/work/x/voice.wav: wait for it, then mix it in".
+- **Follow-ups:** when the agent has finished, `pjob continue NAME --notify --want '...' -- 'NEXT STEP'`
+  gives it the next step. It keeps its whole conversation (saved in `~/work/remote/NAME/.session/`) and
+  its earlier results, on whichever notebook is free; the `--files` it had are sent again. Use this
+  instead of starting a new remote agent that has to learn everything again.
 - For a helper that needs this chat's context, the browser or Kiro Crew tools, use `spawn_run` instead.
 
 ## When to use it
