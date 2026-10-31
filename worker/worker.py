@@ -5352,7 +5352,11 @@ def remote_task(sb: "Supabase", req: dict):
                 if got < frm:
                     logf.write(f"[remote] ({(frm - got) >> 10} KB of log skipped)\n".encode())
                     got = frm
-                logf.write(raw[got - frm:])
+                chunk = raw[got - frm:]
+                for sec in SECRETS:          # the notebook scrubs too; a key never reaches the agent's log
+                    if sec and len(sec) >= 6:
+                        chunk = chunk.replace(sec.encode(), b"***")
+                logf.write(chunk)
                 logf.flush()
                 got = frm + len(raw)
             if st.get("state") in ("done", "failed", "cancelled"):

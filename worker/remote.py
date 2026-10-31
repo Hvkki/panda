@@ -112,6 +112,8 @@ user's Panda. The main Panda chat gave you the task below; nobody reads your mes
 - There is no browser, no Kiro Crew tools and no user to ask here. If you cannot do something, say so in
   REPORT.md instead of guessing.
 - Save credits: combine steps, keep command output short (tail, grep), and stop when the task is done.
+- API keys from the user's vault (Customize -> API keys): {keys}. Load them inside a bash command with
+  `source ~/.panda/secrets.env`; never print, echo or write their values anywhere.
 - The main chat can send more files while you work (they land at the same paths). If the task says a file
   comes later, wait for it with one shell loop (say `for i in $(seq 120); do [ -f PATH ] && break; sleep 15;
   done`), not by checking again and again.
@@ -141,6 +143,18 @@ def session_restore(results: str) -> str:
         if os.path.exists(os.path.join(sd, ids[0] + ext)):
             shutil.copy(os.path.join(sd, ids[0] + ext), SESSIONS)
     return ids[0]
+
+
+def session_credits(results: str) -> float:
+    """Credits the saved conversation has used so far (kiro-cli's own metering, every turn)."""
+    sd = os.path.join(results, ".session")
+    total = 0.0
+    for f in glob.glob(os.path.join(sd, "*.json")):
+        with contextlib.suppress(Exception):
+            md = json.load(open(f))["session_state"]["conversation_metadata"]["user_turn_metadatas"]
+            total += sum(float(m.get("value") or 0) for t in md for m in (t.get("metering_usage") or [])
+                         if m.get("unit") == "credit")
+    return total
 
 
 def session_save(results: str, since: float) -> str:
@@ -195,7 +209,8 @@ def agent_cmd(task: dict, d: str, note) -> tuple[str, dict]:
     if ag.get("resume") and not sid:
         note("no saved conversation in the results folder: starting a new one with the earlier results")
     brief = CONTINUE_BRIEF if sid else AGENT_BRIEF
-    open(pf, "w").write(brief.format(results=results, prompt=ag.get("prompt") or ""))
+    keys = ", ".join(W.SECRET_NAMES) or "none"
+    open(pf, "w").write(brief.format(results=results, prompt=ag.get("prompt") or "", keys=keys))
     cli = ensure_kiro(note)
     note(f"agent: {model} / {effort}, results in ~/{ag.get('results')}" + (" (continuing its conversation)" if sid else ""))
     resume = f"--resume-id {shlex.quote(sid)} " if sid else ""
@@ -462,6 +477,28 @@ def guard_loop(stop: threading.Event):
             say("guard:", type(exc).__name__)
 
 
+def vault_sync(note=None) -> bool:
+    """The owner's vault -> ~/.panda/secrets.env here, read with the worker login like the main Panda does
+    (the keys never pass through Storage). Run before each task, so a key changed in the app is used."""
+    try:
+        os.makedirs(os.path.join(HOME, ".kiro", "crew"), exist_ok=True)   # sync_secrets also writes Crew's .env
+        W.sync_secrets(sb)
+        return True
+    except Exception as exc:
+        if note:
+            note(f"vault keys not loaded: {type(exc).__name__}")
+        say("vault sync failed:", type(exc).__name__)
+        return False
+
+
+def scrub_bytes(data: bytes) -> bytes:
+    """Remove every vault key (and the worker's own secrets) from log bytes before they leave this machine."""
+    for sec in W.SECRETS:
+        if sec and len(sec) >= 6:
+            data = data.replace(sec.encode(), b"***")
+    return data
+
+
 def apply_sends(tid: str, x: dict, d: str, st: dict, note):
     """Unpack files the main chat sent with `pjob send` after the task started (queue entry "sends")."""
     for s in (x.get("flags") or {}).get("sends") or []:
@@ -502,7 +539,7 @@ def run_task(tid: str):
         frm = max(0, size - LOG_TAIL)
         with open(logp, "rb") as f:
             f.seek(frm)
-            sb.put(key("tasks", tid, "log"), f.read(), mime="text/plain")
+            sb.put(key("tasks", tid, "log"), scrub_bytes(f.read()), mime="text/plain")
         st.update(log_bytes=size, log_from=frm, at=time.time())
         put_json(st, "tasks", tid, "status.json")
 
@@ -562,9 +599,12 @@ def run_task(tid: str):
                 raise RuntimeError(f"setup failed with exit {rc}")
             SETUP_DONE.add(h)
         apply_sends(tid, x, d, st, note)
+        vault_sync(note)
         started = time.time() - 1
         cmd, extra_env = task["cmd"], {}
         if task.get("agent"):
+            with contextlib.suppress(Exception):
+                st["credits_before"] = session_credits(os.path.join(HOME, task["agent"].get("results") or "work/remote/task"))
             cmd, extra_env = agent_cmd(task, d, note)
         note(f"running on remote Panda ({os.cpu_count()} CPUs, {free_mb()} MB free)")
         p = subprocess.Popen(["bash", "-c", cmd], cwd=cwd, stdin=subprocess.DEVNULL, stdout=logf,
@@ -582,8 +622,13 @@ def run_task(tid: str):
         st["exit"] = rc
         if task.get("agent"):
             with contextlib.suppress(Exception):
-                if session_save(os.path.join(HOME, task["agent"].get("results") or "work/remote/task"), started):
-                    note("saved the agent's conversation: pjob continue can pick it up")
+                res = os.path.join(HOME, task["agent"].get("results") or "work/remote/task")
+                before = st.get("credits_before") or 0.0
+                if session_save(res, started):
+                    used = session_credits(res) - before
+                    st["credits"] = round(used, 2)
+                    note(f"agent used {used:.2f} credits ({task['agent'].get('model')} / {task['agent'].get('effort')}); "
+                         "saved its conversation: pjob continue can pick it up")
         if x.get("guard_stopped"):
             st["guard"] = x["guard_stopped"]
             note(f"stopped by the remote guard: {x['guard_stopped']}")
@@ -635,6 +680,7 @@ def main():
     global TOOLS
     TOOLS = tools()
     say(f"remote Panda {RID} for {OWNER[:8]}…, tools {TOOLS}")
+    vault_sync()
     threading.Thread(target=guard_loop, args=(GUARD_STOP,), daemon=True, name="guard").start()
     beat()
     last_beat = last_owner_ok = time.time()

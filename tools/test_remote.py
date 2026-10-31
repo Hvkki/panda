@@ -118,6 +118,18 @@ try:
     assert st["exit"] == 0 and "arrived-later" in open(st["log"]).read(), (st, open(st["log"]).read()[-600:])
     print("ok: pjob send reached the running job")
 
+    # Vault keys: the notebook has them in ~/.panda/secrets.env, and a printed key never reaches the log here.
+    print(pjob("start", "rt-keys", "--remote", "--sh",
+               'source ~/.panda/secrets.env && [ -n "$MODAL_TOKEN_ID" ] && echo has-modal-key; '
+               'echo "leak:$MODAL_TOKEN_ID"').strip())
+    st = wait_end("rt-keys", 300)
+    logtxt = open(st["log"]).read()
+    real = subprocess.run(["bash", "-c", 'source ~/.panda/secrets.env && printf %s "$MODAL_TOKEN_ID"'],
+                          capture_output=True, text=True).stdout
+    assert st["exit"] == 0 and "has-modal-key" in logtxt and "leak:***" in logtxt, logtxt[-400:]
+    assert real and real not in logtxt, "a vault key reached the log"
+    print("ok: vault keys on the notebook, scrubbed from the log")
+
     print(pjob("start", "rt-fail", "--remote", "--sh", "echo about to fail; exit 7").strip())
     st = wait_end("rt-fail", 300)
     assert st["exit"] == 7, st

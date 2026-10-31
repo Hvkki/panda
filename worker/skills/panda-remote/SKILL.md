@@ -46,6 +46,11 @@ pjob start research-x --remote --agent --model claude-sonnet-5.5 --effort medium
 - Pick the model for the job: `claude-haiku-5.5` + `low` for simple mechanical work, `claude-sonnet-5.5`
   + `medium` (default) for normal work, Opus only when the task needs hard reasoning. Credits come from the
   same plan as this chat.
+- **Cost:** a remote agent costs no more than a local helper on the same model and effort (measured: the
+  same task took 0.32 credits remote, 0.66 as a local helper, Sonnet / medium). What makes a run expensive
+  is the model and effort you pick (Opus helpers at `xhigh`/`max` used 74-216 credits each on 31 Oct,
+  Sonnet helpers 6-27). Use Opus `xhigh`/`max` only for the hardest part, never as the default for a batch. The job log
+  ends with `[remote] agent used N credits`.
 - **Files that come later:** `pjob send NAME PATH...` sends more files while the agent works (same
   paths there). Say in the task text which file will come and that it should wait for it, for example
   "the narration arrives later at ~/work/x/voice.wav: wait for it, then mix it in".
