@@ -714,7 +714,10 @@ web app (UI), the worker, its skills or its prompt. Elsewhere you never touch Pa
 # State the Crew snapshot does not carry: Crew's chat transcripts (crew/sessions) and
 # kiro-cli's own sessions, agents and steering. Lock files are never saved: a stale
 # lock makes kiro-cli refuse to resume the session on the next run.
-EXTRA_DIRS = ["crew/sessions", "sessions/cli", "agents", "steering"]
+# "sessions" covers sessions/cli and the ACP runtime's sessions/<hash>/sess_* folders (messages.jsonl).
+# Only sessions/cli used to be saved, so after a restart Crew's session/load found no stored turns and
+# every chat started fresh ("replayed no earlier turn"). session-index is that runtime's lookup table.
+EXTRA_DIRS = ["crew/sessions", "sessions", "session-index", "agents", "steering"]
 
 
 def _no_locks(info: tarfile.TarInfo):
