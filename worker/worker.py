@@ -706,9 +706,6 @@ web app (UI), the worker, its skills or its prompt. Elsewhere you never touch Pa
 - Do exactly what the user asked, no more. For a bigger change, say the plan in two or three lines
   first. Deploy only when the user asked for it (or clearly wants it live). Afterwards tell them what
   changed, where, and how to undo it (git revert, or redeploy the previous commit).
-- Never weaken security: the owner-only checks, row-level security, the relay allow-list
-  (GW_ALLOWED in worker/worker.py) and the browser's private-address block stay as they are unless
-  the user explicitly asks and understands the risk.
 [END DEVELOPER MODE]
 
 """
