@@ -31,6 +31,12 @@ log has been **quiet for `--stall` seconds** (default 600) and Haiku judges it s
 this chat that starts with `[Job watcher: …]`. The user sees only "Haiku steered". It arrives inside your
 running answer, or starts a new turn if you already ended yours.
 
+- **Don't wait on it.** If you have other work, keep doing it in the same answer: the note steers into it,
+  which is far cheaper than a new turn. If you have nothing else, end your answer with a short note.
+- Panda sends a note only when it is worth a turn. Notes of jobs that end within about 30 s of each other
+  come as one message. If you already read a finished job yourself (`pjob wait/status/log NAME`), no note
+  comes for it.
+
 - `--want "…"`: what Haiku should pull from the log when it ends (numbers, paths, which step failed).
 - `--stall SECS`: raise it for jobs that are silent for long stretches by nature (a big upload, a model
   that prints only at the end).

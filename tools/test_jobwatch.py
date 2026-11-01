@@ -34,6 +34,7 @@ _cwd = os.getcwd()
 os.chdir(tempfile.mkdtemp(prefix="jobwatch-cwd-"))
 import worker as W  # noqa: E402
 W.OWNER = "owner-1"  # on Kaggle worker.py reads the real worker.json first
+W.JOB_HOLD_SECS = 0  # the older tests deliver at once; test_hold_seen_and_batch covers the hold
 os.chdir(_cwd)
 
 
@@ -102,6 +103,7 @@ def test_short_end_goes_raw_no_haiku():
     m = sb.posts[0]
     meta = dict(m["meta"])
     assert meta.pop("wake_id", "").startswith("t3:failed:"), m["meta"]
+    assert meta.pop("hold_until", 0) > time.time() + 20, m["meta"]
     assert meta == {"steer": True, "haiku_steer": True, "job": "t3", "job_event": "failed"}, m["meta"]
     assert m["status"] == "pending" and m["role"] == "user" and m["chat_id"] == CHAT["id"]
     assert "FAILED (exit 3)" in m["content"] and "line2" in m["content"] and "[Job watcher" in m["content"]
@@ -238,6 +240,7 @@ def test_guard_stop_tells_the_chat_without_notify():
     os.killpg(pid, 9)                                  # what the guard does: no exit file is written
     time.sleep(0.5)
     assert "stopped by Panda's guard" in pjob("status", "t8").stdout
+    os.remove(f"{d}/seen")   # that read counts as the agent seeing it; here the agent has not looked
     W.job_watch_step(sb, None)
     assert len(sb.posts) == 1, sb.posts
     m = sb.posts[0]
@@ -297,16 +300,99 @@ def test_remote_boot_wait_prints_progress():
     assert not ok and any("still waiting for remote Panda" in n for n in notes), notes
 
 
-if __name__ == "__main__":
+class MergeSB(FakeSB):
+    """Keeps message rows, so a second note can be merged into the first one's batch window."""
+    def __init__(self):
+        super().__init__()
+        self.rows = []
+
+    def rest(self, method, table, params=None, body=None, prefer=None):
+        params = params or {}
+        if table == "messages" and method == "GET" and params.get("meta->>haiku_steer"):
+            return [dict(r) for r in reversed(self.rows) if r["status"] == "pending"][:1]
+        if table == "messages" and method == "PATCH":
+            for r in self.rows:
+                if f"eq.{r['id']}" == params.get("id") and r["status"] == "pending":
+                    r.update(body)
+                    return [dict(r)]
+            return []
+        if table == "messages" and method == "POST":
+            row = dict(body, id=len(self.rows) + 1)
+            self.rows.append(row)
+        return super().rest(method, table, params, body, prefer)
+
+
+def test_hold_seen_and_batch():
+    W.JOB_HOLD_SECS = 20
+    try:
+        sb = MergeSB()
+        # 1. ended just now: held, so the agent's own `pjob wait` can read it first
+        pjob("start", "h1", "--notify", "--sh", "echo one")
+        wait_end("h1")
+        W.job_watch_step(sb, None)
+        assert not sb.posts, "a just-ended job was not held"
+        # 2. the agent read it with `pjob wait`: no note at all, ever
+        r = pjob("wait", "h1", "--max", "5")
+        assert "h1: done" in r.stdout, r.stdout
+        assert os.path.exists(f"{HOME}/work/jobs/h1/seen")
+        W.job_watch_step(sb, None)
+        assert not sb.posts and open(f"{HOME}/work/jobs/h1/notified").read().startswith("seen")
+        # 3. two jobs that end together: one message for both, kept back from the claimers
+        for n in ("h2", "h3"):
+            pjob("start", n, "--notify", "--sh", f"echo out-{n}")
+            wait_end(n)
+            open(f"{HOME}/work/jobs/{n}/ended", "w").write(str(time.time() - 60))
+        W.job_watch_step(sb, None)
+        assert len(sb.rows) == 1, sb.rows
+        row = sb.rows[0]
+        assert "out-h2" in row["content"] and "out-h3" in row["content"], row["content"]
+        assert row["content"].count("[Job watcher") == 1, "header repeated"
+        assert sorted(row["meta"]["jobs"]) == ["h2", "h3"] and len(row["meta"]["wake_ids"]) == 2, row["meta"]
+        assert W.job_note_held(row) and not W.job_note_held({"meta": {"hold_until": time.time() - 1}})
+        # 4. a restarted job forgets that it was seen
+        pjob("start", "h1", "--notify", "--sh", "echo again")
+        assert not os.path.exists(f"{HOME}/work/jobs/h1/seen")
+        wait_end("h1")
+    finally:
+        W.JOB_HOLD_SECS = 0
+
+
+def test_memory_delete_relay():
+    ok = [("DELETE", "/api/memory/semantic/pref.helper_model", None),
+          ("DELETE", "/api/memory/episodic/1234", None),
+          ("DELETE", "/api/lessons", {"rule": "Use Sonnet for most helper work", "exact": True})]
+    bad = [("DELETE", "/api/memory/semantic", None),                              # the whole store
+           ("DELETE", "/api/memory/episodic/1/x", None),
+           ("DELETE", "/api/memory/preferences", None),
+           ("DELETE", "/api/lessons", {"rule": "Use Sonnet for most helper work"}),  # substring mode
+           ("DELETE", "/api/lessons", {"rule": "e", "exact": True}),                 # too short
+           ("DELETE", "/api/lessons", {"rule": "Use Sonnet for most", "exact": "true"}),
+           ("DELETE", "/api/lessons", {"rule": "Use Sonnet for most", "exact": True, "scope": "workspace"}),
+           ("POST", "/api/memory/bulk/apply", {})]
+    for m, p, b in ok:
+        W.relay_check(m, p, b)
+    for m, p, b in bad:
+        try:
+            W.relay_check(m, p, b)
+        except ValueError:
+            continue
+        raise AssertionError(f"relay allowed {m} {p} {b}")
+
+
+def run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     order = ["test_notify_records_chat_slot", "test_helper_run_has_no_chat_to_wake", "test_short_end_goes_raw_no_haiku",
              "test_long_end_uses_haiku_for_want", "test_stall_steers_only_when_haiku_says_stuck",
              "test_failed_insert_is_retried_not_lost", "test_lost_answer_does_not_wake_twice",
              "test_guard_stop_tells_the_chat_without_notify", "test_stop_ends_a_timeout_wrapped_command",
              "test_stop_cleans_up_after_a_lost_wrapper", "test_brief_short_and_long",
-             "test_remote_boot_wait_prints_progress"]
+             "test_remote_boot_wait_prints_progress", "test_hold_seen_and_batch", "test_memory_delete_relay"]
     assert sorted(order) == sorted(f.__name__ for f in fns), "a test is missing from the order list"
     for name in order:
         globals()[name]()
         print("ok", name)
     print("all passed")
+
+
+if __name__ == "__main__":
+    run_all()

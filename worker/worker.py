@@ -4342,7 +4342,7 @@ def steer_pending(sb: Supabase, gw: Gateway):
                                               "select": "id,chat_id,content,meta"})
     for r in rows or []:
         info = live.get(r["chat_id"])
-        if not info or not (r.get("content") or "").strip():
+        if not info or not (r.get("content") or "").strip() or job_note_held(r):
             continue
         got = sb.rest("PATCH", "messages", prefer="return=representation",
                       params={"id": f"eq.{r['id']}", "status": "eq.pending"}, body={"status": "processing"})
@@ -4490,12 +4490,50 @@ def job_stall_note(gw: "Gateway", name: str, st: dict, quiet: float, cpu_pct: fl
         "don't just wait longer.") if p)
 
 
+JOB_BATCH_SECS = 30   # a job note waits this long so notes of jobs ending together wake the chat once
+JOB_HOLD_SECS = 20    # after a job ends, time for the agent to read it itself (pjob wait/status/log)
+
+
+def job_note_held(row: dict) -> bool:
+    """True while a job note is still collecting other notes for the same chat."""
+    try:
+        return float((row.get("meta") or {}).get("hold_until") or 0) > time.time()
+    except (TypeError, ValueError):
+        return False
+
+
 def job_deliver(sb: "Supabase", chat: dict, text: str, name: str, kind: str, key: str = ""):
-    meta = {"steer": True, "haiku_steer": True, "job": name, "job_event": kind}
+    """Insert the note, or add it to a note for the same chat that is still in its batch window.
+    On 29 Oct-1 Nov, 40 of 142 notes came within 3 minutes of another note in the same chat, and
+    every separate note cost the agent a full turn."""
+    now = time.time()
+    body = scrub(text)
+    try:
+        open_rows = sb.rest("GET", "messages", params={
+            "chat_id": f"eq.{chat['id']}", "status": "eq.pending", "meta->>haiku_steer": "eq.true",
+            "order": "id.desc", "limit": "1", "select": "id,content,meta"})
+    except Exception:
+        open_rows = []
+    for r in open_rows or []:
+        meta = dict(r.get("meta") or {})
+        # merge only well inside the window, so a claimer never reads the row while we append
+        if float(meta.get("hold_until") or 0) - now < 3:
+            break
+        meta["jobs"] = (meta.get("jobs") or [meta.get("job")]) + [name]
+        meta["wake_ids"] = (meta.get("wake_ids") or [meta.get("wake_id")]) + ([key] if key else [])
+        add = body.replace(JOB_NOTE, "").strip()
+        got = sb.rest("PATCH", "messages", prefer="return=representation",
+                      params={"id": f"eq.{r['id']}", "status": "eq.pending"},
+                      body={"content": f"{r['content']}\n\n---\n\n{add}", "meta": meta})
+        if got:
+            log(f"chat {chat['id']}: job {name} {kind}, added to the waiting note {r['id']}")
+            return
+    meta = {"steer": True, "haiku_steer": True, "job": name, "job_event": kind,
+            "hold_until": round(now + JOB_BATCH_SECS)}
     if key:
         meta["wake_id"] = key
     sb.rest("POST", "messages", body={"chat_id": chat["id"], "owner": chat["owner"], "role": "user",
-                                      "status": "pending", "content": scrub(text), "meta": meta})
+                                      "status": "pending", "content": body, "meta": meta})
     log(f"chat {chat['id']}: job {name} {kind}, Haiku steered")
 
 
@@ -4516,8 +4554,11 @@ def _job_send(sb: "Supabase", w: dict, chat: dict, name: str, kind: str, make, n
     if now < p.get("next", 0):
         return False
     try:
-        if not (p["tries"] and sb.rest("GET", "messages", params={
-                "chat_id": f"eq.{chat['id']}", "meta->>wake_id": f"eq.{p['key']}", "select": "id", "limit": "1"})):
+        if not (p["tries"] and (sb.rest("GET", "messages", params={
+                "chat_id": f"eq.{chat['id']}", "meta->>wake_id": f"eq.{p['key']}", "select": "id", "limit": "1"})
+                or sb.rest("GET", "messages", params={      # merged into another job's note
+                "chat_id": f"eq.{chat['id']}", "meta": f"cs.{json.dumps({'wake_ids': [p['key']]})}",
+                "select": "id", "limit": "1"}))):
             job_deliver(sb, chat, p["text"], name, kind, p["key"])
     except Exception as exc:
         p["tries"] += 1
@@ -4608,6 +4649,17 @@ def _job_watch_one(sb: "Supabase", gw: "Gateway", jm, name: str, d: str, notify:
         if (w.get("pending") or {}).get("kind") == "stuck":
             w.pop("pending", None)      # the end note says more than a late 'looks stuck'
         kind = "guard" if guard else st["state"]
+        if not w.get("pending"):
+            if os.path.exists(f"{d}/seen"):   # the agent already read the end itself: no extra turn
+                done("seen")
+                log(f"job {name}: {kind}, the agent already read it; no note")
+                return
+            try:
+                ended = float(jm._read(d, "ended") or 0)
+            except ValueError:
+                ended = 0
+            if ended and now - ended < JOB_HOLD_SECS:
+                return                         # give a `pjob wait` in the running turn time to see it
         if guard and not notify:
             make = lambda: job_guard_note(name, st, guard, jm.tail(name, 12))
         else:
@@ -5862,6 +5914,8 @@ def claim_next(sb: Supabase):
         with BUSY_LOCK:
             if r["chat_id"] in BUSY_CHATS or len(BUSY_CHATS) >= MAX_PARALLEL_CHATS:
                 continue
+        if job_note_held(r):
+            continue
         body = {"status": "processing"}
         if (r.get("meta") or {}).get("steer"):  # its turn ended before the steer: run it as a normal turn
             body["meta"] = {k: v for k, v in r["meta"].items() if k != "steer"}
@@ -6651,6 +6705,9 @@ _RELAY_WRITE = [
     ({"POST"}, re.compile(r"^/api/sessions/usage/refresh$")),
     ({"PATCH"}, re.compile(r"^/api/config/kirocrew$")),
     ({"PUT"}, re.compile(r"^/api/dashboard/config$")),
+    # Settings -> Memory: the owner deletes one fact, one memory or one lesson at a time.
+    ({"DELETE"}, re.compile(r"^/api/memory/(semantic|episodic)/[^/?#]+$")),
+    ({"DELETE"}, re.compile(r"^/api/lessons$")),
 ]
 
 
@@ -6669,6 +6726,13 @@ def relay_check(method: str, path: str, body) -> None:
         why = locked_reason(target)
         if not target or why:
             raise ValueError(f"not allowed from the app: {target or 'no path'}" + (f" ({why})" if why else ""))
+    if path == "/api/lessons":
+        # One whole lesson, matched exactly: Crew's default is a substring match, which could
+        # take many lessons with one short fragment.
+        ok = (isinstance(body, dict) and set(body) == {"rule", "exact"} and body["exact"] is True
+              and isinstance(body["rule"], str) and len(body["rule"].strip()) >= 8)
+        if not ok:
+            raise ValueError("not allowed from the app: a lesson is deleted by its whole rule, exact=true")
     if path == "/api/dashboard/config":
         extra = set(body or {}) - DASH_KEYS if isinstance(body, dict) else {"body"}
         if extra:

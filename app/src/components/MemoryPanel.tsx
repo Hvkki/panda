@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { gw } from "../lib/commands";
-import { IconAlert } from "./Icons";
+import { IconAlert, IconTrash } from "./Icons";
 
-/* Settings → Memory: what Panda (Kiro Crew) remembers, read-only.
+/* Settings → Memory: what Panda (Kiro Crew) remembers. Facts, memories and lessons can be
+   deleted one at a time (the worker relay allows exactly these deletes, owner only).
    Four parts, all from Crew's own memory store through the worker's read relay:
    - About you: the preferences + projects documents Crew injects into every chat
    - Facts: semantic key/value memories
@@ -78,6 +79,18 @@ const Err = ({ msg, retry }: { msg: string; retry: () => void }) => (
 );
 const Empty = ({ text }: { text: string }) => <p className="muted small pad">{text}</p>;
 
+/** Trash button: asks first, deletes, then tells the list to drop the row. */
+function DeleteBtn({ what, run, onDone }: { what: string; run: () => Promise<unknown>; onDone: () => void }) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <button className="icon-btn" title="Delete" aria-label="Delete" disabled={busy} onClick={async () => {
+      if (!confirm(`Delete this ${what}? Panda forgets it for good.`)) return;
+      setBusy(true);
+      try { await run(); onDone(); } catch (e) { alert((e as Error).message); setBusy(false); }
+    }}><IconTrash size={15} /></button>
+  );
+}
+
 function About() {
   const { data, err, loading, reload } = useLoad(async () => {
     const [p, j] = await Promise.all([
@@ -100,9 +113,11 @@ function About() {
 function Facts({ q }: { q: string }) {
   const { data, err, loading, reload } = useLoad(
     () => gw<AnyRec>("GET", `/api/memory/semantic?limit=500${q ? `&q=${encodeURIComponent(q)}` : ""}`), [q]);
+  const [gone, setGone] = useState<Set<string>>(new Set());
   if (loading) return <Loading />;
   if (err) return <Err msg={err} retry={reload} />;
   const rows = ((data?.entries as AnyRec[]) || [])
+    .filter((e) => !gone.has(str(e.key)))
     .slice().sort((a, b) => str(b.updated_at).localeCompare(str(a.updated_at)));
   if (!rows.length) return <Empty text={q ? "No facts match." : "No saved facts yet."} />;
   return (
@@ -114,6 +129,8 @@ function Facts({ q }: { q: string }) {
             <div className="memory-text">{factValue(e)}</div>
             <div className="muted small">{when(e.updated_at)}{e.source ? ` · ${str(e.source)}` : ""}</div>
           </div>
+          <DeleteBtn what="fact" run={() => gw("DELETE", `/api/memory/semantic/${encodeURIComponent(str(e.key))}`)}
+            onDone={() => setGone((g) => new Set(g).add(str(e.key)))} />
         </div>
       ))}
     </div>
@@ -150,6 +167,9 @@ function Memories({ q }: { q: string }) {
               <div className="muted small">{when(e.created_at)}
                 {tagsOf(e).slice(0, 4).map((t) => <span key={t} className="tag" style={{ marginLeft: 6 }}>{t}</span>)}</div>
             </div>
+            {e.id != null && <DeleteBtn what="memory"
+              run={() => gw("DELETE", `/api/memory/episodic/${encodeURIComponent(str(e.id))}`)}
+              onDone={() => setRows((r) => r.filter((x) => str(x.id) !== str(e.id)))} />}
           </div>
         ))}
       </div>
@@ -161,11 +181,12 @@ function Memories({ q }: { q: string }) {
 
 function Lessons() {
   const { data, err, loading, reload } = useLoad(() => gw<AnyRec>("GET", "/api/lessons?limit=200"), []);
+  const [gone, setGone] = useState<Set<string>>(new Set());
   if (loading) return <Loading />;
   if (err) return <Err msg={err} retry={reload} />;
-  const rows = ((data?.lessons as AnyRec[]) || []).slice().reverse(); // newest first
+  const rows = ((data?.lessons as AnyRec[]) || []).filter((e) => !gone.has(str(e.rule))).slice().reverse(); // newest first
   if (!rows.length) return <Empty text="No lessons yet." />;
-  const total = Number(data?.total) || rows.length;
+  const total = (Number(data?.total) || rows.length + gone.size) - gone.size;
   return (
     <>
       <p className="muted small">Rules Panda learned from your corrections. {total > rows.length ? `Showing the newest ${rows.length} of ${total}.` : `${total} in total.`}</p>
@@ -177,6 +198,9 @@ function Lessons() {
               {e.negative ? <div className="muted small">Not: {str(e.negative)}</div> : null}
               <div className="muted small">{when(e.ts)}{e.category ? ` · ${str(e.category)}` : ""}</div>
             </div>
+            {str(e.rule).trim().length >= 8 && <DeleteBtn what="lesson"
+              run={() => gw("DELETE", "/api/lessons", { rule: str(e.rule), exact: true })}
+              onDone={() => setGone((g) => new Set(g).add(str(e.rule)))} />}
           </div>
         ))}
       </div>

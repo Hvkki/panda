@@ -93,6 +93,16 @@ def state(name: str) -> dict:
     return out
 
 
+def mark_seen(st: dict):
+    """The agent has just read this job's end (wait/status/log by name). Panda's watcher then
+    skips the --notify note: waking the chat for news it already has costs a whole turn."""
+    if st.get("state") in ("done", "failed", "stopped", "lost"):
+        try:
+            open(os.path.join(_dir(st["name"]), "seen"), "w").write(str(time.time()))
+        except OSError:
+            pass
+
+
 def tail(name: str, n: int = 15) -> str:
     path = os.path.join(_dir(name), "log")
     try:
@@ -285,7 +295,7 @@ def cmd_start(a, rest):
         if getattr(a, "resume", False):
             shown = f"remote agent (continued): {(a.sh or ' '.join(rest))[:300]}"
     os.makedirs(d, exist_ok=True)
-    for f in ("exit", "ended", "log", "notify", "notified", "watch.json", "guard", "slot"):
+    for f in ("exit", "ended", "log", "notify", "notified", "watch.json", "guard", "slot", "seen"):
         try:
             os.remove(os.path.join(d, f))
         except OSError:
@@ -455,18 +465,23 @@ def main():
         else:
             for st in sts:
                 show(st, a.n if a.name else 0)
+        if a.name:
+            mark_seen(sts[0])
     elif a.op == "wait":
         mx = max(1.0, min(a.max, 1500))   # never block one step for more than 25 minutes
         (st,), ended = _wait([a.name], mx)
         show(st, a.n)
+        mark_seen(st)
         if not ended:
             print(f"(still running after waiting {int(mx)}s; wait again, or do other work and check later)")
     elif a.op == "wait-any":
         sts, ended = _wait(a.names, max(1.0, min(a.max, 1500)))
         for st in sts:
             show(st, 6 if st["state"] != "running" else 0)
+            mark_seen(st)
     elif a.op == "log":
         print(tail(a.name, a.n))
+        mark_seen(state(a.name))
     elif a.op == "stop":
         d = _dir(a.name)
         pid = int(_read(d, "pid", "0") or 0)
