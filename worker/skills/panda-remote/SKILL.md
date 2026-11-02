@@ -58,6 +58,11 @@ pjob start research-x --remote --agent --model claude-sonnet-5.5 --effort medium
   gives it the next step. It keeps its whole conversation (saved in `~/work/remote/NAME/.session/`) and
   its earlier results, on whichever notebook is free; the `--files` it had are sent again. Use this
   instead of starting a new remote agent that has to learn everything again.
+  When the owner turned on **Settings -> Chat & tools -> Start each phase fresh**, `pjob continue` instead
+  starts a new agent that reads `REPORT.md` and the notes it lists (much cheaper per step, since the old
+  conversation is not re-sent). So before a helper ends a phase, make sure its REPORT.md names the notes,
+  paths and decisions the next phase needs. `--keep` resumes the old conversation anyway, `--fresh` forces
+  a fresh one.
 - For a helper that needs this chat's context, the browser or Kiro Crew tools, use `spawn_run` instead.
 
 ## When to use it

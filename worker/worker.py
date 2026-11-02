@@ -2511,6 +2511,24 @@ def user_settings(sb: Supabase, owner: str) -> dict:
     return (rows[0]["settings"] if rows else {}) or {}
 
 
+AGENT_PREFS = os.path.expanduser("~/.panda/agent_prefs.json")
+
+
+def write_agent_prefs(settings: dict):
+    """The app settings that pjob (run by agents in their shell) needs, mirrored to a local file."""
+    want = {"fresh_phases": bool((settings or {}).get("freshPhases", False))}
+    try:
+        if json.load(open(AGENT_PREFS)) == want:
+            return
+    except (OSError, ValueError):
+        pass
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.dirname(AGENT_PREFS), exist_ok=True)
+        tmp = AGENT_PREFS + ".tmp"
+        json.dump(want, open(tmp, "w"))
+        os.replace(tmp, AGENT_PREFS)
+
+
 def ensure_slot(sb: Supabase, gw: Gateway, chat: dict, settings: dict) -> tuple[str, bool]:
     """Return (slot, needs_replay); applies the chat's model, effort and approval mode."""
     slot = chat.get("slot_id")
@@ -3785,6 +3803,8 @@ def narrate(gw: "Gateway", ask: str, tools: list, at: list, elapsed: float, thin
 def handle(sb: Supabase, gw: Gateway, msg: dict):
     chat = sb.rest("GET", "chats", params={"id": f"eq.{msg['chat_id']}", "select": "*"})[0]
     settings = user_settings(sb, chat["owner"])
+    if chat["owner"] == OWNER:
+        write_agent_prefs(settings)
     fresh_slot = not chat.get("slot_id")
     slot, needs_replay = ensure_slot(sb, gw, chat, settings)
     raw = msg["content"] or ""
@@ -5365,7 +5385,7 @@ def remote_task(sb: "Supabase", req: dict):
             open(f"{d}/agent", "w").write(str(agent.get("model") or ""))
             agent = {"prompt": str(agent.get("prompt") or "")[:20000], "model": str(agent.get("model") or ""),
                      "effort": str(agent.get("effort") or ""), "results": _home_rel(agent.get("results") or "", False),
-                     "resume": bool(agent.get("resume"))}
+                     "resume": bool(agent.get("resume")), "fresh": bool(agent.get("fresh"))}
         remote_put_json(sb, {"tid": tid, "cmd": req["cmd"], "cwd": cwd, "setup": req.get("setup") or "",
                              "out": outs, "files": files, "has_input": bool(files), "agent": agent, "at": time.time()},
                         rid, "tasks", tid, "task.json")
@@ -7258,7 +7278,9 @@ def main():
         except Exception as exc:
             log("vault sync failed:", exc)
         # Settings → Memory: off means Crew reads memory but stops writing new memories.
-        mem_on = user_settings(sb, OWNER).get("memory", True)
+        boot_settings = user_settings(sb, OWNER)
+        write_agent_prefs(boot_settings)
+        mem_on = boot_settings.get("memory", True)
         sh(f"kirocrew config set memory.writes_enabled {'true' if mem_on else 'false'}")
         start_browser(sb)
         _safe(start_codex, sb)

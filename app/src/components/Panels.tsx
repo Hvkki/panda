@@ -161,6 +161,9 @@ export function SettingsModal({ email, userId, onClose, worker, online, initialT
               options={[["ask", "Ask me"], ["trust", "Trust (don't ask)"]]} />
             <Toggle k="background_trust" label="Allow scheduled tasks to use tools"
               hint="Scheduled jobs run without you; they can't wait for a tap." />
+            <h3>Remote helpers</h3>
+            <Toggle k="freshPhases" label="Start each phase fresh"
+              hint="When a chat gives a finished remote helper its next step, a new agent starts from its REPORT.md and notes instead of carrying the whole old conversation. Much cheaper per step; it forgets details not written down." />
             <h3>Browser</h3>
             <ForgetRow userId={userId} />
             <h3>Worker</h3>

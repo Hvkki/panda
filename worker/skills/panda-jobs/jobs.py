@@ -288,12 +288,15 @@ def cmd_start(a, rest):
             extra = ["--agent", f"--model={a.model or 'claude-sonnet-5.5'}", f"--effort={a.effort or 'medium'}"]
             if getattr(a, "resume", False):
                 extra.append("--resume")
+                if getattr(a, "fresh_run", False):
+                    extra.append("--fresh")
         line = shlex.join([sys.executable, premote, "run", "--name", a.name, "--cwd", a.cwd or os.getcwd(),
                            "--files", *(a.files or []), "--out", *(a.out or []), f"--setup={a.setup or ''}",
                            *extra, f"--cmd={line}"])
         shown = f"remote {'agent' if a.agent else ''}: {shown}".replace("remote :", "remote:")
         if getattr(a, "resume", False):
-            shown = f"remote agent (continued): {(a.sh or ' '.join(rest))[:300]}"
+            how = "next phase, fresh agent" if getattr(a, "fresh_run", False) else "continued"
+            shown = f"remote agent ({how}): {(a.sh or ' '.join(rest))[:300]}"
     os.makedirs(d, exist_ok=True)
     for f in ("exit", "ended", "log", "notify", "notified", "watch.json", "guard", "slot", "seen"):
         try:
@@ -383,6 +386,14 @@ def cmd_send(a):
     print(f"still sending to {a.name} after {int(time.time() - t0)}s; the job log shows 'send {n}' when it is there")
 
 
+def fresh_phases() -> bool:
+    """Settings -> Chat & tools -> Start each phase fresh (the worker mirrors it to ~/.panda/agent_prefs.json)."""
+    try:
+        return bool(json.load(open(os.path.expanduser("~/.panda/agent_prefs.json"))).get("fresh_phases"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def cmd_continue(a, rest):
     res = os.path.expanduser(f"~/work/remote/{a.name}")
     try:
@@ -391,7 +402,11 @@ def cmd_continue(a, rest):
         sys.exit(f"pjob: {a.name} was not a remote agent job (no {res}/.pjob.json)")
     if state(a.name)["state"] == "running":
         sys.exit(f"pjob: {a.name} is still running; use pjob send for files, or wait for it to end")
-    if not os.path.isdir(os.path.join(res, ".session")):
+    a.fresh_run = fresh_phases() if a.fresh is None else a.fresh
+    if a.fresh_run:
+        print(f"note: fresh mode: a new agent picks up from {res}/REPORT.md and the notes it lists, "
+              "not the old conversation (Settings -> Chat & tools -> Start each phase fresh; --keep to resume)")
+    elif not os.path.isdir(os.path.join(res, ".session")):
         print(f"note: no saved conversation in {res}/.session (it ran before continue existed, or failed early); "
               "the agent starts fresh with the earlier results and REPORT.md")
     home = os.path.expanduser("~")
@@ -435,6 +450,10 @@ def main():
     s.add_argument("--notify", action="store_true"); s.add_argument("--want")
     s.add_argument("--stall", type=float, default=600); s.add_argument("--setup")
     s.add_argument("--model"); s.add_argument("--effort")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--fresh", dest="fresh", action="store_true", default=None,
+                   help="a new agent picks up from REPORT.md (default: the Start each phase fresh setting)")
+    g.add_argument("--keep", dest="fresh", action="store_false", help="resume the saved conversation")
     s = sub.add_parser("status"); s.add_argument("name", nargs="?"); s.add_argument("-n", type=int, default=12)
     s.add_argument("--json", action="store_true")
     s = sub.add_parser("wait"); s.add_argument("name"); s.add_argument("--max", type=float, default=240)

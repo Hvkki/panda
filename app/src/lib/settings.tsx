@@ -12,6 +12,8 @@ export type Settings = {
   approvals: "ask" | "trust";
   background_trust: boolean;
   memory: boolean;
+  /** pjob continue: start a new remote agent from REPORT.md and the notes instead of resuming the old conversation. */
+  freshPhases: boolean;
   autoStart: boolean;
   notifyReplies: boolean;
   enterToSend: boolean;
@@ -38,6 +40,7 @@ export const DEFAULTS: Settings = {
   approvals: "ask",
   background_trust: true,
   memory: true,
+  freshPhases: false,
   autoStart: true,
   notifyReplies: true,
   enterToSend: true,

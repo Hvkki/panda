@@ -129,6 +129,14 @@ below, then update {results}/REPORT.md the same way.
 NEXT STEP:
 {prompt}
 """
+FRESH_HANDOFF = """You take over a task that an earlier helper agent started (a new phase, so you start with a clean
+conversation to save credits). Its results are in {results}. Read {results}/REPORT.md first, then only
+the notes and files it points to that this step needs; don't re-read everything. To check pictures,
+look at small copies (say 512 px wide), not full-size sheets. Then do the next step and update
+{results}/REPORT.md so the next phase can start from it too.
+
+NEXT STEP:
+{prompt}"""
 SESSIONS = os.path.join(HOME, ".kiro", "sessions", "cli")
 
 
@@ -205,14 +213,19 @@ def agent_cmd(task: dict, d: str, note) -> tuple[str, dict]:
     results = os.path.join(HOME, ag.get("results") or "work/remote/task")
     os.makedirs(results, exist_ok=True)
     pf = f"{d}/prompt.md"
-    sid = session_restore(results) if ag.get("resume") else ""
-    if ag.get("resume") and not sid:
+    fresh = bool(ag.get("resume") and ag.get("fresh"))
+    sid = session_restore(results) if ag.get("resume") and not fresh else ""
+    if ag.get("resume") and not fresh and not sid:
         note("no saved conversation in the results folder: starting a new one with the earlier results")
+    prompt = ag.get("prompt") or ""
+    if fresh or (ag.get("resume") and not sid):
+        prompt = FRESH_HANDOFF.format(results=results, prompt=prompt)
     brief = CONTINUE_BRIEF if sid else AGENT_BRIEF
     keys = ", ".join(W.SECRET_NAMES) or "none"
-    open(pf, "w").write(brief.format(results=results, prompt=ag.get("prompt") or "", keys=keys))
+    open(pf, "w").write(brief.format(results=results, prompt=prompt, keys=keys))
     cli = ensure_kiro(note)
-    note(f"agent: {model} / {effort}, results in ~/{ag.get('results')}" + (" (continuing its conversation)" if sid else ""))
+    how = " (continuing its conversation)" if sid else " (next phase, fresh agent from REPORT.md)" if fresh else ""
+    note(f"agent: {model} / {effort}, results in ~/{ag.get('results')}{how}")
     resume = f"--resume-id {shlex.quote(sid)} " if sid else ""
     cmd = (f"{shlex.quote(cli)} chat --no-interactive --trust-all-tools --wrap never {resume}"
            f"--model {model} --effort {effort} \"$(cat {shlex.quote(pf)})\"")
@@ -603,8 +616,10 @@ def run_task(tid: str):
         started = time.time() - 1
         cmd, extra_env = task["cmd"], {}
         if task.get("agent"):
-            with contextlib.suppress(Exception):
-                st["credits_before"] = session_credits(os.path.join(HOME, task["agent"].get("results") or "work/remote/task"))
+            ag0 = task["agent"]
+            if ag0.get("resume") and not ag0.get("fresh"):   # a fresh agent's saved conversation starts at 0
+                with contextlib.suppress(Exception):
+                    st["credits_before"] = session_credits(os.path.join(HOME, ag0.get("results") or "work/remote/task"))
             cmd, extra_env = agent_cmd(task, d, note)
         note(f"running on remote Panda ({os.cpu_count()} CPUs, {free_mb()} MB free)")
         p = subprocess.Popen(["bash", "-c", cmd], cwd=cwd, stdin=subprocess.DEVNULL, stdout=logf,

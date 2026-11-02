@@ -32,6 +32,7 @@ def main():
     ap.add_argument("--model", default="claude-sonnet-5.5")
     ap.add_argument("--effort", default="medium")
     ap.add_argument("--resume", action="store_true", help="continue the agent's saved conversation")
+    ap.add_argument("--fresh", action="store_true", help="with --resume: a new agent picks up from REPORT.md")
     a = ap.parse_args()
     tid = f"{a.name}-{int(time.time())}-{uuid.uuid4().hex[:4]}"
     d = f"{BOX}/jobs/{tid}"
@@ -40,7 +41,8 @@ def main():
     if a.agent:
         res = os.path.expanduser(f"~/work/remote/{a.name}")
         os.makedirs(res, exist_ok=True)
-        agent = {"prompt": a.cmd, "model": a.model, "effort": a.effort, "results": res, "resume": a.resume}
+        agent = {"prompt": a.cmd, "model": a.model, "effort": a.effort, "results": res, "resume": a.resume,
+                 "fresh": a.fresh}
         if not a.resume:      # what pjob continue sends again (it adds the results folder itself)
             json.dump({"files": a.files, "out": a.out, "setup": a.setup, "model": a.model, "effort": a.effort},
                       open(f"{res}/.pjob.json", "w"))

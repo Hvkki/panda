@@ -81,7 +81,8 @@ pjob start stems --remote --files ~/work/mix/in.wav ~/work/mix/mix.py --out ~/wo
 - Use it when a command is heavy for minutes; quick commands stay local (sending files takes time).
 - `--remote --agent --model M --effort E --sh 'TASK'` runs a whole agent task there instead of a command
   (uses credits); results come back in `~/work/remote/NAME/` with `REPORT.md`. `pjob continue NAME
-  --notify -- 'NEXT STEP'` gives a finished one its next step with its whole conversation. See the
+  --notify -- 'NEXT STEP'` gives a finished one its next step with its whole conversation (or, with the
+  owner's "Start each phase fresh" setting on, a new agent that starts from its REPORT.md). See the
   `panda-remote` skill.
 
 ## brief: only the answer, not the output
