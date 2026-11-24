@@ -150,7 +150,7 @@ const MessageView = memo(function MessageView({ m, model, onRetry }: { m: Messag
           {onRetry && <button className="tap" onClick={onRetry} title="Retry" aria-label="Retry"><IconRetry size={17} /></button>}
           <span className="muted meta-line">
             {modelName(model)}{m.secs ? ` · ${m.secs}s` : ""}
-            {u ? ` · ${fmtTokens(u.input + u.cache_read + u.cache_write)} in · ${fmtTokens(u.output)} out` : ""}
+            {u ? ` · ${fmtTokens(u.input + u.cache_write)} in · ${fmtTokens(u.cache_read)} cached · ${fmtTokens(u.output)} out` : ""}
           </span>
         </div>
       )}
@@ -167,7 +167,7 @@ type Props = {
   canAttach: boolean;
 };
 
-export function ChatView({ chat, onSend, onRetry, onStop, canAttach }: Props) {
+export function ChatView({ chat, onSend, onRetry, onStop, canAttach, onModel }: Props) {
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const [queue, setQueue] = useState<{ id: number; text: string; attached: string[] }[]>([]);
@@ -212,7 +212,8 @@ export function ChatView({ chat, onSend, onRetry, onStop, canAttach }: Props) {
             ))}
           </div>
         )}
-        <Composer onSend={send} onStop={() => { setQueue([]); onStop(); }}
+        <Composer onSend={send} model={chat.model} effort={chat.effort} onModel={onModel}
+          commands={{ online: canAttach, dev: chat.dev }} onStop={() => { setQueue([]); onStop(); }}
           busy={busy} autoFocus canAttach={canAttach} target={{ folder: chat.project_id, dev: chat.dev }}
           placeholder={chat.dev ? "Tell Claude what to change in Panda" : undefined} />
       </div>

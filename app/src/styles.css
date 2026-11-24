@@ -692,3 +692,13 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   .round-btn { width: 42px; height: 42px; }
   .topbar .icon-btn { width: 38px; height: 38px; }
 }
+
+/* "/" command menu above the composer */
+.slash-menu { max-height: 280px; overflow-y: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 18px;
+  padding: 6px; box-shadow: 0 6px 24px rgba(60,40,20,.10); display: flex; flex-direction: column; }
+.slash-wait { padding: 12px 14px; }
+.slash-row { display: flex; align-items: baseline; gap: 12px; width: 100%; text-align: left; padding: 9px 12px; border-radius: 12px; min-height: 42px; }
+.slash-row:hover, .slash-row:focus-visible { background: var(--bg-2); }
+.slash-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em; flex: none; }
+.slash-desc { font-size: .86em; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-foot { gap: 4px; }

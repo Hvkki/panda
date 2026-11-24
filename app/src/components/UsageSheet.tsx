@@ -15,8 +15,8 @@ export function chatUsage(chat: Chat | null) {
   return {
     turns: turns.length,
     ctx: last?.ctx || 0,
-    window: last?.window || 200000,
-    pct: last ? Math.min(100, (last.ctx / (last.window || 200000)) * 100) : 0,
+    window: last?.window || 1000000,
+    pct: last ? Math.min(100, (last.ctx / (last.window || 1000000)) * 100) : 0,
     input: sum("input"), output: sum("output"), cacheRead: sum("cache_read"), cacheWrite: sum("cache_write"), cost: sum("cost"),
   };
 }

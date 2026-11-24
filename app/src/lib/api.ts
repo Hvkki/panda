@@ -216,3 +216,7 @@ export async function browserShot(tab: string): Promise<{ url: string; w: number
   const [w, h] = (r.headers.get("X-View") || "1280x800").split("x").map(Number);
   return { url: URL.createObjectURL(await r.blob()), w: w || 1280, h: h || 800 };
 }
+
+/** Claude Code's slash commands on the worker (from its init event). */
+export type SlashList = { commands: string[]; skills: string[] };
+export const getCommands = (dev = false) => wjson<SlashList>(`/commands${dev ? "?dev=1" : ""}`);

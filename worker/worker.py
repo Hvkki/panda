@@ -64,7 +64,8 @@ HOME = Path.home()
 BIN = HOME / ".local" / "bin"
 T0 = time.time()
 MAX_UPLOAD = 100 * 1024 * 1024
-MODELS = {"default", "opus", "sonnet", "haiku"}
+MODELS = {"default", "opus", "sonnet", "haiku", "fable", "opusplan"}
+MODEL_ID = re.compile(r"^claude-[a-z0-9.-]{3,40}(\[1m\])?$")  # full ids like claude-opus-5-5
 EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 
 ENV = dict(os.environ, CLAUDE_CODE_OAUTH_TOKEN=CFG.get("claude_oauth_token", ""), IS_SANDBOX="1",  # root inside a disposable VM
@@ -136,11 +137,15 @@ DEV_PROMPT = """This is Panda's Developer chat. Here you may change Panda itself
 Panda is a web app (React, Vite, in app/) on Vercel plus this Kaggle worker (worker/worker.py), from the
 GitHub repo {repo}, branch {branch}. The repo is already checked out in ./panda: work there.
 {git}
+Save the owner's plan limits: every step re-sends this whole conversation, so keep it small. Use Grep and read
+only the lines you need (styles.css and worker.py are large), and cut long command output with `| tail -20`.
 To publish (needs VERCEL_TOKEN): cd panda/app && npm ci && cd .. && python3 scripts/deploy-app.py
 (it builds the app first and stops if the build fails). That one deploy updates both the web app and
 worker.py (the worker downloads it from the deployment), so worker changes take effect the next time the
 worker is started. Run `python3 -m py_compile worker/worker.py` after worker edits: a broken deploy breaks
 Panda for the owner.
+Model facts (no need to look them up): Opus 5.5, Sonnet 5.5, Haiku 5.5 and Fable 5.2 all have a 1M-token
+context window.
 Developer variables available in your environment: {names}. If one you need is missing, ask the owner to add
 it in Developer -> Env variables. Never print their values."""
 GIT_PUSH = "Commit and push your changes to that branch (GITHUB_TOKEN is set; the remote already uses it)."
@@ -218,19 +223,23 @@ def folder_for(req: dict) -> Path:
 def run_claude(req: dict, emit) -> None:
     """Run one turn. emit(event: dict) is called for every piece of progress."""
     chat = str(req.get("chat_id") or "chat")
-    model = req.get("model") if req.get("model") in MODELS else "default"
+    model = str(req.get("model") or "")
+    model = model if model in MODELS or MODEL_ID.match(model) else "default"
     effort = req.get("effort") if req.get("effort") in EFFORTS else "medium"
     prompt = str(req.get("message") or "")
     sid = str(req.get("session_id") or "")
     if sid and not session_exists(sid):
         sid = ""
         hist = req.get("history") or []
-        if hist:  # the session is gone (new run): give Claude the earlier conversation as plain text
+        if hist and not prompt.startswith("/"):  # the session is gone (new run): give Claude the earlier conversation as plain text
             lines = [f"{'User' if h.get('role') == 'user' else 'Assistant'}: {h.get('content', '')}"
                      for h in hist[-40:] if h.get("content")]
             prompt = ("[Earlier conversation, restored because the session was lost]\n" + "\n\n".join(lines)
                       + "\n[End of earlier conversation]\n\n" + prompt)
-    cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+    cmd = ["claude", "-p"]
+    if req.get("dev"):  # the claude-api reference skill alone is ~46k tokens; Panda work never needs it
+        cmd += ["--disallowedTools", "Skill(claude-api)"]
+    cmd += ["--output-format", "stream-json", "--verbose", "--include-partial-messages",
            "--permission-mode", "bypassPermissions", "--effort", effort]
     if model != "default":
         cmd += ["--model", model]
@@ -276,6 +285,8 @@ def run_claude(req: dict, emit) -> None:
             except ValueError:
                 continue
             kind = ev.get("type")
+            if kind == "system" and ev.get("subtype") == "init":
+                note_commands(bool(req.get("dev")), ev)
             if kind == "system" and ev.get("session_id") and ev["session_id"] != sent_session:
                 sent_session = ev["session_id"]
                 emit({"t": "session", "id": sent_session})
@@ -327,6 +338,49 @@ def run_claude(req: dict, emit) -> None:
         emit({"t": "error", "message": tail})
 
 
+# ── slash commands ───────────────────────────────────────────────────────────
+COMMANDS: dict = {}   # "dev" / "chat" -> {"at": time, "commands": [...], "skills": [...]}
+
+
+def note_commands(dev: bool, init: dict) -> None:
+    """Remember the slash commands Claude Code reports in its init event (minus terminal-only ones)."""
+    term = set(init.get("terminal_slash_commands") or [])
+    cmds = [c for c in init.get("slash_commands") or [] if isinstance(c, str) and not c.startswith("_") and c not in term]
+    COMMANDS["dev" if dev else "chat"] = {"at": time.time(), "commands": cmds, "skills": init.get("skills") or []}
+
+
+def slash_commands(dev: bool) -> dict:
+    """Claude Code's slash commands. Starts `claude` just long enough to read its init event (no API call)."""
+    key = "dev" if dev else "chat"
+    hit = COMMANDS.get(key)
+    if hit and time.time() - hit["at"] < 900:
+        return hit
+    cwd = folder_for({"dev": dev})
+    try:
+        p = subprocess.Popen(["claude", "-p", "--output-format", "stream-json", "--verbose"], cwd=cwd, env=ENV,
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        p.stdin.write("/context")  # a local command: even if the read below is slow, no model call is made
+        p.stdin.close()
+        timer = threading.Timer(60, p.kill)
+        timer.start()
+        try:
+            for line in p.stdout:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("type") == "system" and ev.get("subtype") == "init":
+                    note_commands(dev, ev)
+                    break
+        finally:
+            timer.cancel()
+            p.kill()
+            p.wait(timeout=10)
+    except (OSError, subprocess.SubprocessError) as e:
+        log("reading slash commands failed:", e)
+    return COMMANDS.get(key) or {"at": 0, "commands": [], "skills": []}
+
+
 # ── token and plan usage ─────────────────────────────────────────────────────
 LIMITS: dict = {}          # window ("five_hour", "seven_day"…) -> {"pct": 0-100, "resets_at": epoch secs}
 USAGE_CACHE: dict = {"at": 0.0, "data": None}
@@ -345,7 +399,7 @@ def turn_usage(ev: dict, ctx: int) -> dict:
         "cache_read": tot("cacheReadInputTokens") or int(u.get("cache_read_input_tokens") or 0),
         "cache_write": tot("cacheCreationInputTokens") or int(u.get("cache_creation_input_tokens") or 0),
         "cost": round(float(ev.get("total_cost_usd") or 0), 4),
-        "ctx": ctx, "window": window or 200000,
+        "ctx": ctx, "window": window or 1000000,
     }
 
 
@@ -955,6 +1009,8 @@ class Handler(BaseHTTPRequestHandler):
                 "settings": settings(), "save": SAVE["state"], "browser": BROWSER["state"],
                 "browser_error": BROWSER["error"], "uptime": int(time.time() - T0), "max": MAX_RUNTIME,
                 "claude": bool(CFG.get("claude_oauth_token"))})
+        if u.path == "/commands":
+            return self.send_json(slash_commands(q.get("dev", [""])[0] == "1"))
         if u.path == "/usage":
             return self.send_json(plan_usage(force=q.get("fresh", [""])[0] == "1"))
         if u.path == "/notifications":

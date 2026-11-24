@@ -148,6 +148,17 @@ function Shell({ onLogout }: { onLogout: () => void }) {
   const title = view === "chat" ? active?.title || "" : view === "developer" ? "Developer"
     : view === "projects" ? "Projects" : view === "files" ? "Files" : view === "customize" ? "Customize" : "";
   const [menuOpen, setMenuOpen] = useState(false);
+  // Slash commands Panda answers itself (/usage, /clear), sent by the composer.
+  useEffect(() => {
+    const usage = () => setModal("usage");
+    const clear = () => {
+      if (view === "developer" && devChat) patchChat(devChat.id, (c) => ({ ...c, messages: [], session_id: undefined }));
+      else { setActiveId(null); setView("chat"); }
+    };
+    window.addEventListener("panda:usage", usage);
+    window.addEventListener("panda:new-chat", clear);
+    return () => { window.removeEventListener("panda:usage", usage); window.removeEventListener("panda:new-chat", clear); };
+  }, [view, devChat, patchChat]);
   const [modelOpen, setModelOpen] = useState(false);
 
   const closeSideOnMobile = () => { if (window.innerWidth <= 900) setSideOpen(false); };
@@ -210,10 +221,12 @@ function Shell({ onLogout }: { onLogout: () => void }) {
         ) : view === "developer" ? (
           <DeveloperPage online={online} chat={devChat && (
             <ChatView key={devChat.id} chat={devChat} canAttach={online}
+              onModel={(model, effort) => patchChat(devChat.id, (c) => ({ ...c, model, effort }))}
               onSend={(t, a) => send(devChat, t, a)} onRetry={() => retry(devChat)} onStop={() => stop(devChat)} />
           )} />
         ) : active ? (
           <ChatView key={active.id} chat={active} canAttach={online}
+            onModel={(model, effort) => patchChat(active.id, (c) => ({ ...c, model, effort }))}
             onSend={(t, a) => send(active, t, a)} onRetry={() => retry(active)} onStop={() => stop(active)} />
         ) : (
           <div className="home">
