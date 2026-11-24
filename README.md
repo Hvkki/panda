@@ -1,72 +1,74 @@
 # Panda
 
-Panda is a personal AI assistant you use from a phone or a browser. It is built on
-[Kiro Crew](https://github.com/kirodotdev/KiroCrew), an open-source agent layer (memory,
-scheduled tasks, skills, tools, multiple sessions) that runs on `kiro-cli`.
+Claude Code from your phone or browser. A Kaggle notebook runs the real `claude` CLI, logged in with
+your Claude subscription, and the Panda web app (hosted on Vercel) talks to it through a tunnel.
 
-- **Web app** (installable PWA): https://panda-app-gamma.vercel.app
-- **Backend:** Supabase project `ufvskhagspdjslomzwjh` (sign-in, Postgres with row-level
-  security, Realtime, Storage, one Edge Function).
-- **Worker:** a Kaggle notebook (`vladraf/kirocrew-worker`) that runs Kiro Crew. You press
-  **Start** in the app. It runs until you press **Stop** or it reaches its 11-hour safety limit.
-  It never starts itself again.
+There is no database. Kaggle is the only backend:
 
-Earlier names: Embra.
+```
+Phone / browser (Panda PWA, Vercel)
+   │  /api/session  (Vercel function: Start, Stop, Status, finds the worker)
+   ▼
+Kaggle ── notebook "panda-worker" ── worker.py ── claude -p (stream-json) ── your Claude plan
+   ▲            ▲
+   │            └─ private dataset "panda-secret": worker.json (Claude token, app password)
+   └─ Cloudflare tunnel: the app streams chat straight from the worker
+```
 
-> **If you are the next agent:** read this file, then [docs/status.md](docs/status.md) (what is
-> verified and what is not), then [docs/runbook.md](docs/runbook.md).
-> **The API keys are not in this repository.** The owner gives you a plain-text file named
-> `panda-api-keys.env` (same format as `.env`). Ask for it before any step that calls an API.
-
-## Repository layout
+- **Chats** are saved in your browser (localStorage). The worker keeps Claude's session files only
+  while it runs; if a session is gone the app re-sends the conversation as context.
+- **Files** Claude creates live in the worker's workspace. Download them from the Files page before
+  you stop the worker.
+- **Permissions:** Claude Code runs with `bypassPermissions` inside the disposable Kaggle VM, so it
+  never waits for an approval. Anyone with your app password can run commands on that VM, so use a
+  long password.
+- No custom system prompt: Claude Code runs as shipped.
 
 | Path | What it is |
 |---|---|
-| `app/` | React + TypeScript + Vite web app (PWA). Deployed to the Vercel project `panda-app`. |
-| `worker/worker.py` | Runs inside the Kaggle notebook. Starts Kiro Crew, answers chats, streams replies, thinking, tool steps and approvals, mirrors notifications, publishes files, offloads big files to Google Drive, runs the browser, syncs the key vault, serves the app's command relay. |
-| `worker/prompt.md` | Panda's system prompt. Stored in Supabase Storage (`config/prompt.md`), so you can change it without redeploying the worker. |
-| `worker/skills/` | Skills the agent loads: `panda-docs` (PDF, DOCX, PPTX), `image-search`, `panda-browser` (real Chromium, live view, take-over), `panda-drive` (Google Drive). |
-| `supabase/` | Schema and migrations (run in order), and the `session` Edge Function (Start, Stop, Status). |
-| `tools/` | Live tests and probes, see [docs/runbook.md](docs/runbook.md). `tools/screenshots/` holds Playwright harnesses for UI checks. |
-| `scripts/` | Deploy the app, deploy the worker, sync the Kaggle dataset after a key change, fetch Kiro Crew. |
-| `vendor/KIROCREW.md` | Kiro Crew is an upstream dependency. It is pinned by commit and not copied here. |
-| `docs/` | Status, runbook, architecture, lessons, a few screenshots. |
-| `legacy/` | The first Kaggle smoke-test scripts, kept for reference. |
+| `app/` | React + TypeScript + Vite web app (PWA) |
+| `app/api/` | Vercel functions: `session.js` (Start / Stop / Status), `_lib.js` |
+| `worker/worker.py` | Runs on Kaggle: installs Claude Code and cloudflared, serves the chat API |
+| `worker/kernel-metadata.json` | Notebook settings (the Start button pushes `worker.py` for you) |
+| `scripts/setup-kaggle.py` | Saves your Claude token and password into private Kaggle datasets |
+| `scripts/deploy-app.py` | Builds and deploys the app, functions and `worker.py` to Vercel |
 
 ## Set up
 
-1. Clone this repository.
-2. `./scripts/fetch-kirocrew.sh` checks out Kiro Crew at the pinned commit into `vendor/KiroCrew`.
-3. Put `panda-api-keys.env` (from the owner) in the workspace root, **outside this repository**, and load it:
+1. **Claude login (once).** On your own computer run `claude setup-token`. It opens a browser, you
+   sign in to your Pro/Max account, and it prints a long-lived token (`sk-ant-oat01-…`). That token
+   is how the subscription login survives Kaggle's wiped disks. Keep it secret.
+2. **Pick a password** for the app (`PANDA_PASSWORD`).
+3. **Tunnel**, pick one:
+   - *Quick tunnel (no account):* nothing to do. The worker publishes its changing URL to the
+     Kaggle dataset `<you>/panda-endpoint`, and the Vercel function reads it. Start takes a minute
+     longer.
+   - *Named Cloudflare tunnel (stable URL, recommended):* create a tunnel in Cloudflare Zero Trust,
+     point a hostname at `http://localhost:8787`, and keep the tunnel token (`CLOUDFLARED_TOKEN`) and
+     the hostname (`PANDA_API_URL`).
+4. **Save the secrets in Kaggle:**
    ```bash
-   set -a; . ./panda-api-keys.env; set +a
+   pip install kaggle
+   export KAGGLE_USERNAME=... KAGGLE_API_TOKEN=... CLAUDE_CODE_OAUTH_TOKEN=... PANDA_PASSWORD=...
+   python3 scripts/setup-kaggle.py
    ```
-4. Web app: `cd app && npm ci && npm run build`. Deploy: `python3 scripts/deploy-app.py`.
-5. Worker: `./scripts/deploy-worker.sh`. A worker that is already running keeps the code it started
-   with, so press **Stop** and then **Start** in the app.
-6. Python tools: `python3 -m venv .venv && . .venv/bin/activate && pip install -r tools/requirements.txt`.
+5. **Deploy the app** (variable names are in `.env.example`):
+   ```bash
+   export VERCEL_TOKEN=... KAGGLE_KERNEL=<you>/panda-worker KAGGLE_DATASET=<you>/panda-secret
+   export PANDA_PASSWORD=... KAGGLE_API_TOKEN=...   # plus PANDA_API_URL or ENDPOINT_DATASET
+   python3 scripts/deploy-app.py --set-env
+   ```
+6. Open the app, enter the password, press **Start**. About two minutes later it says Online.
+   Sending a message while offline starts the worker for you.
 
-## Architecture in one picture
+## Rotating the Claude token
 
-Phone or browser (Panda PWA) ↔ Supabase (rows, Realtime, Storage, `session` function) ↔ worker
-on Kaggle ↔ Kiro Crew gateway (127.0.0.1:5476) ↔ kiro-cli ↔ Kiro models.
-Details: [docs/architecture.md](docs/architecture.md).
+Run `claude setup-token` again, export the new `CLAUDE_CODE_OAUTH_TOKEN`, and run
+`python3 scripts/setup-kaggle.py`. Stop and Start the worker.
 
-## Hard rules
+## Not verified
 
-- **Keys are never committed**, never printed in logs or chat, and never stored in GitHub Actions
-  secrets (anyone who can run workflows on a repo can read them).
-- **This repository is public.** Keep keys and personal data out of it.
-- **Sign-ups must stay closed.** At handoff they were still open (see
-  [docs/status.md](docs/status.md)). Turn off Supabase → Authentication → Sign In / Providers →
-  Email → "Allow new users to sign up". The database trigger `block_signups` refuses only a sixth
-  account, so it does not replace that switch.
-- **Kaggle runs start only when a person presses Start.** Do not add automatic restarts.
-- **The worker runs unsandboxed on Kaggle**, because Kaggle blocks user namespaces. The owner
-  accepted that. The app's approval flow is the control on tool use.
-- **Do not claim a UI works from a still screenshot.** Motion, live streams, taps and push
-  notifications need a device test. See [docs/status.md](docs/status.md).
-
-## License
-
-No license has been chosen yet (owner decision). Kiro Crew is Apache-2.0.
+The worker's HTTP API and the Vercel function were exercised against stand-ins for `claude` and
+`cloudflared`. These have not been run against the real services yet: the Claude Code install on
+Kaggle, the Kaggle calls in `app/api` (`SaveKernel`, `GetKernelSessionStatus`, and the endpoint
+dataset download), and a Vercel deployment. Check them on the first real Start.

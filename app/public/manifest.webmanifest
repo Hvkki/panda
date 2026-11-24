@@ -1,7 +1,7 @@
 {
   "name": "Panda",
   "short_name": "Panda",
-  "description": "Your calm, creative AI assistant with memory.",
+  "description": "Claude Code, from your phone.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

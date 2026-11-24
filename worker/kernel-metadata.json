@@ -1,6 +1,6 @@
 {
-  "id": "vladraf/kirocrew-worker",
-  "title": "kirocrew worker",
+  "id": "vladraf/panda-worker",
+  "title": "panda worker",
   "code_file": "worker.py",
   "language": "python",
   "kernel_type": "script",
@@ -8,7 +8,7 @@
   "enable_gpu": false,
   "enable_tpu": false,
   "enable_internet": true,
-  "dataset_sources": ["vladraf/kirocrew-test-secret"],
+  "dataset_sources": ["vladraf/panda-secret"],
   "competition_sources": [],
   "kernel_sources": []
 }
