@@ -40,6 +40,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 import termios
 import threading
 import time
@@ -117,6 +118,7 @@ def install():
 # ── Claude Code runner ───────────────────────────────────────────────────────
 RUNNING: dict[str, subprocess.Popen] = {}   # chat id -> live claude process
 RUN_LOCK = threading.Lock()
+TURNS: dict = {}   # chat_id -> the latest turn's buffered events, so a dropped stream can resume
 
 
 def session_exists(sid: str) -> bool:
@@ -822,6 +824,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"ok": True, "uptime": int(time.time() - T0)})
         if not self.authed():
             return self.send_json({"error": "unauthorized"}, 401)
+        if u.path == "/chat/events":
+            q = parse_qs(u.query)
+            with RUN_LOCK:
+                turn = TURNS.get((q.get("chat_id") or [""])[0])
+            if turn and (q.get("turn") or [""])[0] not in ("", turn["id"]):
+                turn = None  # a newer turn replaced the one the app is waiting for
+            return self.follow(turn, int((q.get("from") or ["0"])[0] or 0))
         if u.path == "/status":
             return self.send_json({"ok": True, "uptime": int(time.time() - T0), "max": MAX_RUNTIME,
                                    "busy": list(RUNNING), "claude": bool(CFG.get("claude_oauth_token"))})
@@ -981,6 +990,36 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_json({"ok": True})
 
     def chat(self, req: dict):
+        """Start a turn in the background and stream its events. The turn does not depend on this
+        connection: if the phone drops it, /chat/events picks the stream up again."""
+        chat = str(req.get("chat_id") or "chat")
+        turn = {"id": uuid.uuid4().hex, "events": [], "done": False, "cond": threading.Condition(), "at": time.time()}
+        with RUN_LOCK:
+            TURNS[chat] = turn
+            for k in [k for k, t in TURNS.items() if t["done"] and time.time() - t["at"] > 3600]:
+                TURNS.pop(k, None)
+
+        def emit(ev: dict):
+            with turn["cond"]:
+                turn["events"].append(ev)
+                turn["cond"].notify_all()
+
+        def work():
+            try:
+                run_claude(req, emit)
+            except Exception as exc:
+                emit({"t": "error", "message": scrub(exc)})
+            finally:
+                with turn["cond"]:
+                    turn["done"] = True
+                    turn["at"] = time.time()
+                    turn["cond"].notify_all()
+
+        threading.Thread(target=work, daemon=True).start()
+        self.follow(turn, 0)
+
+    def follow(self, turn: dict | None, start: int):
+        """Stream a turn's events from index `start` until it ends. Every frame carries its index."""
         self.send_response(200)
         self.cors()
         self.send_header("Content-Type", "text/event-stream")
@@ -988,37 +1027,29 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.send_header("Connection", "close")
         self.end_headers()
-        lock = threading.Lock()
-        alive = threading.Event()
-
-        def emit(ev: dict):
-            data = f"data: {json.dumps(ev)}\n\n".encode()
-            with lock:
-                self.wfile.write(data)
-                self.wfile.flush()
-
-        def pinger():
-            while not alive.wait(15):
-                try:
-                    with lock:
-                        self.wfile.write(b": ping\n\n")
-                        self.wfile.flush()
-                except Exception:
-                    return
-
-        threading.Thread(target=pinger, daemon=True).start()
+        self.close_connection = True
         try:
-            run_claude(req, emit)
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # the phone went away; the turn keeps running until Claude finishes or /cancel
-        except Exception as exc:
-            try:
-                emit({"t": "error", "message": scrub(exc)})
-            except Exception:
-                pass
-        finally:
-            alive.set()
-            self.close_connection = True
+            if turn is None:
+                self.wfile.write(b'data: {"t": "gone"}\n\n')
+                self.wfile.flush()
+                return
+            self.wfile.write(f'data: {json.dumps({"t": "turn", "id": turn["id"]})}\n\n'.encode())
+            self.wfile.flush()
+            i = max(0, start)
+            while True:
+                with turn["cond"]:
+                    if i >= len(turn["events"]) and not turn["done"]:
+                        turn["cond"].wait(15)
+                    batch = turn["events"][i:]
+                    done = turn["done"]
+                out = b"".join(f"data: {json.dumps(dict(ev, i=i + n))}\n\n".encode() for n, ev in enumerate(batch))
+                i += len(batch)
+                self.wfile.write(out or b": ping\n\n")
+                self.wfile.flush()
+                if done and i >= len(turn["events"]):
+                    return
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass  # the phone went away; the turn keeps running
 
     def upload(self):
         name = os.path.basename(self.headers.get("X-File-Name") or "upload.bin") or "upload.bin"
