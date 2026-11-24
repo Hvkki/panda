@@ -22,7 +22,8 @@ if ("serviceWorker" in navigator && import.meta.env.PROD) {
       });
       setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000);
     }).catch(() => {});
-    let reloaded = false;
+    // Reload only when an update replaces a running version, not on the very first visit.
+    let reloaded = !navigator.serviceWorker.controller;
     navigator.serviceWorker.addEventListener("controllerchange", () => {
       if (!reloaded) { reloaded = true; location.reload(); }
     });

@@ -122,16 +122,49 @@ export async function uploadFile(f: File, target: UploadTarget = {}): Promise<st
   return (await r.json()).path;
 }
 // ── developer variables (stored in the private Kaggle dataset by the worker) ──
-export async function getDevEnv(): Promise<string[]> {
-  const r = await wfetch("/devenv");
-  if (!r.ok) throw new Error(`Worker answered ${r.status}`);
-  return (await r.json()).names;
-}
-export async function setDevEnv(set: Record<string, string | null>): Promise<{ names: string[]; saved: boolean }> {
-  const r = await wfetch("/devenv", { method: "POST", body: JSON.stringify({ set }), headers: { "Content-Type": "application/json" } });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok || d.error) throw new Error(d.error || `Worker answered ${r.status}`);
-  return d;
-}
+export const getDevEnv = () => wjson<{ names: string[] }>("/devenv").then((d) => d.names);
+export const setDevEnv = (set: Record<string, string | null>) => wjson<{ names: string[] }>("/devenv", { set });
 
 export const workerOnline = () => !!workerUrl;
+
+// ── saved state on the worker (skills, connectors, keys, memory, schedules) ──
+export type Schedule = {
+  id?: string; name: string; prompt: string; kind: "daily" | "interval"; time?: string; minutes?: number;
+  days?: number[]; tz?: number; model?: string; effort?: string; enabled?: boolean; last_run?: number;
+};
+export type McpConfig = { type: "http" | "sse" | "stdio"; url?: string; headers?: Record<string, string>;
+  command?: string; args?: string[]; env?: Record<string, string> };
+export type WorkerSaved = {
+  skills: Record<string, string>; mcp: Record<string, McpConfig>; env: string[]; dev_env: string[]; memory: string;
+  schedules: Schedule[]; settings: { browser: boolean; memory: boolean }; save: "saved" | "saving" | "error";
+  browser: string; browser_error: string; uptime: number; max: number; claude: boolean;
+};
+export type Note = { id: string; at: number; kind: string; title: string; prompt?: string; text: string;
+  session_id?: string; error?: boolean };
+
+async function wjson<T>(path: string, body?: unknown): Promise<T> {
+  const r = await wfetch(path, body === undefined ? {} : { method: "POST", body: JSON.stringify(body), headers: { "Content-Type": "application/json" } });
+  const d = await r.json().catch(() => ({}));
+  if (r.status === 401) throw new AuthError();
+  if (!r.ok || d.error) throw new Error(d.error || `Worker answered ${r.status}`);
+  return d as T;
+}
+export const getSaved = () => wjson<WorkerSaved>("/state");
+export const change = <T = { ok: boolean }>(path: string, body: unknown) => wjson<T>(path, body);
+export const getNotes = () => wjson<{ notifications: Note[] }>("/notifications").then((d) => d.notifications);
+export const mcpStatus = () => wjson<{ text: string }>("/mcp/status").then((d) => d.text);
+export const setEnv = (set: Record<string, string | null>) => wjson<{ names: string[] }>("/env", { set });
+export const deleteFile = (path: string) => wjson("/delete", { path });
+export const loginStart = () => wjson<{ url: string }>("/login/start", {});
+export const loginCode = (code: string) => wjson<{ ok: boolean }>("/login/code", { code });
+
+// ── live browser ─────────────────────────────────────────────────────────────
+export type BrowserTab = { id: string; title: string; url: string };
+export const browserStatus = () => wjson<{ state: string; error: string; tabs: BrowserTab[] }>("/browser/status");
+export const browserAct = (a: Record<string, unknown>) => wjson("/browser/act", a);
+export async function browserShot(tab: string): Promise<{ url: string; w: number; h: number }> {
+  const r = await wfetch(`/browser/shot?tab=${encodeURIComponent(tab)}&q=60`);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `Worker answered ${r.status}`);
+  const [w, h] = (r.headers.get("X-View") || "1280x800").split("x").map(Number);
+  return { url: URL.createObjectURL(await r.blob()), w: w || 1280, h: h || 800 };
+}

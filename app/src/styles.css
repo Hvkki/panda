@@ -541,3 +541,58 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 
 .crumb { color: var(--muted); padding: 0; }
 .crumb:hover { color: var(--text); }
+
+/* ── customize / settings / search / notifications ─────────────── */
+.row-gap { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.editor { display: flex; flex-direction: column; gap: 10px; }
+.editor h3 { margin: 0; }
+.code-area { width: 100%; padding: 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--bg);
+  font-family: ui-monospace, Menlo, monospace; font-size: .88em; resize: vertical; color: var(--text); }
+.health { white-space: pre-wrap; font-size: .82em; background: var(--bg-2); padding: 12px; border-radius: 12px; overflow-x: auto; }
+.row-card .grow { flex: 1; min-width: 0; }
+.row-card .grow .small { overflow: hidden; text-overflow: ellipsis; }
+.set-layout { display: flex; gap: 20px; }
+@media (max-width: 700px) { .set-layout { flex-direction: column; gap: 6px; } }
+.search-box input { width: 100%; padding: 11px 14px; border-radius: 12px; border: 1px solid var(--line); background: var(--bg); font-size: 1em; }
+.search-results { display: flex; flex-direction: column; margin-top: 10px; }
+.search-hit { text-align: left; padding: 10px 12px; border-radius: 10px; }
+.search-hit:hover { background: var(--bg-2); }
+.search-hit .small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.note { border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; background: var(--panel); }
+.note.err { border-color: var(--danger); }
+.note-head { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.note-text { white-space: pre-wrap; font-size: .92em; }
+.login-steps { display: flex; flex-direction: column; gap: 8px; }
+.login-steps p { margin: 0; }
+.login-steps a { color: var(--accent); font-weight: 600; }
+.badge { margin-left: auto; background: var(--accent); color: #fff; border-radius: 999px; font-size: .75em; padding: 1px 8px; }
+
+/* ── live browser ─────────────────────────────────────────────── */
+.bp { position: fixed; z-index: 45; inset: 0; background: var(--panel); display: flex; flex-direction: column;
+  padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+@media (min-width: 1100px) { .bp { left: auto; width: min(760px, 55vw); border-left: 1px solid var(--line); box-shadow: var(--shadow); } }
+.bp-bar { display: flex; align-items: center; gap: 4px; padding: 8px; border-bottom: 1px solid var(--line); }
+.bp-url { flex: 1; min-width: 0; }
+.bp-url input, .bp-type input { width: 100%; padding: 8px 12px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg); font-size: 16px; }
+.bp-tabs { display: flex; gap: 4px; overflow-x: auto; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+.bp-tabs button { display: flex; gap: 6px; align-items: center; max-width: 200px; padding: 5px 10px; border-radius: 10px; font-size: .82em; color: var(--muted); }
+.bp-tabs button span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bp-tabs button.active { background: var(--bg-2); color: var(--text); }
+.bp-x { padding: 0 2px; }
+.bp-stage { flex: 1; min-height: 0; overflow: auto; background: #e9e6e0; display: flex; align-items: flex-start; justify-content: center; }
+.bp-stage img { width: 100%; height: auto; display: block; cursor: pointer; user-select: none; -webkit-user-select: none; }
+.bp-empty { margin: auto; text-align: center; color: var(--muted); padding: 24px; max-width: 360px; }
+.bp-keys { display: flex; gap: 6px; align-items: center; padding: 8px; border-top: 1px solid var(--line); flex-wrap: wrap; }
+.bp-type { flex: 1 1 160px; min-width: 0; }
+.bp-keys .btn { padding: 7px 10px; }
+.flip { display: inline-flex; transform: rotate(180deg); }
+
+.row-card.wrap { flex-wrap: wrap; }
+.row-card.wrap .grow { flex: 1 1 calc(100% - 40px); }
+@media (min-width: 700px) { .row-card.wrap { flex-wrap: nowrap; } .row-card.wrap .grow { flex: 1; } }
+.bp-bar .small-btn { padding: 5px 10px; font-size: .8em; }
+.bp-stage img { max-width: 100%; }
+@media (min-width: 700px) { .bp-stage { padding: 0; } }
+.bp-keys { flex-wrap: nowrap; gap: 4px; }
+.bp-type { flex: 1 1 auto; min-width: 60px; }
+.bp-keys .btn { padding: 7px 9px; flex: none; }

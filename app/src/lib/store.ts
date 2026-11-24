@@ -46,7 +46,12 @@ export function useChats() {
     patchChat(chatId, (c) => ({ ...c, messages: c.messages.map((m) => (m.id === msgId ? fn(m) : m)) })), [patchChat]);
   const add = useCallback((c: Chat) => setChats((prev) => [c, ...prev]), []);
   const remove = useCallback((id: string) => setChats((prev) => prev.filter((c) => c.id !== id)), []);
-  return { chats, add, remove, patchChat, patchMessage };
+  const importChats = useCallback((list: Chat[]) => setChats((prev) => {
+    const have = new Set(prev.map((c) => c.id));
+    return [...prev, ...list.filter((c) => c && c.id && Array.isArray(c.messages) && !have.has(c.id))];
+  }), []);
+  const clearAll = useCallback(() => setChats([]), []);
+  return { chats, add, remove, patchChat, patchMessage, importChats, clearAll };
 }
 
 // Projects live in this browser too.

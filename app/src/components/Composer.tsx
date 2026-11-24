@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { ModelPicker } from "./ModelSheet";
 import { IconPlus, IconSend, IconStop, IconX } from "./Icons";
 import { uploadFile, type UploadTarget } from "../lib/api";
+import { getSettings } from "../lib/settings";
 
 type Props = {
   model: string;
@@ -66,7 +67,7 @@ export function Composer({ model, effort, onModel, onSend, onStop, busy, autoFoc
           e.target.style.height = `${Math.min(e.target.scrollHeight, 240)}px`;
         }}
         onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && window.innerWidth > 700) { e.preventDefault(); send(); }
+          if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && window.innerWidth > 700 && getSettings().enterToSend) { e.preventDefault(); send(); }
         }} />
       <div className="composer-bar">
         <input ref={input} type="file" multiple hidden onChange={(e) => addFiles(e.target.files)} />

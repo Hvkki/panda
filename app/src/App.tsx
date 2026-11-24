@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AuthError, cancelChat, ensureWorker, getPassword, setPassword, streamChat, type StreamEvent } from "./lib/api";
+import { AuthError, cancelChat, ensureWorker, getPassword, setPassword, streamChat, type Note, type StreamEvent } from "./lib/api";
+import { applySettings, getSettings } from "./lib/settings";
+import { CustomizePage } from "./components/CustomizePage";
+import { BrowserPanel } from "./components/BrowserPanel";
+import { NotificationsModal, SearchModal, SettingsModal, useNotes } from "./components/Panels";
 import { uid, useChats, useProjects, type Chat, type Message } from "./lib/store";
 import { Login } from "./components/Login";
 import { Sidebar, type View } from "./components/Sidebar";
@@ -10,23 +14,17 @@ import { Composer } from "./components/Composer";
 import { SessionChip, useWorker } from "./components/SessionChip";
 import { FilesPage } from "./components/FilesPage";
 import { Logo } from "./components/Logo";
-import { IconPlus, IconSidebar } from "./components/Icons";
+import { IconGlobe, IconPlus, IconSidebar } from "./components/Icons";
 
 export default function App() {
   const [signedIn, setSignedIn] = useState(!!getPassword());
-  useEffect(() => {
-    const dark = window.matchMedia("(prefers-color-scheme: dark)");
-    const apply = () => { document.documentElement.dataset.theme = dark.matches ? "dark" : "light"; };
-    apply();
-    dark.addEventListener("change", apply);
-    return () => dark.removeEventListener("change", apply);
-  }, []);
+  useEffect(applySettings, []);
   if (!signedIn) return <Login onDone={() => setSignedIn(true)} />;
   return <Shell onLogout={() => { setPassword(""); setSignedIn(false); }} />;
 }
 
 function Shell({ onLogout }: { onLogout: () => void }) {
-  const { chats, add, remove, patchChat, patchMessage } = useChats();
+  const { chats, add, remove, patchChat, patchMessage, importChats, clearAll } = useChats();
   const { projects, addProject, patchProject, removeProject } = useProjects();
   const projectsRef = useRef(projects);
   useEffect(() => { projectsRef.current = projects; }, [projects]);
@@ -35,7 +33,9 @@ function Shell({ onLogout }: { onLogout: () => void }) {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [view, setView] = useState<View>("chat");
   const [sideOpen, setSideOpen] = useState(() => window.innerWidth > 900);
-  const [draft, setDraft] = useState({ model: "default", effort: "medium" });
+  const [draft, setDraft] = useState(() => ({ model: getSettings().defaultModel, effort: getSettings().defaultEffort }));
+  const [modal, setModal] = useState<"search" | "notes" | "settings" | null>(null);
+  const [browserOpen, setBrowserOpen] = useState(false);
   const aborts = useRef(new Map<string, AbortController>());
   const active = chats.find((c) => c.id === activeId) || null;
 
@@ -75,6 +75,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
         folder: chat.project_id, dev: chat.dev,
       }, onEvent, ctl.signal);
       if (!failed) upd((m) => (m.status === "streaming" ? { ...m, status: "done" } : m));
+      notifyReply(chat.dev ? "Developer" : chat.title, failed);
     } catch (e) {
       if (e instanceof AuthError) return onLogout();
       const stopped = ctl.signal.aborted;
@@ -85,6 +86,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
   }, [patchChat, patchMessage, worker, onLogout]);
 
   const send = useCallback((chat: Chat, text: string, attached: string[]) => {
+    if (getSettings().notifyReplies && typeof Notification !== "undefined" && Notification.permission === "default") Notification.requestPermission().catch(() => {});
     const body = attached.length ? `${text}\n\n[Attached files in the working directory: ${attached.join(", ")}]`.trim() : text;
     const user: Message = { id: uid(), role: "user", content: body };
     const history = chat.messages;
@@ -100,6 +102,18 @@ function Shell({ onLogout }: { onLogout: () => void }) {
     setActiveId(chat.id);
     setView("chat");
     send(chat, text, attached);
+  };
+
+  /** Start a chat about something (from Customize, a notification…). */
+  const ask = (text: string) => startChat(text, []);
+  const openNote = (n: Note) => {
+    const chat: Chat = { id: uid(), title: n.title, model: draft.model, effort: draft.effort, pinned: false,
+      created: n.at * 1000, updated: Date.now(), session_id: n.session_id || undefined,
+      messages: [{ id: uid(), role: "user", content: n.prompt || n.title },
+        { id: uid(), role: "assistant", content: n.text, status: n.error ? "error" : "done", error: n.error ? n.text : undefined }] };
+    add(chat);
+    setActiveId(chat.id);
+    setView("chat");
   };
 
   const stop = (chat: Chat) => {
@@ -131,6 +145,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
 
   const closeSideOnMobile = () => { if (window.innerWidth <= 900) setSideOpen(false); };
   const online = worker.state === "on";
+  const notes = useNotes(online);
 
   return (
     <div className={`app ${sideOpen ? "side-open" : ""}`}>
@@ -141,7 +156,9 @@ function Shell({ onLogout }: { onLogout: () => void }) {
         onRename={(id, title) => patchChat(id, (c) => ({ ...c, title }))}
         onPin={(id) => patchChat(id, (c) => ({ ...c, pinned: !c.pinned }))}
         onDelete={(id) => { remove(id); if (id === activeId) setActiveId(null); }}
-        onLogout={() => { if (confirm("Log out of Panda on this device?")) onLogout(); }} />
+        onSearch={() => { setModal("search"); closeSideOnMobile(); }}
+        onNotifications={() => { setModal("notes"); notes.markSeen(); closeSideOnMobile(); }} unread={notes.unread}
+        onSettings={() => { setModal("settings"); closeSideOnMobile(); }} />
       <main className="main">
         <header className="topbar">
           <button className="icon-btn" onClick={() => setSideOpen((v) => !v)} aria-label="Sidebar"><IconSidebar /></button>
@@ -150,11 +167,12 @@ function Shell({ onLogout }: { onLogout: () => void }) {
             {view === "chat" ? active?.title || "" : ""}
           </div>
           <SessionChip worker={worker} />
+          {online && <button className="icon-btn" onClick={() => setBrowserOpen(true)} aria-label="Browser" title="Browser"><IconGlobe /></button>}
           {(active || view !== "chat") && (
             <button className="icon-btn" onClick={() => { setActiveId(null); setView("chat"); }} aria-label="New chat"><IconPlus /></button>
           )}
         </header>
-        {view === "files" ? <FilesPage online={online} /> : view === "projects" ? (
+        {view === "files" ? <FilesPage online={online} /> : view === "customize" ? <CustomizePage online={online} onAsk={ask} /> : view === "projects" ? (
           <ProjectsPage projects={projects} chats={chats} openId={projectId} online={online} draft={draft}
             onDraft={(model, effort) => setDraft({ model, effort })} onOpenProject={setProjectId}
             onOpenChat={(id) => { setActiveId(id); setView("chat"); }}
@@ -179,6 +197,23 @@ function Shell({ onLogout }: { onLogout: () => void }) {
           </div>
         )}
       </main>
+      {browserOpen && online && <BrowserPanel onClose={() => setBrowserOpen(false)} />}
+      {modal === "search" && <SearchModal chats={chats} onClose={() => setModal(null)}
+        onOpen={(id) => { const c = chats.find((x) => x.id === id); setActiveId(id); setView(c?.dev ? "developer" : "chat"); }} />}
+      {modal === "notes" && <NotificationsModal notes={notes.notes} online={online} onClose={() => setModal(null)}
+        onOpenNote={openNote} onChanged={notes.setNotes} />}
+      {modal === "settings" && <SettingsModal online={online} chats={chats} onImport={importChats} onClearAll={() => { clearAll(); setActiveId(null); }}
+        onLogout={() => { if (confirm("Log out of Panda on this device?")) onLogout(); }} onClose={() => setModal(null)} />}
     </div>
   );
+}
+
+/** A system notification when a reply finishes while Panda is in the background. */
+function notifyReply(title: string, failed: boolean) {
+  if (!getSettings().notifyReplies || !document.hidden || typeof Notification === "undefined") return;
+  if (Notification.permission !== "granted") return;
+  const head = failed ? "Panda: something went wrong" : "Panda replied";
+  const opts = { body: title, icon: "/icon-192.png" };
+  if ("serviceWorker" in navigator) navigator.serviceWorker.getRegistration().then((r) => { if (r) return r.showNotification(head, opts); new Notification(head, opts); }).catch(() => {});
+  else try { new Notification(head, opts); } catch { /* not supported */ }
 }

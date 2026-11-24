@@ -23,3 +23,9 @@ self.addEventListener("fetch", (e) => {
     }));
   }
 });
+
+// Tapping a "Panda replied" notification brings the app back.
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  e.waitUntil(self.clients.matchAll({ type: "window" }).then((cs) => (cs[0] ? cs[0].focus() : self.clients.openWindow("/"))));
+});

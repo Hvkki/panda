@@ -2,6 +2,7 @@ import { memo, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Chat, Message } from "../lib/store";
+import { useSettings } from "../lib/settings";
 import { Composer } from "./Composer";
 import { Logo } from "./Logo";
 import { IconAlert, IconCheck, IconChevron, IconBrain, IconCopy, IconRetry, IconSpinner } from "./Icons";
@@ -79,19 +80,20 @@ function Activity({ m, live }: { m: Message; live: boolean }) {
 
 const MessageView = memo(function MessageView({ m, model, onRetry }: { m: Message; model: string; onRetry?: () => void }) {
   const [copied, setCopied] = useState(false);
+  const { showThinking } = useSettings();
   if (m.role === "user") return <div className="msg user"><div className="bubble">{m.content}</div></div>;
   const live = m.status === "streaming" || m.status === "waiting";
   return (
     <div className="msg assistant">
       <div className="avatar"><Logo size={28} animated working={live} /></div>
       <div className="msg-body">
-        {m.thinking && <Thinking text={m.thinking} live={live && !m.content} />}
+        {m.thinking && showThinking && <Thinking text={m.thinking} live={live && !m.content} />}
         <Activity m={m} live={live} />
         {m.content ? <div className="prose"><Markdown text={m.content} /></div> :
           live && !(m.tools || []).length && !m.thinking ? (
             <div className="activity live"><div className="step current">
               <span className="step-icon"><IconSpinner size={15} /></span>
-              <span className="step-label shimmer">{m.status === "waiting" ? "Starting the worker. This takes about two minutes." : "Thinking"}</span>
+              <span className="step-label shimmer">{m.status === "waiting" ? "Starting the worker. This takes about 30 seconds." : "Thinking"}</span>
             </div></div>
           ) : null}
         {m.status === "error" && <div className="error-note"><IconAlert size={15} /> {m.error || "Something went wrong."}</div>}

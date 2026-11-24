@@ -15,14 +15,35 @@ Kaggle ── notebook "panda-worker" ── worker.py ── claude -p (stream-
    └─ Cloudflare tunnel: the app streams chat straight from the worker
 ```
 
-- **Chats** are saved in your browser (localStorage). The worker keeps Claude's session files only
-  while it runs; if a session is gone the app re-sends the conversation as context.
+- **Chats and projects** are saved in your browser (localStorage). Export or import them in
+  Settings → Data. The worker keeps Claude's session files only while it runs; if a session is gone
+  the app re-sends the conversation as context.
+- **Everything you customize** (skills, connectors, scheduled tasks, API keys, memory, developer
+  variables, the Claude token) is saved by the worker into the private dataset `panda-secret`
+  (`worker.json`), so it survives Kaggle's wiped disks.
 - **Files** Claude creates live in the worker's workspace. Download them from the Files page before
   you stop the worker.
 - **Permissions:** Claude Code runs with `bypassPermissions` inside the disposable Kaggle VM, so it
   never waits for an approval. Anyone with your app password can run commands on that VM, so use a
   long password.
-- No custom system prompt: Claude Code runs as shipped.
+
+## Features
+
+All built on Claude Code itself:
+
+| Feature | How it works |
+|---|---|
+| Chat | `claude -p --output-format stream-json`, streamed to the app; model and effort per chat |
+| Projects | Custom instructions (`--append-system-prompt`) and a folder per project on the worker |
+| Developer | One chat that edits Panda's own repo, pushes and redeploys; its own env variables |
+| Skills | Claude Code skills in `~/.claude/skills`, edited in Customize |
+| Connectors | MCP servers (`claude mcp add-json -s user`), remote URL or command |
+| Browser | Chromium + Playwright MCP; watch and take over (captchas, logins) in the Browser panel |
+| Scheduled | Tasks the worker runs while online; results go to Notifications |
+| API keys | Environment variables every chat can use (names shown to Claude, never values) |
+| Memory | `~/.claude/CLAUDE.md`; Claude adds to it when you ask it to remember something |
+| Search, Settings | Search all chats; theme, text size, width, defaults, export/import |
+| Connect Claude | Settings → Claude account runs `claude setup-token` on the worker: open the link, paste the code |
 
 | Path | What it is |
 |---|---|
@@ -58,22 +79,23 @@ Kaggle ── notebook "panda-worker" ── worker.py ── claude -p (stream-
    export PANDA_PASSWORD=... KAGGLE_API_TOKEN=...   # plus PANDA_API_URL or ENDPOINT_DATASET
    python3 scripts/deploy-app.py --set-env
    ```
-6. Open the app, enter the password, press **Start**. About two minutes later it says Online.
+6. Open the app, enter the password, press **Start**. About 30 seconds later it says Online.
    Sending a message while offline starts the worker for you.
 
 ## Rotating the Claude token
 
-Run `claude setup-token` again, export the new `CLAUDE_CODE_OAUTH_TOKEN`, and run
-`python3 scripts/setup-kaggle.py`. Stop and Start the worker.
+In the app: Settings → Claude account → Connect, open the link, paste the code. Or run
+`claude setup-token` yourself, export `CLAUDE_CODE_OAUTH_TOKEN`, and run
+`python3 scripts/setup-kaggle.py`, then Stop and Start the worker.
 
 ## Verified on Kaggle (24 Nov 2026)
 
-Run with a placeholder Claude token: Start through `SaveKernel`, the worker installing the real
-`claude` CLI and `cloudflared`, the quick-tunnel URL published to the endpoint dataset, the Vercel
-function finding it (status "on"), the chat stream through the tunnel, Stop, and the kernel
-finishing. Claude answered "401 OAuth access token is invalid", which is the expected reply to a fake
-token.
+With the real subscription token, on the deployed site and a live worker: chat replies, project
+instructions, a skill triggering, memory, a scheduled task posting to Notifications, connectors
+setup, Claude driving the browser (Wikipedia, Google) and the live Browser panel on a phone-sized
+screen, settings saved to Kaggle and restored after a restart, and the Connect Claude login link.
+Every page was opened at phone size with no errors. Kaggle's API answers 404 to some default client
+User-Agents, so `app/api` sends its own.
 
-Not verified: a real reply with your real `setup-token` token, the deployed Vercel site, and the
-browser UI against a live worker. Kaggle's API answers 404 to some default client User-Agents, so
-`app/api` sends its own.
+Not verified: the Developer chat pushing to GitHub (needs your `GITHUB_TOKEN`), and scheduled tasks
+firing on their own timer (only "Run now" was tested; the timing logic has a local test).

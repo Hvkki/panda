@@ -43,6 +43,8 @@ import tempfile
 import termios
 import threading
 import time
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -73,7 +75,7 @@ STOP = threading.Event()
 def scrub(s) -> str:
     s = "" if s is None else str(s)
     for secret in (CFG.get("claude_oauth_token"), PASSWORD, CFG.get("cloudflared_token"), CFG.get("kaggle_api_token"),
-                   *(CFG.get("dev_env") or {}).values()):
+                   *(CFG.get("dev_env") or {}).values(), *(CFG.get("env") or {}).values()):
         if secret:
             s = s.replace(secret, "***")
     return s
@@ -142,6 +144,8 @@ it in Developer -> Env variables. Never print their values."""
 def folder_for(req: dict) -> Path:
     if req.get("dev"):
         name = "developer"
+    elif req.get("scheduled"):
+        name = "scheduled"
     else:
         name = re.sub(r"[^A-Za-z0-9_-]", "", str(req.get("folder") or ""))[:64]
         name = f"projects/{name}" if name else ""
@@ -172,14 +176,15 @@ def run_claude(req: dict, emit) -> None:
     if sid:
         cmd += ["--resume", sid]
     system = str(req.get("system") or "")[:20000]
-    env = ENV
+    env = dict(ENV, **(CFG.get("env") or {}))
     if req.get("dev"):
         dev_env = CFG.get("dev_env") or {}
-        env = dict(ENV, **dev_env)
+        env.update(dev_env)
         branch = dev_env.get("PANDA_BRANCH") or "claude/amazing-mccarthy-ejh4o9"
         repo = dev_env.get("PANDA_REPO") or "hvkki/panda"
         system = DEV_PROMPT.format(repo=repo, branch=branch, names=", ".join(sorted(dev_env)) or "none yet") + (
             "\n\n" + system if system else "")
+    system = "\n\n".join(x for x in (extra_system(req), system) if x)
     if system:
         cmd += ["--append-system-prompt", system]
     t0 = time.time()
@@ -333,22 +338,12 @@ def login_code(code: str) -> dict:
     login_stop()
     CFG["claude_oauth_token"] = token
     ENV["CLAUDE_CODE_OAUTH_TOKEN"] = token
-    saved = save_config()
-    log("claude token updated", "and saved" if saved else "(not saved to the dataset)")
-    return {"ok": True, "saved": saved}
+    save_soon(0.5)
+    log("claude token updated")
+    return {"ok": True}
 
 
-def set_dev_env(changes: dict) -> dict:
-    env = dict(CFG.get("dev_env") or {})
-    for name, value in changes.items():
-        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", str(name)):
-            return {"error": f"Bad name: {name}. Use CAPITALS, digits and _."}
-        if value is None or value == "":
-            env.pop(name, None)
-        else:
-            env[name] = str(value)
-    CFG["dev_env"] = env
-    return {"names": sorted(env), "saved": save_config()}
+SAVE_CFG_LOCK = threading.Lock()
 
 
 def save_config() -> bool:
@@ -356,7 +351,343 @@ def save_config() -> bool:
     ds = CFG.get("secret_dataset") or (CFG.get("kaggle_username") and f"{CFG['kaggle_username']}/panda-secret")
     if not ds:
         return False
-    return kaggle_push(ds, {"worker.json": json.dumps(CFG)}, "token from Connect Claude", private=True)
+    with SAVE_CFG_LOCK:
+        with CFG_LOCK:
+            text = json.dumps(CFG)
+        ok = kaggle_push(ds, {"worker.json": text}, "saved from the Panda app", private=True)
+    log("settings saved" if ok else "settings save failed")
+    return ok
+
+# ── saved state: skills, connectors, keys, memory, schedules ─────────────────
+# Everything the app customizes lives in worker.json (the private dataset), so it survives restarts.
+# Saves are batched: a change is written to Kaggle a few seconds after the last edit.
+SAVE = {"timer": None, "state": "saved"}
+SAVE_LOCK = threading.Lock()
+CFG_LOCK = threading.Lock()
+NAME_RE = r"[A-Z][A-Z0-9_]{0,63}"
+SKILL_RE = r"[a-z0-9][a-z0-9-]{0,63}"
+
+
+def settings() -> dict:
+    return {"browser": True, "memory": True, **(CFG.get("settings") or {})}
+
+
+def _flush():
+    with SAVE_LOCK:
+        SAVE["timer"] = None
+    ok = save_config()
+    with SAVE_LOCK:
+        if SAVE["timer"] is None:
+            SAVE["state"] = "saved" if ok else "error"
+
+
+def save_soon(delay: float = 4):
+    with SAVE_LOCK:
+        if SAVE["timer"]:
+            SAVE["timer"].cancel()
+        SAVE["state"] = "saving"
+        t = threading.Timer(delay, _flush)
+        t.daemon = True
+        SAVE["timer"] = t
+        t.start()
+
+
+def flush_now():
+    with SAVE_LOCK:
+        t = SAVE["timer"]
+        if t:
+            t.cancel()
+    if t:
+        _flush()
+
+
+def set_vars(key: str, changes: dict) -> dict:
+    with CFG_LOCK:
+        env = dict(CFG.get(key) or {})
+        for name, value in changes.items():
+            if not re.fullmatch(NAME_RE, str(name)):
+                return {"error": f"Bad name: {name}. Use CAPITALS, digits and _."}
+            if value is None or value == "":
+                env.pop(name, None)
+            else:
+                env[name] = str(value)
+        CFG[key] = env
+    save_soon()
+    return {"names": sorted(env)}
+
+
+SKILLS_DIR = HOME / ".claude" / "skills"
+MEMORY_FILE = HOME / ".claude" / "CLAUDE.md"
+MEM = {"mtime": 0.0}
+
+
+def apply_skills():
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    want = CFG.get("skills") or {}
+    for d in SKILLS_DIR.iterdir():
+        if (d / ".panda").exists() and d.name not in want:
+            shutil.rmtree(d, ignore_errors=True)
+    for name, text in want.items():
+        d = SKILLS_DIR / name
+        d.mkdir(exist_ok=True)
+        (d / "SKILL.md").write_text(text)
+        (d / ".panda").write_text("managed by the Panda app\n")
+
+
+def apply_memory():
+    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    MEMORY_FILE.write_text(CFG.get("memory") or "")
+    MEM["mtime"] = MEMORY_FILE.stat().st_mtime
+
+
+def watch_memory():
+    """Claude may edit ~/.claude/CLAUDE.md itself ("remember that…"): keep the saved copy in step."""
+    try:
+        m = MEMORY_FILE.stat().st_mtime
+    except OSError:
+        return
+    if m != MEM["mtime"]:
+        MEM["mtime"] = m
+        text = MEMORY_FILE.read_text()
+        if text != (CFG.get("memory") or ""):
+            CFG["memory"] = text
+            log("memory changed by Claude, saving")
+            save_soon()
+
+
+BROWSER_MCP = {"type": "stdio", "command": "npx",
+               "args": ["-y", "@playwright/mcp@latest", "--cdp-endpoint", "http://127.0.0.1:9222"]}
+MCP_APPLIED: set = set()
+
+
+def apply_mcp():
+    want = dict(CFG.get("mcp") or {})
+    if settings()["browser"]:
+        want["browser"] = BROWSER_MCP
+    for name in list(MCP_APPLIED - set(want)):
+        sh(f"claude mcp remove -s user {name}", timeout=60)
+        MCP_APPLIED.discard(name)
+    for name, conf in want.items():
+        sh(f"claude mcp remove -s user {name} >/dev/null 2>&1; claude mcp add-json -s user {name} "
+           f"'{json.dumps(conf).replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'", timeout=60)
+        MCP_APPLIED.add(name)
+
+
+def mask_mcp(conf: dict) -> dict:
+    c = json.loads(json.dumps(conf))
+    for k in ("headers", "env"):
+        if isinstance(c.get(k), dict):
+            c[k] = {n: "••••" for n in c[k]}
+    return c
+
+
+def extra_system(req: dict) -> str:
+    parts = []
+    if settings()["memory"]:
+        parts.append("Long-term memory: ~/.claude/CLAUDE.md is loaded in every chat. When the user asks you to "
+                     "remember something, or tells you a lasting preference or fact about themselves, add it "
+                     "there briefly. Keep it short and tidy.")
+    if settings()["browser"]:
+        parts.append("You have a real web browser through the `browser` MCP tools. The user can watch it and "
+                     "take over in the app's Browser panel; if a page needs a login or a captcha, ask them to "
+                     "do that step in the Browser panel, then continue.")
+    if CFG.get("env"):
+        parts.append("API keys available as environment variables: " + ", ".join(sorted(CFG["env"])) + ".")
+    return "\n\n".join(parts)
+
+
+# ── scheduled tasks and notifications ────────────────────────────────────────
+NOTES_MAX = 60
+
+
+def notify(note: dict):
+    note = {"id": uuid_hex(), "at": int(time.time()), **note}
+    with CFG_LOCK:
+        CFG["notifications"] = ([note] + (CFG.get("notifications") or []))[:NOTES_MAX]
+    save_soon()
+
+
+def uuid_hex() -> str:
+    return os.urandom(8).hex()
+
+
+def schedule_due(s: dict, now: float) -> bool:
+    if not s.get("enabled", True):
+        return False
+    last = float(s.get("last_run") or 0)
+    if s.get("kind") == "interval":
+        every = max(15, int(s.get("minutes") or 60)) * 60
+        return now - max(last, float(s.get("created") or 0)) >= every
+    # daily at HH:MM in the user's time zone (tz = minutes from JS getTimezoneOffset)
+    local = time.gmtime(now - int(s.get("tz") or 0) * 60)
+    hh, mm = (int(x) for x in str(s.get("time") or "09:00").split(":"))
+    days = s.get("days") or [0, 1, 2, 3, 4, 5, 6]  # 0 = Monday
+    if local.tm_wday not in days or (local.tm_hour, local.tm_min) < (hh, mm):
+        return False
+    last_local = time.gmtime(last - int(s.get("tz") or 0) * 60) if last else None
+    return not last_local or (last_local.tm_year, last_local.tm_yday) != (local.tm_year, local.tm_yday)
+
+
+def run_schedule(s: dict):
+    out = {"text": "", "session_id": "", "error": False}
+
+    def emit(ev):
+        if ev.get("t") == "done":
+            out.update(text=ev.get("text") or "", session_id=ev.get("session_id") or "", error=bool(ev.get("error")))
+        elif ev.get("t") == "error":
+            out.update(text=ev.get("message") or "failed", error=True)
+
+    log("scheduled task:", s.get("name"))
+    try:
+        run_claude({"chat_id": "sched-" + s["id"], "message": s.get("prompt") or "", "model": s.get("model"),
+                    "effort": s.get("effort") or "medium", "scheduled": True}, emit)
+    except Exception as exc:
+        out.update(text=scrub(exc), error=True)
+    notify({"kind": "scheduled", "title": s.get("name") or "Scheduled task", "prompt": s.get("prompt") or "",
+            "text": out["text"], "session_id": out["session_id"], "error": out["error"], "schedule": s["id"]})
+
+
+def scheduler():
+    while not STOP.wait(30):
+        now = time.time()
+        for s in list(CFG.get("schedules") or []):
+            if schedule_due(s, now) and ("sched-" + s["id"]) not in RUNNING:
+                s["last_run"] = now
+                save_soon()
+                threading.Thread(target=run_schedule, args=(s,), daemon=True).start()
+
+
+def upsert_schedule(s: dict) -> dict:
+    if not str(s.get("prompt") or "").strip():
+        return {"error": "The task needs a prompt."}
+    with CFG_LOCK:
+        items = list(CFG.get("schedules") or [])
+        s = {k: s.get(k) for k in ("id", "name", "prompt", "kind", "minutes", "time", "days", "tz", "model",
+                                   "effort", "enabled") if k in s}
+        old = next((x for x in items if x["id"] == s.get("id")), None)
+        if old:
+            old.update(s)
+        else:
+            s.update(id=s.get("id") or uuid_hex(), created=time.time(), last_run=0)
+            items.append(s)
+        CFG["schedules"] = items
+    save_soon()
+    return {"schedules": items}
+
+
+# ── live browser (Chromium with DevTools; Claude drives it through Playwright MCP) ──
+BROWSER = {"state": "off", "proc": None, "error": ""}
+CDP = "http://127.0.0.1:9222"
+
+
+def start_browser():
+    if not settings()["browser"]:
+        return
+    BROWSER["state"] = "installing"
+    try:
+        sh("npx -y playwright@latest install --with-deps chromium", timeout=1200, check=True)
+        exe = sorted(glob.glob(str(HOME / ".cache/ms-playwright/chromium-*/chrome-linux*/chrome")))
+        if not exe:
+            raise RuntimeError("chromium not found after install")
+        prof = WORK / "browser-profile"
+        prof.mkdir(exist_ok=True)
+        BROWSER["proc"] = subprocess.Popen(
+            [exe[-1], "--headless=new", "--remote-debugging-port=9222", "--remote-debugging-address=127.0.0.1",
+             "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", f"--user-data-dir={prof}",
+             "--window-size=1280,800", "--no-first-run", "about:blank"],
+            env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(30):
+            if cdp_pages() is not None:
+                break
+            time.sleep(1)
+        sh("npx -y @playwright/mcp@latest --help >/dev/null", timeout=600)  # warm the npx cache
+        BROWSER["state"] = "ready"
+        log("browser ready")
+    except Exception as exc:
+        BROWSER.update(state="error", error=scrub(exc)[:300])
+        log("browser failed:", exc)
+
+
+def cdp_pages():
+    try:
+        with urllib.request.urlopen(CDP + "/json", timeout=3) as r:
+            return [p for p in json.load(r) if p.get("type") == "page"]
+    except Exception:
+        return None
+
+
+def cdp(tab: str, calls: list, browser: bool = False) -> list:
+    """Run DevTools commands on a tab (or on the browser itself); returns their results in order."""
+    from websockets.sync.client import connect
+    if browser:
+        with urllib.request.urlopen(CDP + "/json/version", timeout=3) as r:
+            ws_url = json.load(r)["webSocketDebuggerUrl"]
+    else:
+        pages = cdp_pages() or []
+        page = next((p for p in pages if p["id"] == tab), pages[0] if pages else None)
+        if not page:
+            raise RuntimeError("no browser tab")
+        ws_url = page["webSocketDebuggerUrl"]
+    out = []
+    with connect(ws_url, max_size=None, open_timeout=5) as ws:
+        for i, (method, params) in enumerate(calls, 1):
+            ws.send(json.dumps({"id": i, "method": method, "params": params}))
+            while True:
+                msg = json.loads(ws.recv(timeout=20))
+                if msg.get("id") == i:
+                    if "error" in msg:
+                        raise RuntimeError(msg["error"].get("message", "devtools error"))
+                    out.append(msg.get("result") or {})
+                    break
+    return out
+
+
+KEYS = {"Enter": 13, "Backspace": 8, "Tab": 9, "Escape": 27, "ArrowDown": 40, "ArrowUp": 38,
+        "ArrowLeft": 37, "ArrowRight": 39}
+
+
+def browser_act(a: dict) -> dict:
+    tab, kind = str(a.get("tab") or ""), a.get("type")
+    if kind == "click":
+        x, y = float(a["x"]), float(a["y"])
+        cdp(tab, [("Input.dispatchMouseEvent", {"type": t, "x": x, "y": y, "button": "left", "clickCount": 1})
+                  for t in ("mouseMoved", "mousePressed", "mouseReleased")])
+    elif kind == "type":
+        cdp(tab, [("Input.insertText", {"text": str(a.get("text") or "")})])
+    elif kind == "key":
+        k = str(a.get("key"))
+        code = KEYS.get(k, 0)
+        extra = {"text": "\r"} if k == "Enter" else {}
+        cdp(tab, [("Input.dispatchKeyEvent", {"type": "keyDown", "key": k, "code": k, "windowsVirtualKeyCode": code, **extra}),
+                  ("Input.dispatchKeyEvent", {"type": "keyUp", "key": k, "code": k, "windowsVirtualKeyCode": code})])
+    elif kind == "scroll":
+        cdp(tab, [("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": float(a.get("x") or 400),
+                                                "y": float(a.get("y") or 400), "deltaX": 0, "deltaY": float(a.get("dy") or 400)})])
+    elif kind == "nav":
+        url = str(a.get("url") or "").strip()
+        if url and not re.match(r"^[a-z]+:", url):
+            url = ("https://" + url) if "." in url and " " not in url else "https://www.google.com/search?q=" + urllib.parse.quote(url)
+        cdp(tab, [("Page.navigate", {"url": url})])
+    elif kind in ("back", "forward", "reload"):
+        js = {"back": "history.back()", "forward": "history.forward()", "reload": "location.reload()"}[kind]
+        cdp(tab, [("Runtime.evaluate", {"expression": js})])
+    elif kind == "size":  # phone or desktop window; pages re-layout to it
+        w, h = max(320, min(int(a.get("w") or 1280), 1920)), max(480, min(int(a.get("h") or 800), 1400))
+        pages = cdp_pages() or []
+        page = next((p for p in pages if p["id"] == tab), pages[0] if pages else None)
+        if not page:
+            return {"error": "no browser tab"}
+        win = cdp("", [("Browser.getWindowForTarget", {"targetId": page["id"]})], browser=True)[0]["windowId"]
+        cdp("", [("Browser.setWindowBounds", {"windowId": win, "bounds": {"windowState": "normal"}}),
+                 ("Browser.setWindowBounds", {"windowId": win, "bounds": {"width": w, "height": h}})], browser=True)
+    elif kind == "new":
+        urllib.request.urlopen(urllib.request.Request(CDP + "/json/new?about:blank", method="PUT"), timeout=5).read()
+    elif kind == "close":
+        urllib.request.urlopen(CDP + "/json/close/" + urllib.parse.quote(tab), timeout=5).read()
+    else:
+        return {"error": "unknown action"}
+    return {"ok": True}
+
 
 # ── HTTP API ─────────────────────────────────────────────────────────────────
 FAILS = {"n": 0, "until": 0.0}
@@ -412,6 +743,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        try:
+            return self._get()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as exc:
+            return self.send_json({"error": scrub(exc)}, 400)
+
+    def _get(self):
         u = urlparse(self.path)
         if u.path == "/health":
             return self.send_json({"ok": True, "uptime": int(time.time() - T0)})
@@ -420,8 +759,46 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/status":
             return self.send_json({"ok": True, "uptime": int(time.time() - T0), "max": MAX_RUNTIME,
                                    "busy": list(RUNNING), "claude": bool(CFG.get("claude_oauth_token"))})
+        q = parse_qs(u.query)
         if u.path == "/devenv":
             return self.send_json({"names": sorted(CFG.get("dev_env") or {})})
+        if u.path == "/state":
+            return self.send_json({
+                "skills": CFG.get("skills") or {}, "mcp": {k: mask_mcp(v) for k, v in (CFG.get("mcp") or {}).items()},
+                "env": sorted(CFG.get("env") or {}), "dev_env": sorted(CFG.get("dev_env") or {}),
+                "memory": CFG.get("memory") or "", "schedules": CFG.get("schedules") or [],
+                "settings": settings(), "save": SAVE["state"], "browser": BROWSER["state"],
+                "browser_error": BROWSER["error"], "uptime": int(time.time() - T0), "max": MAX_RUNTIME,
+                "claude": bool(CFG.get("claude_oauth_token"))})
+        if u.path == "/notifications":
+            return self.send_json({"notifications": CFG.get("notifications") or []})
+        if u.path == "/mcp/status":
+            r = subprocess.run(["claude", "mcp", "list"], env=ENV, capture_output=True, text=True, timeout=90)
+            return self.send_json({"text": scrub(r.stdout or r.stderr)[-4000:]})
+        if u.path == "/browser/status":
+            pages = cdp_pages()
+            return self.send_json({"state": BROWSER["state"] if pages is not None or BROWSER["state"] != "ready" else "error",
+                                   "error": BROWSER["error"],
+                                   "tabs": [{"id": p["id"], "title": p.get("title", ""), "url": p.get("url", "")} for p in pages or []]})
+        if u.path == "/browser/shot":
+            tab = q.get("tab", [""])[0]
+            vp = cdp(tab, [("Page.getLayoutMetrics", {})])[0].get("cssVisualViewport") or {}
+            shot = {"format": "jpeg", "quality": int(q.get("q", ["60"])[0])}
+            if 0 < vp.get("clientWidth", 0) < 700:  # phone-sized window: capture at 2x so text is sharp
+                shot["clip"] = {"x": vp.get("pageX", 0), "y": vp.get("pageY", 0), "width": vp["clientWidth"],
+                                "height": vp["clientHeight"], "scale": 2}
+            import base64
+            img = base64.b64decode(cdp(tab, [("Page.captureScreenshot", shot)])[0]["data"])
+            self.send_response(200)
+            self.cors()
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-View", f'{int(vp.get("clientWidth", 0))}x{int(vp.get("clientHeight", 0))}')
+            self.send_header("Access-Control-Expose-Headers", "X-View")
+            self.send_header("Content-Length", str(len(img)))
+            self.end_headers()
+            self.wfile.write(img)
+            return
         if u.path == "/files":
             return self.send_json({"files": list_files()})
         if u.path == "/file":
@@ -446,8 +823,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(login_start())
             if u.path == "/login/code":
                 return self.send_json(login_code(str(json.loads(self.body() or b"{}").get("code") or "")))
-            if u.path == "/devenv":
-                return self.send_json(set_dev_env(json.loads(self.body() or b"{}").get("set") or {}))
+            if u.path in ("/devenv", "/env"):
+                key = "dev_env" if u.path == "/devenv" else "env"
+                return self.send_json(set_vars(key, json.loads(self.body() or b"{}").get("set") or {}))
+            if u.path == "/delete":
+                return self.delete_file(str(json.loads(self.body() or b"{}").get("path") or ""))
+            if u.path in ("/skills", "/mcp", "/memory", "/settings", "/schedules", "/schedules/run",
+                          "/notifications/clear", "/browser/act"):
+                return self.send_json(self.change(u.path, json.loads(self.body(4 << 20) or b"{}")))
             if u.path == "/upload":
                 return self.upload()
             if u.path == "/stop":
@@ -459,6 +842,77 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             return self.send_json({"error": scrub(exc)}, 400)
         self.send_json({"error": "not found"}, 404)
+
+    def change(self, path: str, b: dict) -> dict:
+        if path == "/browser/act":
+            return browser_act(b)
+        if path == "/schedules/run":
+            s = next((x for x in CFG.get("schedules") or [] if x["id"] == b.get("id")), None)
+            if not s:
+                return {"error": "no such task"}
+            threading.Thread(target=run_schedule, args=(s,), daemon=True).start()
+            return {"ok": True}
+        if path == "/schedules":
+            if b.get("delete"):
+                with CFG_LOCK:
+                    CFG["schedules"] = [x for x in CFG.get("schedules") or [] if x["id"] != b["delete"]]
+                save_soon()
+                return {"schedules": CFG["schedules"]}
+            return upsert_schedule(b.get("schedule") or {})
+        if path == "/notifications/clear":
+            with CFG_LOCK:
+                CFG["notifications"] = [n for n in CFG.get("notifications") or [] if b.get("id") and n["id"] != b["id"]]
+            save_soon()
+            return {"notifications": CFG["notifications"]}
+        if path == "/skills":
+            name = str(b.get("name") or "")
+            if not re.fullmatch(SKILL_RE, name):
+                return {"error": "Skill names use lowercase letters, digits and dashes."}
+            with CFG_LOCK:
+                skills = dict(CFG.get("skills") or {})
+                if b.get("content"):
+                    skills[name] = str(b["content"])
+                else:
+                    skills.pop(name, None)
+                CFG["skills"] = skills
+            apply_skills()
+        elif path == "/mcp":
+            name = str(b.get("name") or "")
+            if not re.fullmatch(SKILL_RE, name) or name == "browser":
+                return {"error": "Connector names use lowercase letters, digits and dashes (not 'browser')."}
+            conf = b.get("config")
+            with CFG_LOCK:
+                mcp = dict(CFG.get("mcp") or {})
+                if conf:
+                    old = mcp.get(name) or {}
+                    for k in ("headers", "env"):  # keep secret values the app only saw masked
+                        if isinstance(conf.get(k), dict):
+                            conf[k] = {n: (old.get(k, {}).get(n, "") if v == "••••" else v) for n, v in conf[k].items()}
+                    mcp[name] = conf
+                else:
+                    mcp.pop(name, None)
+                CFG["mcp"] = mcp
+            apply_mcp()
+        elif path == "/memory":
+            CFG["memory"] = str(b.get("text") or "")
+            apply_memory()
+        elif path == "/settings":
+            before = settings()
+            CFG["settings"] = {**(CFG.get("settings") or {}), **{k: bool(v) for k, v in (b.get("patch") or {}).items()
+                                                                 if k in ("browser", "memory")}}
+            if settings()["browser"] != before["browser"]:
+                apply_mcp()
+                if settings()["browser"] and BROWSER["state"] in ("off", "error"):
+                    threading.Thread(target=start_browser, daemon=True).start()
+        save_soon()
+        return {"ok": True}
+
+    def delete_file(self, rel: str):
+        target = (WORKSPACE / rel).resolve()
+        if WORKSPACE.resolve() not in target.parents or not target.is_file():
+            return self.send_json({"error": "not found"}, 404)
+        target.unlink()
+        return self.send_json({"ok": True})
 
     def chat(self, req: dict):
         self.send_response(200)
@@ -607,6 +1061,9 @@ def publish_endpoint(url: str):
 # ── main ─────────────────────────────────────────────────────────────────────
 def main():
     install()
+    apply_skills()
+    apply_memory()
+    apply_mcp()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -616,7 +1073,10 @@ def main():
         log("PANDA_URL=" + url)
         threading.Thread(target=publish_endpoint, args=(url,), daemon=True).start()
     log("ready")
+    threading.Thread(target=scheduler, daemon=True).start()
+    threading.Thread(target=start_browser, daemon=True).start()
     while not STOP.is_set():
+        watch_memory()
         if time.time() - T0 > MAX_RUNTIME:
             log("time limit reached, stopping")
             break
@@ -629,6 +1089,10 @@ def main():
             if p.poll() is None:
                 p.kill()
     login_stop()
+    watch_memory()
+    flush_now()
+    if BROWSER["proc"]:
+        BROWSER["proc"].kill()
     tunnel.terminate()
     srv.shutdown()
     log("stopped")
