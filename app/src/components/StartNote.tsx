@@ -13,7 +13,7 @@ export function StartNote({ what }: { what: string }) {
       <button className="btn primary" disabled={busy} onClick={async () => {
         setBusy(true);
         try { await sessionAction("start"); } catch (e) { setErr((e as Error).message); setBusy(false); }
-      }}><IconPower size={15} /> {busy ? "Starting… (about 30 s)" : "Start"}</button>
+      }}><IconPower size={15} /> {busy ? "Starting… (1–3 min)" : "Start"}</button>
       {err && <p className="login-msg">{err}</p>}
     </div>
   );
