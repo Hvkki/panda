@@ -1,3 +1,4 @@
+import type { TurnUsage } from "./api";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 export type Tool = { id: string; label: string; done: boolean; error?: boolean };
@@ -10,6 +11,7 @@ export type Message = {
   status?: "waiting" | "streaming" | "done" | "error";
   error?: string;
   secs?: number;
+  usage?: TurnUsage;
 };
 export type Chat = {
   id: string; title: string; model: string; effort: string; pinned: boolean;

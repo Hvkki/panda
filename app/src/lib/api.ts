@@ -55,8 +55,12 @@ export type StreamEvent =
   | { t: "thinking"; d: string }
   | { t: "tool"; id: string; label: string }
   | { t: "tool_done"; id: string; error: boolean }
-  | { t: "done"; session_id?: string; text: string; error: boolean; secs: number }
+  | { t: "done"; session_id?: string; text: string; error: boolean; secs: number; usage?: TurnUsage }
+  | { t: "limits" }
   | { t: "error"; message: string };
+
+/** Tokens for one turn (all API calls Claude Code made), plus how full the context window is after it. */
+export type TurnUsage = { input: number; output: number; cache_read: number; cache_write: number; cost: number; ctx: number; window: number };
 
 export type ChatRequest = {
   chat_id: string; message: string; model: string; effort: string; session_id?: string;
@@ -151,6 +155,9 @@ async function wjson<T>(path: string, body?: unknown): Promise<T> {
 }
 export const getSaved = () => wjson<WorkerSaved>("/state");
 export const change = <T = { ok: boolean }>(path: string, body: unknown) => wjson<T>(path, body);
+export type PlanWindow = { pct: number; resets_at: number | null; used?: number; limit?: number };
+export type PlanUsage = { windows: Record<string, PlanWindow>; source: string; at: number; error: string };
+export const getUsage = (fresh = false) => wjson<PlanUsage>(`/usage${fresh ? "?fresh=1" : ""}`);
 export const getNotes = () => wjson<{ notifications: Note[] }>("/notifications").then((d) => d.notifications);
 export const mcpStatus = () => wjson<{ text: string }>("/mcp/status").then((d) => d.text);
 export const setEnv = (set: Record<string, string | null>) => wjson<{ names: string[] }>("/env", { set });

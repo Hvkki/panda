@@ -14,7 +14,10 @@ import { Composer } from "./components/Composer";
 import { SessionChip, useWorker } from "./components/SessionChip";
 import { FilesPage } from "./components/FilesPage";
 import { Logo } from "./components/Logo";
-import { IconGlobe, IconPlus, IconSidebar } from "./components/Icons";
+import { IconDots, IconGauge, IconGlobe, IconPlus, IconSidebar, IconSliders } from "./components/Icons";
+import { UsageRing, UsageSheet, chatUsage, usePlanUsage } from "./components/UsageSheet";
+import { ModelSheet } from "./components/ModelSheet";
+import { effortLabel, modelName } from "./lib/models";
 
 export default function App() {
   const [signedIn, setSignedIn] = useState(!!getPassword());
@@ -34,7 +37,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
   const [view, setView] = useState<View>("chat");
   const [sideOpen, setSideOpen] = useState(() => window.innerWidth > 900);
   const [draft, setDraft] = useState(() => ({ model: getSettings().defaultModel, effort: getSettings().defaultEffort }));
-  const [modal, setModal] = useState<"search" | "notes" | "settings" | null>(null);
+  const [modal, setModal] = useState<"search" | "notes" | "settings" | "usage" | null>(null);
   const [browserOpen, setBrowserOpen] = useState(false);
   const aborts = useRef(new Map<string, AbortController>());
   const active = chats.find((c) => c.id === activeId) || null;
@@ -62,10 +65,11 @@ function Shell({ onLogout }: { onLogout: () => void }) {
             : { ...m, tools: [...tools, { id: e.id, label: e.label, done: false }] };
         });
         else if (e.t === "tool_done") upd((m) => ({ ...m, tools: (m.tools || []).map((t) => (t.id === e.id ? { ...t, done: true, error: e.error } : t)) }));
+        else if (e.t === "limits") window.dispatchEvent(new Event("panda:limits"));
         else if (e.t === "done") {
           if (e.session_id) patchChat(chat.id, (c) => ({ ...c, session_id: e.session_id }));
           if (e.error) failed = true;
-          upd((m) => ({ ...m, content: e.text || m.content, secs: e.secs, status: e.error ? "error" : "done", error: e.error ? e.text : undefined }));
+          upd((m) => ({ ...m, content: e.text || m.content, secs: e.secs, usage: e.usage, status: e.error ? "error" : "done", error: e.error ? e.text : undefined }));
         } else if (e.t === "error") { failed = true; upd((m) => ({ ...m, status: "error", error: e.message })); }
       };
       await streamChat(url, {
@@ -130,22 +134,26 @@ function Shell({ onLogout }: { onLogout: () => void }) {
     runTurn(chat, question.content, rest);
   };
 
-  const setModel = (model: string, effort: string) => {
-    if (!active) return setDraft({ model, effort });
-    patchChat(active.id, (c) => ({ ...c, model, effort }));
-  };
-
   // The Developer chat: one per browser, created the first time the tab is opened.
   const devChat = chats.find((c) => c.dev) || null;
   useEffect(() => {
     if (view === "developer" && !devChat) add({ id: uid(), title: "Developer", model: "default", effort: "high", pinned: false,
       created: Date.now(), updated: Date.now(), messages: [], dev: true });
   }, [view, devChat, add]);
-  const activeProject = active?.project_id ? projects.find((p) => p.id === active.project_id) : undefined;
+
+  // What the top bar describes: the open chat (or the Developer chat on its page).
+  const headChat = view === "chat" ? active : view === "developer" ? devChat : null;
+  const headProject = headChat?.project_id ? projects.find((p) => p.id === headChat.project_id) : undefined;
+  const headUsage = chatUsage(headChat);
+  const title = view === "chat" ? active?.title || "" : view === "developer" ? "Developer"
+    : view === "projects" ? "Projects" : view === "files" ? "Files" : view === "customize" ? "Customize" : "";
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [modelOpen, setModelOpen] = useState(false);
 
   const closeSideOnMobile = () => { if (window.innerWidth <= 900) setSideOpen(false); };
   const online = worker.state === "on";
   const notes = useNotes(online);
+  const plan = usePlanUsage(online);
 
   return (
     <div className={`app ${sideOpen ? "side-open" : ""}`}>
@@ -162,15 +170,36 @@ function Shell({ onLogout }: { onLogout: () => void }) {
       <main className="main">
         <header className="topbar">
           <button className="icon-btn" onClick={() => setSideOpen((v) => !v)} aria-label="Sidebar"><IconSidebar /></button>
-          <div className="topbar-title">
-            {view === "chat" && activeProject && <button className="crumb" onClick={() => { setProjectId(activeProject.id); setView("projects"); }}>{activeProject.name} / </button>}
-            {view === "chat" ? active?.title || "" : ""}
+          <div className="topbar-center">
+            <div className="topbar-title">{title}</div>
+            {headChat && (
+              <button className="topbar-sub" onClick={() => setModelOpen(true)}>
+                {headProject ? headProject.name : headChat.dev ? "panda" : "Chat"} · {modelName(headChat.model)}
+                {headChat.effort !== "medium" ? ` · ${effortLabel(headChat.effort)}` : ""}
+              </button>
+            )}
           </div>
-          <SessionChip worker={worker} />
-          {online && <button className="icon-btn" onClick={() => setBrowserOpen(true)} aria-label="Browser" title="Browser"><IconGlobe /></button>}
-          {(active || view !== "chat") && (
-            <button className="icon-btn" onClick={() => { setActiveId(null); setView("chat"); }} aria-label="New chat"><IconPlus /></button>
-          )}
+          <button className="icon-btn" onClick={() => setModal("usage")} aria-label="Usage"
+            title={headChat ? `Context ${Math.round(headUsage.pct)}% used` : "Usage"}>
+            <UsageRing pct={headChat ? headUsage.pct : plan.data?.windows.five_hour?.pct ?? 0} />
+          </button>
+          <div className="menu-anchor">
+            <button className="icon-btn" onClick={() => setMenuOpen((v) => !v)} aria-label="More" aria-expanded={menuOpen}>
+              <IconDots /><span className={`state-dot ${worker.state}`} />
+            </button>
+            {menuOpen && (
+              <>
+                <div className="menu-scrim" onClick={() => setMenuOpen(false)} />
+                <div className="top-menu" role="menu">
+                  <div className="top-menu-session"><SessionChip worker={worker} /></div>
+                  <button onClick={() => { setMenuOpen(false); setActiveId(null); setView("chat"); }}><IconPlus size={18} /> New chat</button>
+                  {headChat && <button onClick={() => { setMenuOpen(false); setModelOpen(true); }}><IconSliders size={18} /> Model and effort</button>}
+                  <button onClick={() => { setMenuOpen(false); setModal("usage"); }}><IconGauge size={18} /> Usage</button>
+                  {online && <button onClick={() => { setMenuOpen(false); setBrowserOpen(true); }}><IconGlobe size={18} /> Browser</button>}
+                </div>
+              </>
+            )}
+          </div>
         </header>
         {view === "files" ? <FilesPage online={online} /> : view === "customize" ? <CustomizePage online={online} onAsk={ask} /> : view === "projects" ? (
           <ProjectsPage projects={projects} chats={chats} openId={projectId} online={online} draft={draft}
@@ -181,11 +210,10 @@ function Shell({ onLogout }: { onLogout: () => void }) {
         ) : view === "developer" ? (
           <DeveloperPage online={online} chat={devChat && (
             <ChatView key={devChat.id} chat={devChat} canAttach={online}
-              onModel={(model, effort) => patchChat(devChat.id, (c) => ({ ...c, model, effort }))}
               onSend={(t, a) => send(devChat, t, a)} onRetry={() => retry(devChat)} onStop={() => stop(devChat)} />
           )} />
         ) : active ? (
-          <ChatView key={active.id} chat={active} onModel={setModel} canAttach={online}
+          <ChatView key={active.id} chat={active} canAttach={online}
             onSend={(t, a) => send(active, t, a)} onRetry={() => retry(active)} onStop={() => stop(active)} />
         ) : (
           <div className="home">
@@ -197,6 +225,9 @@ function Shell({ onLogout }: { onLogout: () => void }) {
           </div>
         )}
       </main>
+      {modal === "usage" && <UsageSheet chat={headChat} online={online} plan={plan} onClose={() => setModal(null)} />}
+      {modelOpen && headChat && <ModelSheet model={headChat.model} effort={headChat.effort} onClose={() => setModelOpen(false)}
+        onChange={(model, effort) => patchChat(headChat.id, (c) => ({ ...c, model, effort }))} />}
       {browserOpen && online && <BrowserPanel onClose={() => setBrowserOpen(false)} />}
       {modal === "search" && <SearchModal chats={chats} onClose={() => setModal(null)}
         onOpen={(id) => { const c = chats.find((x) => x.id === id); setActiveId(id); setView(c?.dev ? "developer" : "chat"); }} />}

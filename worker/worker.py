@@ -132,13 +132,72 @@ def tool_label(name: str, inp: dict) -> str:
 
 DEV_PROMPT = """This is Panda's Developer chat. Here you may change Panda itself.
 Panda is a web app (React, Vite, in app/) on Vercel plus this Kaggle worker (worker/worker.py), from the
-GitHub repo {repo}, branch {branch}. Work in ./panda in the current directory. If it is missing, clone it:
-  git clone https://x-access-token:$GITHUB_TOKEN@github.com/{repo}.git panda && cd panda && git checkout {branch}
-Commit and push your changes to that branch. To publish the web app (needs VERCEL_TOKEN):
-  cd panda/app && npm ci && cd .. && python3 scripts/deploy-app.py
-Worker changes take effect the next time the worker is started from the app.
+GitHub repo {repo}, branch {branch}. The repo is already checked out in ./panda: work there.
+{git}
+To publish (needs VERCEL_TOKEN): cd panda/app && npm ci && cd .. && python3 scripts/deploy-app.py
+(it builds the app first and stops if the build fails). That one deploy updates both the web app and
+worker.py (the worker downloads it from the deployment), so worker changes take effect the next time the
+worker is started. Run `python3 -m py_compile worker/worker.py` after worker edits: a broken deploy breaks
+Panda for the owner.
 Developer variables available in your environment: {names}. If one you need is missing, ask the owner to add
 it in Developer -> Env variables. Never print their values."""
+GIT_PUSH = "Commit and push your changes to that branch (GITHUB_TOKEN is set; the remote already uses it)."
+GIT_LOCAL = ("There is no GITHUB_TOKEN, so you cannot push to GitHub. Commit locally if you like; Panda saves "
+             "every change in ./panda (committed or not) to the owner's private Kaggle dataset after each turn "
+             "and restores it on the next run. Tell the owner that changes are live on Vercel but not on GitHub.")
+DEV_PATCH_MAX = 8 << 20
+
+
+def dev_repo(repo: str, branch: str, token: str) -> str:
+    """Make sure ./panda exists in the developer folder, with the saved changes re-applied. Returns a note
+    for Claude when something went wrong."""
+    d = WORKSPACE / "developer" / "panda"
+    url = f"https://x-access-token:{token}@github.com/{repo}.git" if token else f"https://github.com/{repo}.git"
+    run = lambda *a, **k: subprocess.run(a, cwd=k.get("cwd", d), capture_output=True, text=True, timeout=600)
+    if not (d / ".git").exists():
+        d.parent.mkdir(parents=True, exist_ok=True)
+        r = run("git", "clone", "--branch", branch, url, str(d), cwd=d.parent)
+        if r.returncode != 0:
+            return "Cloning the repo failed: " + scrub(r.stderr)[-300:]
+        run("git", "config", "user.name", "Panda Developer")
+        run("git", "config", "user.email", "panda@users.noreply.github.com")
+        patch = CFG.get("dev_patch") or ""
+        if patch:
+            (d.parent / "saved-changes.patch").write_text(patch)
+            r = run("git", "apply", "--3way", "--whitespace=nowarn", str(d.parent / "saved-changes.patch"))
+            if r.returncode != 0:
+                return ("Your saved changes from an earlier run did not apply cleanly to the current branch; "
+                        "they are in ../saved-changes.patch. " + scrub(r.stderr)[-300:])
+            run("git", "reset", "-q")
+    else:
+        run("git", "remote", "set-url", "origin", url)
+    return ""
+
+
+def dev_snapshot(branch: str) -> None:
+    """Save everything in ./panda that is not on GitHub's branch (commits, edits, new files) as one patch."""
+    d = WORKSPACE / "developer" / "panda"
+    if not (d / ".git").exists():
+        return
+    try:
+        subprocess.run(["git", "add", "-A"], cwd=d, capture_output=True, timeout=120)
+        r = subprocess.run(["git", "diff", "--binary", "--cached", f"origin/{branch}"], cwd=d,
+                           capture_output=True, text=True, timeout=120)
+        subprocess.run(["git", "reset", "-q"], cwd=d, capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        log("dev snapshot failed:", e)
+        return
+    if r.returncode != 0:
+        log("dev snapshot failed:", r.stderr[-200:])
+        return
+    patch = r.stdout
+    if len(patch) > DEV_PATCH_MAX:
+        log("dev changes too large to save:", len(patch))
+        return
+    if patch != (CFG.get("dev_patch") or ""):
+        with CFG_LOCK:
+            CFG["dev_patch"] = patch
+        save_soon()
 
 
 def folder_for(req: dict) -> Path:
@@ -182,8 +241,13 @@ def run_claude(req: dict, emit) -> None:
         env.update(dev_env)
         branch = dev_env.get("PANDA_BRANCH") or "claude/amazing-mccarthy-ejh4o9"
         repo = dev_env.get("PANDA_REPO") or "hvkki/panda"
-        system = DEV_PROMPT.format(repo=repo, branch=branch, names=", ".join(sorted(dev_env)) or "none yet") + (
-            "\n\n" + system if system else "")
+        token = dev_env.get("GITHUB_TOKEN", "")
+        emit({"t": "tool", "id": "dev-repo", "label": "Preparing the Panda repo"})
+        note = dev_repo(repo, branch, token)
+        emit({"t": "tool_done", "id": "dev-repo", "error": bool(note)})
+        system = DEV_PROMPT.format(repo=repo, branch=branch, git=GIT_PUSH if token else GIT_LOCAL,
+                                   names=", ".join(sorted(dev_env)) or "none yet") + (
+            f"\n\nNote: {note}" if note else "") + ("\n\n" + system if system else "")
     system = "\n\n".join(x for x in (extra_system(req), system) if x)
     if system:
         cmd += ["--append-system-prompt", system]
@@ -202,6 +266,7 @@ def run_claude(req: dict, emit) -> None:
     seen_tools: set = set()
     sent_session = ""
     done = False
+    ctx = 0  # tokens in the context window after the latest API call
     try:
         for line in p.stdout:
             try:
@@ -225,7 +290,14 @@ def run_claude(req: dict, emit) -> None:
                     if b.get("type") == "tool_use" and b.get("id") not in seen_tools:
                         seen_tools.add(b["id"])
                         emit({"t": "tool", "id": b["id"], "label": b.get("name", "tool")})
+            elif kind == "rate_limit_event":
+                note_limits(ev.get("rate_limit_info") or {})
+                emit({"t": "limits"})
             elif kind == "assistant":
+                u = (ev.get("message") or {}).get("usage") or {}
+                if ev.get("parent_tool_use_id") is None and u.get("input_tokens") is not None:
+                    ctx = sum(int(u.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens",
+                                                            "cache_read_input_tokens", "output_tokens"))
                 for b in (ev.get("message") or {}).get("content") or []:
                     if b.get("type") == "tool_use":
                         seen_tools.add(b.get("id"))
@@ -238,7 +310,7 @@ def run_claude(req: dict, emit) -> None:
                 done = True
                 emit({"t": "done", "session_id": ev.get("session_id"), "text": ev.get("result") or "",
                       "error": bool(ev.get("is_error")), "secs": round(time.time() - t0, 1),
-                      "usage": ev.get("usage"), "turns": ev.get("num_turns")})
+                      "usage": turn_usage(ev, ctx), "turns": ev.get("num_turns")})
         p.wait(timeout=30)
     finally:
         if p.poll() is None:
@@ -246,9 +318,136 @@ def run_claude(req: dict, emit) -> None:
         with RUN_LOCK:
             if RUNNING.get(chat) is p:
                 RUNNING.pop(chat, None)
+        if req.get("dev"):
+            dev_snapshot(branch)
     if not done:
         tail = " ".join(errors)[-400:] or f"claude exited with code {p.returncode}"
         emit({"t": "error", "message": tail})
+
+
+# ── token and plan usage ─────────────────────────────────────────────────────
+LIMITS: dict = {}          # window ("five_hour", "seven_day"…) -> {"pct": 0-100, "resets_at": epoch secs}
+USAGE_CACHE: dict = {"at": 0.0, "data": None}
+WINDOW_KEYS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_oauth_apps")
+
+
+def turn_usage(ev: dict, ctx: int) -> dict:
+    """Token totals for one turn, from Claude Code's result event."""
+    u = ev.get("usage") or {}
+    mu = ev.get("modelUsage") or {}
+    window = max([int(m.get("contextWindow") or 0) for m in mu.values() if isinstance(m, dict)] or [0])
+    tot = lambda k: sum(int(m.get(k) or 0) for m in mu.values() if isinstance(m, dict))
+    return {
+        "input": tot("inputTokens") or int(u.get("input_tokens") or 0),
+        "output": tot("outputTokens") or int(u.get("output_tokens") or 0),
+        "cache_read": tot("cacheReadInputTokens") or int(u.get("cache_read_input_tokens") or 0),
+        "cache_write": tot("cacheCreationInputTokens") or int(u.get("cache_creation_input_tokens") or 0),
+        "cost": round(float(ev.get("total_cost_usd") or 0), 4),
+        "ctx": ctx, "window": window or 200000,
+    }
+
+
+def _pct(v) -> float | None:
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return round(v * 100 if v <= 1.0 else v, 1)  # fractions (0-1) or percents
+
+
+def _epoch(v) -> int | None:
+    if v in (None, ""):
+        return None
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime
+        return int(datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return None
+
+
+def note_limits(info: dict):
+    """Remember plan usage from a rate_limit_event of a running chat."""
+    for k, w in (info.get("unifiedWindows") or {}).items():
+        if isinstance(w, dict) and _pct(w.get("utilization")) is not None:
+            LIMITS[k] = {"pct": _pct(w.get("utilization")), "resets_at": _epoch(w.get("resetsAt"))}
+    k = info.get("rateLimitType")
+    if k and _pct(info.get("utilization")) is not None:
+        LIMITS[k] = {"pct": _pct(info.get("utilization")), "resets_at": _epoch(info.get("resetsAt"))}
+    if LIMITS:
+        LIMITS["_at"] = time.time()
+
+
+def _oauth_usage(token: str) -> dict:
+    """The same endpoint Claude Code's /usage reads."""
+    rq = urllib.request.Request("https://api.anthropic.com/api/oauth/usage", headers={
+        "Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-cli",
+        "Content-Type": "application/json"})
+    with urllib.request.urlopen(rq, timeout=15) as r:
+        d = json.load(r)
+    out = {}
+    for k, w in d.items():
+        if isinstance(w, dict) and _pct(w.get("utilization")) is not None and k != "extra_usage":
+            out[k] = {"pct": _pct(w["utilization"]), "resets_at": _epoch(w.get("resets_at"))}
+    ex = d.get("extra_usage")
+    if isinstance(ex, dict) and ex.get("is_enabled"):
+        out["extra_usage"] = {"pct": _pct(ex.get("utilization")) or 0, "resets_at": None,
+                              "used": ex.get("used_credits"), "limit": ex.get("monthly_limit")}
+    return out
+
+
+def _header_usage(token: str) -> dict:
+    """Fallback: a 1-token request; the reply headers carry the plan's 5-hour and weekly use."""
+    import urllib.error
+    for model in ("claude-haiku-4-5", "claude-haiku-5-5", "claude-sonnet-4-5"):
+        body = json.dumps({"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}],
+                           "system": "You are Claude Code, Anthropic's official CLI for Claude."}).encode()
+        rq = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
+            "Authorization": f"Bearer {token}", "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(rq, timeout=30) as r:
+                h = r.headers
+        except urllib.error.HTTPError as e:
+            h = e.headers
+        out = {}
+        for k, tag in (("five_hour", "5h"), ("seven_day", "7d")):
+            pct = _pct(h.get(f"anthropic-ratelimit-unified-{tag}-utilization"))
+            if pct is not None:
+                out[k] = {"pct": pct, "resets_at": _epoch(h.get(f"anthropic-ratelimit-unified-{tag}-reset"))}
+        if out:
+            return out
+    return {}
+
+
+def plan_usage(force: bool = False) -> dict:
+    if not force and USAGE_CACHE["data"] and time.time() - USAGE_CACHE["at"] < 60:
+        return USAGE_CACHE["data"]
+    token = CFG.get("claude_oauth_token") or ""
+    windows, source, err = {}, "", ""
+    if token:
+        for name, fn in (("account", _oauth_usage), ("headers", _header_usage)):
+            try:
+                windows = fn(token)
+            except Exception as exc:
+                err = scrub(exc)
+                continue
+            if windows:
+                source = name
+                break
+    if not windows and LIMITS:
+        windows, source = {k: v for k, v in LIMITS.items() if not k.startswith("_")}, "chat"
+    elif windows:
+        for k, v in LIMITS.items():  # fresher numbers seen in chats fill gaps
+            if not k.startswith("_") and k not in windows:
+                windows[k] = v
+    data = {"windows": windows, "source": source, "at": int(time.time()),
+            "error": "" if windows else (err or ("Connect Claude first" if not token else "No usage data yet"))}
+    USAGE_CACHE.update(at=time.time(), data=data)
+    return data
 
 
 # ── Claude login from the phone ──────────────────────────────────────────────
@@ -770,6 +969,8 @@ class Handler(BaseHTTPRequestHandler):
                 "settings": settings(), "save": SAVE["state"], "browser": BROWSER["state"],
                 "browser_error": BROWSER["error"], "uptime": int(time.time() - T0), "max": MAX_RUNTIME,
                 "claude": bool(CFG.get("claude_oauth_token"))})
+        if u.path == "/usage":
+            return self.send_json(plan_usage(force=q.get("fresh", [""])[0] == "1"))
         if u.path == "/notifications":
             return self.send_json({"notifications": CFG.get("notifications") or []})
         if u.path == "/mcp/status":

@@ -47,6 +47,8 @@ export const IconUsers = (p: P) => <S {...p}><circle cx="9" cy="8" r="3.5" /><pa
 export const IconMoon = (p: P) => <S {...p}><path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a7 7 0 0 0 10.5 10.5z" /></S>;
 export const IconArrowLeft = (p: P) => <S {...p}><path d="M19 12H5M11 6l-6 6 6 6" /></S>;
 export const IconFile = (p: P) => <S {...p}><path d="M6 3h8l4 4v14H6z" /><path d="M14 3v4h4" /></S>;
+export const IconDots = (p: P) => <S {...p}><circle cx="12" cy="5" r="1.3" fill="currentColor" /><circle cx="12" cy="12" r="1.3" fill="currentColor" /><circle cx="12" cy="19" r="1.3" fill="currentColor" /></S>;
+export const IconGauge = (p: P) => <S {...p}><path d="M4 18a8 8 0 1 1 16 0" /><path d="m12 18 4-6" /></S>;
 export const IconSpinner = ({ size = 16 }: P) => (
   <svg width={size} height={size} viewBox="0 0 24 24" className="spin" aria-hidden>
     <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeOpacity="0.2" strokeWidth="2.4" />

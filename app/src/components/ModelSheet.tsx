@@ -16,7 +16,7 @@ export function ModelPicker({ model, effort, onChange }: Props) {
   );
 }
 
-function ModelSheet({ model, effort, onChange, onClose }: Props & { onClose: () => void }) {
+export function ModelSheet({ model, effort, onChange, onClose }: Props & { onClose: () => void }) {
   useEffect(() => {
     const esc = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", esc);

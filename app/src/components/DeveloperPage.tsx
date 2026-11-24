@@ -21,7 +21,7 @@ export function DeveloperPage({ online, chat }: { online: boolean; chat: ReactNo
       </div>
       {tab === "chat" ? (
         <div className="dev-chat">
-          <div className="dev-note muted small">Claude can change Panda here: it works on the GitHub repo, pushes, and redeploys. Needs <code>GITHUB_TOKEN</code> (and <code>VERCEL_TOKEN</code> to publish) in Env variables.</div>
+          <div className="dev-note muted small">Claude can change Panda here and redeploy it with <code>VERCEL_TOKEN</code>. Changes are saved between runs; add <code>GITHUB_TOKEN</code> in Env variables to also push them to GitHub.</div>
           {chat}
         </div>
       ) : <div className="page dev-env"><EnvTab online={online} /></div>}

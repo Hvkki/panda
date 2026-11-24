@@ -13,7 +13,7 @@ export type Settings = {
   defaultEffort: string;
 };
 const DEFAULTS: Settings = {
-  theme: "system", textSize: "medium", width: "narrow", font: "serif", showThinking: true,
+  theme: "system", textSize: "medium", width: "narrow", font: "sans", showThinking: true,
   enterToSend: true, notifyReplies: true, defaultModel: "default", defaultEffort: "medium",
 };
 const KEY = "panda.settings.v1";
