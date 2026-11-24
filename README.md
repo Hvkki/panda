@@ -97,5 +97,5 @@ screen, settings saved to Kaggle and restored after a restart, and the Connect C
 Every page was opened at phone size with no errors. Kaggle's API answers 404 to some default client
 User-Agents, so `app/api` sends its own.
 
-Not verified: the Developer chat pushing to GitHub (needs your `GITHUB_TOKEN`), and scheduled tasks
+Not verified: the Developer chat pushing to GitHub (optional, needs your `GITHUB_TOKEN`; with only `VERCEL_TOKEN` it publishes to Vercel and keeps its changes in the Kaggle dataset), and scheduled tasks
 firing on their own timer (only "Run now" was tested; the timing logic has a local test).

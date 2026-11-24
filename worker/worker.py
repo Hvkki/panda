@@ -132,13 +132,72 @@ def tool_label(name: str, inp: dict) -> str:
 
 DEV_PROMPT = """This is Panda's Developer chat. Here you may change Panda itself.
 Panda is a web app (React, Vite, in app/) on Vercel plus this Kaggle worker (worker/worker.py), from the
-GitHub repo {repo}, branch {branch}. Work in ./panda in the current directory. If it is missing, clone it:
-  git clone https://x-access-token:$GITHUB_TOKEN@github.com/{repo}.git panda && cd panda && git checkout {branch}
-Commit and push your changes to that branch. To publish the web app (needs VERCEL_TOKEN):
-  cd panda/app && npm ci && cd .. && python3 scripts/deploy-app.py
-Worker changes take effect the next time the worker is started from the app.
+GitHub repo {repo}, branch {branch}. The repo is already checked out in ./panda: work there.
+{git}
+To publish (needs VERCEL_TOKEN): cd panda/app && npm ci && cd .. && python3 scripts/deploy-app.py
+(it builds the app first and stops if the build fails). That one deploy updates both the web app and
+worker.py (the worker downloads it from the deployment), so worker changes take effect the next time the
+worker is started. Run `python3 -m py_compile worker/worker.py` after worker edits: a broken deploy breaks
+Panda for the owner.
 Developer variables available in your environment: {names}. If one you need is missing, ask the owner to add
 it in Developer -> Env variables. Never print their values."""
+GIT_PUSH = "Commit and push your changes to that branch (GITHUB_TOKEN is set; the remote already uses it)."
+GIT_LOCAL = ("There is no GITHUB_TOKEN, so you cannot push to GitHub. Commit locally if you like; Panda saves "
+             "every change in ./panda (committed or not) to the owner's private Kaggle dataset after each turn "
+             "and restores it on the next run. Tell the owner that changes are live on Vercel but not on GitHub.")
+DEV_PATCH_MAX = 8 << 20
+
+
+def dev_repo(repo: str, branch: str, token: str) -> str:
+    """Make sure ./panda exists in the developer folder, with the saved changes re-applied. Returns a note
+    for Claude when something went wrong."""
+    d = WORKSPACE / "developer" / "panda"
+    url = f"https://x-access-token:{token}@github.com/{repo}.git" if token else f"https://github.com/{repo}.git"
+    run = lambda *a, **k: subprocess.run(a, cwd=k.get("cwd", d), capture_output=True, text=True, timeout=600)
+    if not (d / ".git").exists():
+        d.parent.mkdir(parents=True, exist_ok=True)
+        r = run("git", "clone", "--branch", branch, url, str(d), cwd=d.parent)
+        if r.returncode != 0:
+            return "Cloning the repo failed: " + scrub(r.stderr)[-300:]
+        run("git", "config", "user.name", "Panda Developer")
+        run("git", "config", "user.email", "panda@users.noreply.github.com")
+        patch = CFG.get("dev_patch") or ""
+        if patch:
+            (d.parent / "saved-changes.patch").write_text(patch)
+            r = run("git", "apply", "--3way", "--whitespace=nowarn", str(d.parent / "saved-changes.patch"))
+            if r.returncode != 0:
+                return ("Your saved changes from an earlier run did not apply cleanly to the current branch; "
+                        "they are in ../saved-changes.patch. " + scrub(r.stderr)[-300:])
+            run("git", "reset", "-q")
+    else:
+        run("git", "remote", "set-url", "origin", url)
+    return ""
+
+
+def dev_snapshot(branch: str) -> None:
+    """Save everything in ./panda that is not on GitHub's branch (commits, edits, new files) as one patch."""
+    d = WORKSPACE / "developer" / "panda"
+    if not (d / ".git").exists():
+        return
+    try:
+        subprocess.run(["git", "add", "-A"], cwd=d, capture_output=True, timeout=120)
+        r = subprocess.run(["git", "diff", "--binary", "--cached", f"origin/{branch}"], cwd=d,
+                           capture_output=True, text=True, timeout=120)
+        subprocess.run(["git", "reset", "-q"], cwd=d, capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        log("dev snapshot failed:", e)
+        return
+    if r.returncode != 0:
+        log("dev snapshot failed:", r.stderr[-200:])
+        return
+    patch = r.stdout
+    if len(patch) > DEV_PATCH_MAX:
+        log("dev changes too large to save:", len(patch))
+        return
+    if patch != (CFG.get("dev_patch") or ""):
+        with CFG_LOCK:
+            CFG["dev_patch"] = patch
+        save_soon()
 
 
 def folder_for(req: dict) -> Path:
@@ -182,8 +241,13 @@ def run_claude(req: dict, emit) -> None:
         env.update(dev_env)
         branch = dev_env.get("PANDA_BRANCH") or "claude/amazing-mccarthy-ejh4o9"
         repo = dev_env.get("PANDA_REPO") or "hvkki/panda"
-        system = DEV_PROMPT.format(repo=repo, branch=branch, names=", ".join(sorted(dev_env)) or "none yet") + (
-            "\n\n" + system if system else "")
+        token = dev_env.get("GITHUB_TOKEN", "")
+        emit({"t": "tool", "id": "dev-repo", "label": "Preparing the Panda repo"})
+        note = dev_repo(repo, branch, token)
+        emit({"t": "tool_done", "id": "dev-repo", "error": bool(note)})
+        system = DEV_PROMPT.format(repo=repo, branch=branch, git=GIT_PUSH if token else GIT_LOCAL,
+                                   names=", ".join(sorted(dev_env)) or "none yet") + (
+            f"\n\nNote: {note}" if note else "") + ("\n\n" + system if system else "")
     system = "\n\n".join(x for x in (extra_system(req), system) if x)
     if system:
         cmd += ["--append-system-prompt", system]
@@ -246,6 +310,8 @@ def run_claude(req: dict, emit) -> None:
         with RUN_LOCK:
             if RUNNING.get(chat) is p:
                 RUNNING.pop(chat, None)
+        if req.get("dev"):
+            dev_snapshot(branch)
     if not done:
         tail = " ".join(errors)[-400:] or f"claude exited with code {p.returncode}"
         emit({"t": "error", "message": tail})

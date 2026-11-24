@@ -21,7 +21,7 @@ export function DeveloperPage({ online, chat }: { online: boolean; chat: ReactNo
       </div>
       {tab === "chat" ? (
         <div className="dev-chat">
-          <div className="dev-note muted small">Claude can change Panda here: it works on the GitHub repo, pushes, and redeploys. Needs <code>GITHUB_TOKEN</code> (and <code>VERCEL_TOKEN</code> to publish) in Env variables.</div>
+          <div className="dev-note muted small">Claude can change Panda here and publish it with <code>VERCEL_TOKEN</code>. Changes are kept in your Kaggle dataset between runs. Add <code>GITHUB_TOKEN</code> too if you want them pushed to GitHub.</div>
           {chat}
         </div>
       ) : <div className="page dev-env"><EnvTab online={online} /></div>}
@@ -34,7 +34,7 @@ function EnvTab({ online }: { online: boolean }) {
   return (
     <>
       <p className="muted">Only the Developer chat sees these. They are saved in your private Kaggle dataset and kept between runs. Values are never shown again.</p>
-      <VarsEditor load={getDevEnv} save={setDevEnv} empty={<>No variables yet. Add <code>GITHUB_TOKEN</code> so Claude can push to your repo.</>} />
+      <VarsEditor load={getDevEnv} save={setDevEnv} empty={<>No variables yet. Add <code>VERCEL_TOKEN</code> so Claude can publish changes.</>} />
     </>
   );
 }
