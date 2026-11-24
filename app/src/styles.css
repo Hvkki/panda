@@ -702,3 +702,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .slash-name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em; flex: none; }
 .slash-desc { font-size: .86em; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .composer-foot { gap: 4px; }
+
+/* Long chats: let the browser skip layout and paint for messages that are off screen. Without this, every
+   streamed update re-laid out the whole Developer chat and phones lagged. */
+.chat-inner > .msg:not(:last-child) { content-visibility: auto; contain-intrinsic-size: auto 300px; }

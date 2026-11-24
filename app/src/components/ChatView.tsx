@@ -25,6 +25,24 @@ const Markdown = memo(function Markdown({ text }: { text: string }) {
   );
 });
 
+/** Split Markdown at blank lines outside code fences, so a streaming reply re-renders only its last block. */
+function blocks(text: string): string[] {
+  const out: string[] = [];
+  let cur: string[] = [], fence = "";
+  for (const line of text.split("\n")) {
+    const f = line.match(/^\s*(`{3,}|~{3,})/);
+    if (f) fence = !fence ? f[1] : line.trim().startsWith(fence) ? "" : fence;
+    if (!fence && !f && !line.trim() && cur.length) { out.push(cur.join("\n")); cur = []; continue; }
+    cur.push(line);
+  }
+  if (cur.length) out.push(cur.join("\n"));
+  return out;
+}
+
+function StreamingMarkdown({ text }: { text: string }) {
+  return <>{blocks(text).map((b, i) => <Markdown key={i} text={b} />)}</>;
+}
+
 function CodeBlock({ lang, code }: { lang: string; code: string }) {
   const [copied, setCopied] = useState(false);
   return (
@@ -139,7 +157,7 @@ const MessageView = memo(function MessageView({ m, model, onRetry }: { m: Messag
     <div className="msg assistant">
       {m.thinking && showThinking && <Thinking text={m.thinking} live={live && !m.content} />}
       <Activity m={m} live={live} />
-      {m.content && <div className="prose"><Markdown text={m.content} /></div>}
+      {m.content && <div className="prose">{live ? <StreamingMarkdown text={m.content} /> : <Markdown text={m.content} />}</div>}
       {m.status === "error" && <div className="error-note"><IconAlert size={15} /> {m.error || "Something went wrong."}</div>}
       {live ? <LiveStatus m={m} /> : (
         <div className="msg-actions">

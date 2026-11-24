@@ -54,10 +54,23 @@ function Shell({ onLogout }: { onLogout: () => void }) {
       worker.setState("on");
       upd((m) => ({ ...m, status: "streaming" }));
       let failed = false;
+      // Text arrives a few characters at a time. Re-rendering a long chat for every piece froze phones,
+      // so pieces are collected and shown at most ~8 times a second.
+      let bufText = "", bufThinking = "", timer: number | undefined;
+      const flush = () => {
+        window.clearTimeout(timer); timer = undefined;
+        if (!bufText && !bufThinking) return;
+        const t = bufText, th = bufThinking; bufText = ""; bufThinking = "";
+        upd((m) => ({ ...m, content: m.content + t, thinking: th ? (m.thinking || "") + th : m.thinking }));
+      };
       const onEvent = (e: StreamEvent) => {
+        if (e.t === "text" || e.t === "thinking") {
+          if (e.t === "text") bufText += e.d; else bufThinking += e.d;
+          if (timer === undefined) timer = window.setTimeout(flush, 120);
+          return;
+        }
+        flush();
         if (e.t === "session") patchChat(chat.id, (c) => ({ ...c, session_id: e.id }));
-        else if (e.t === "text") upd((m) => ({ ...m, content: m.content + e.d }));
-        else if (e.t === "thinking") upd((m) => ({ ...m, thinking: (m.thinking || "") + e.d }));
         else if (e.t === "tool") upd((m) => {
           const tools = m.tools || [];
           return tools.some((t) => t.id === e.id)
@@ -78,6 +91,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
         system: projectsRef.current.find((p) => p.id === chat.project_id)?.instructions || undefined,
         folder: chat.project_id, dev: chat.dev,
       }, onEvent, ctl.signal);
+      flush();
       if (!failed) upd((m) => (m.status === "streaming" ? { ...m, status: "done" } : m));
       notifyReply(chat.dev ? "Developer" : chat.title, failed);
     } catch (e) {
