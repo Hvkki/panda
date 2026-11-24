@@ -13,28 +13,33 @@ Chats live in the browser. This worker keeps only Claude Code's own session file
 the web app re-sends the conversation when a session is gone (for example after a restart).
 
 worker.json (private Kaggle dataset, attached to the notebook):
-  claude_oauth_token  required   from `claude setup-token`
+  claude_oauth_token  optional   from `claude setup-token`; the app's "Connect Claude" page can set it
   app_password        required   what you type in the app; also the API bearer token
   cloudflared_token   optional   token of a named Cloudflare tunnel (stable URL)
   endpoint_dataset    optional   "user/panda-endpoint", used with quick tunnels
   kaggle_api_token    optional   to publish the quick-tunnel URL
   kaggle_username     optional   same
+  secret_dataset      optional   "user/panda-secret"; where "Connect Claude" saves the new token
   max_runtime_secs    optional   default 39600 (11 h, Kaggle stops at 12 h)
 
 Nothing secret is printed.
 """
 from __future__ import annotations
 
+import fcntl
 import glob
 import hmac
 import json
 import mimetypes
 import os
+import pty
 import re
+import struct
 import shutil
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,7 +49,6 @@ from urllib.parse import parse_qs, urlparse
 # ── config ───────────────────────────────────────────────────────────────────
 _cfg_path = (glob.glob("/kaggle/input/**/worker.json", recursive=True) or [None])[0]
 CFG = json.load(open(_cfg_path)) if _cfg_path else json.loads(os.environ["PANDA_WORKER_CFG"])
-TOKEN = CFG["claude_oauth_token"]
 PASSWORD = CFG["app_password"]
 MAX_RUNTIME = int(CFG.get("max_runtime_secs", 11 * 3600))
 PORT = int(CFG.get("port", 8787))
@@ -59,7 +63,7 @@ MAX_UPLOAD = 100 * 1024 * 1024
 MODELS = {"default", "opus", "sonnet", "haiku"}
 EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 
-ENV = dict(os.environ, CLAUDE_CODE_OAUTH_TOKEN=TOKEN, IS_SANDBOX="1",  # root inside a disposable VM
+ENV = dict(os.environ, CLAUDE_CODE_OAUTH_TOKEN=CFG.get("claude_oauth_token", ""), IS_SANDBOX="1",  # root inside a disposable VM
            PATH=f"{BIN}:{os.environ.get('PATH', '')}")
 ENV.pop("ANTHROPIC_API_KEY", None)  # an API key would override the subscription login
 STOP = threading.Event()
@@ -67,7 +71,7 @@ STOP = threading.Event()
 
 def scrub(s) -> str:
     s = "" if s is None else str(s)
-    for secret in (TOKEN, PASSWORD, CFG.get("cloudflared_token"), CFG.get("kaggle_api_token")):
+    for secret in (CFG.get("claude_oauth_token"), PASSWORD, CFG.get("cloudflared_token"), CFG.get("kaggle_api_token")):
         if secret:
             s = s.replace(secret, "***")
     return s
@@ -207,6 +211,105 @@ def run_claude(req: dict, emit) -> None:
         emit({"t": "error", "message": tail})
 
 
+# ── Claude login from the phone ──────────────────────────────────────────────
+# Runs `claude setup-token` in a terminal on the worker. The app shows its login link; you sign in
+# on claude.ai and paste the code you get back; the printed token is saved to the secret dataset.
+ANSI = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+LOGIN: dict = {"proc": None, "fd": None, "buf": ""}
+LOGIN_LOCK = threading.Lock()
+
+
+def _login_text() -> str:
+    return ANSI.sub("", LOGIN["buf"]).replace("\r", "")
+
+
+def _login_wait(pattern: str, secs: float) -> re.Match | None:
+    end = time.time() + secs
+    while time.time() < end:
+        m = re.search(pattern, _login_text())
+        if m:
+            return m
+        p = LOGIN["proc"]
+        if p is None or p.poll() is not None:
+            return re.search(pattern, _login_text())
+        time.sleep(0.3)
+    return None
+
+
+def _login_tail() -> str:
+    lines = [l.strip() for l in _login_text().splitlines() if l.strip()]
+    return scrub(" | ".join(lines[-6:]))[-500:]
+
+
+def login_stop():
+    p, fd = LOGIN["proc"], LOGIN["fd"]
+    if p and p.poll() is None:
+        p.kill()
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    LOGIN.update(proc=None, fd=None)
+
+
+def login_start() -> dict:
+    with LOGIN_LOCK:
+        login_stop()
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 60, 1000, 0, 0))  # wide: no wrapped URL
+        env = dict(ENV, TERM="xterm-256color", COLUMNS="1000", LINES="60")
+        env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+        p = subprocess.Popen(["claude", "setup-token"], cwd=WORK, env=env, stdin=slave, stdout=slave,
+                             stderr=slave, start_new_session=True, close_fds=True)
+        os.close(slave)
+        LOGIN.update(proc=p, fd=master, buf="")
+
+        def reader():
+            while True:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                LOGIN["buf"] = (LOGIN["buf"] + chunk.decode("utf-8", "replace"))[-200000:]
+
+        threading.Thread(target=reader, daemon=True).start()
+    m = _login_wait(r"https://\S*oauth/authorize\S+", 45)
+    if not m:
+        return {"error": "Claude did not show a login link. " + _login_tail()}
+    return {"url": m.group(0)}
+
+
+def login_code(code: str) -> dict:
+    code = code.strip()
+    if not code or LOGIN["proc"] is None or LOGIN["proc"].poll() is not None:
+        return {"error": "The login expired. Tap Connect again."}
+    os.write(LOGIN["fd"], code.encode())
+    time.sleep(0.5)
+    os.write(LOGIN["fd"], b"\r")
+    m = _login_wait(r"sk-ant-oat01-[A-Za-z0-9_\-]{20,}", 90)
+    if not m:
+        tail = _login_tail()
+        login_stop()
+        return {"error": "No token came back. Check the code and try again. " + tail}
+    token = m.group(0)
+    login_stop()
+    CFG["claude_oauth_token"] = token
+    ENV["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    saved = save_config()
+    log("claude token updated", "and saved" if saved else "(not saved to the dataset)")
+    return {"ok": True, "saved": saved}
+
+
+def save_config() -> bool:
+    """Write worker.json back to the private dataset so the next run has the new token."""
+    ds = CFG.get("secret_dataset") or (CFG.get("kaggle_username") and f"{CFG['kaggle_username']}/panda-secret")
+    if not ds:
+        return False
+    return kaggle_push(ds, {"worker.json": json.dumps(CFG)}, "token from Connect Claude", private=True)
+
 # ── HTTP API ─────────────────────────────────────────────────────────────────
 FAILS = {"n": 0, "until": 0.0}
 
@@ -268,7 +371,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "unauthorized"}, 401)
         if u.path == "/status":
             return self.send_json({"ok": True, "uptime": int(time.time() - T0), "max": MAX_RUNTIME,
-                                   "busy": list(RUNNING)})
+                                   "busy": list(RUNNING), "claude": bool(CFG.get("claude_oauth_token"))})
         if u.path == "/files":
             return self.send_json({"files": list_files()})
         if u.path == "/file":
@@ -289,6 +392,10 @@ class Handler(BaseHTTPRequestHandler):
                 if p and p.poll() is None:
                     p.kill()
                 return self.send_json({"ok": True})
+            if u.path == "/login/start":
+                return self.send_json(login_start())
+            if u.path == "/login/code":
+                return self.send_json(login_code(str(json.loads(self.body() or b"{}").get("code") or "")))
             if u.path == "/upload":
                 return self.upload()
             if u.path == "/stop":
@@ -411,25 +518,37 @@ def start_tunnel() -> tuple[subprocess.Popen, str]:
     raise RuntimeError("cloudflared did not give a tunnel URL")
 
 
+def kaggle_push(ds: str, files: dict, message: str, private: bool = False) -> bool:
+    d = Path(tempfile.mkdtemp(prefix="panda-ds-"))
+    try:
+        for name, text in files.items():
+            (d / name).write_text(text)
+        meta = {"id": ds, "title": ds.split("/")[1], "licenses": [{"name": "other"}]}
+        if private:
+            meta["isPrivate"] = True
+        (d / "dataset-metadata.json").write_text(json.dumps(meta))
+        env = dict(ENV, KAGGLE_CONFIG_DIR=str(d / ".kaggle"))
+        if CFG.get("kaggle_api_token"):
+            env["KAGGLE_API_TOKEN"] = CFG["kaggle_api_token"]
+        if CFG.get("kaggle_username"):
+            env["KAGGLE_USERNAME"] = CFG["kaggle_username"]
+        r = subprocess.run(["kaggle", "datasets", "version", "-p", str(d), "-m", message],
+                           env=env, capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            log(f"dataset {ds} update failed: {(r.stderr or r.stdout)[-300:]}")
+        return r.returncode == 0
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def publish_endpoint(url: str):
     """Quick tunnels get a new URL every run: write it to the endpoint dataset for the web app."""
     ds = CFG.get("endpoint_dataset")
     if not ds or not url:
         log("endpoint not published (no endpoint_dataset):", url)
         return
-    d = Path(tempfile.mkdtemp(prefix="panda-endpoint-"))
-    (d / "endpoint.json").write_text(json.dumps({"url": url, "started_at": int(T0)}))
-    (d / "dataset-metadata.json").write_text(json.dumps(
-        {"id": ds, "title": ds.split("/")[1], "licenses": [{"name": "other"}]}))
-    env = dict(ENV, KAGGLE_CONFIG_DIR=str(d / ".kaggle"))
-    if CFG.get("kaggle_api_token"):
-        env["KAGGLE_API_TOKEN"] = CFG["kaggle_api_token"]
-    if CFG.get("kaggle_username"):
-        env["KAGGLE_USERNAME"] = CFG["kaggle_username"]
-    r = subprocess.run(["kaggle", "datasets", "version", "-p", str(d), "-m", f"endpoint {int(time.time())}"],
-                       env=env, capture_output=True, text=True, timeout=300)
-    log("endpoint published" if r.returncode == 0 else f"endpoint publish failed: {(r.stderr or r.stdout)[-300:]}")
-    shutil.rmtree(d, ignore_errors=True)
+    if kaggle_push(ds, {"endpoint.json": json.dumps({"url": url, "started_at": int(T0)})}, f"endpoint {int(time.time())}"):
+        log("endpoint published")
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -456,6 +575,7 @@ def main():
         for p in RUNNING.values():
             if p.poll() is None:
                 p.kill()
+    login_stop()
     tunnel.terminate()
     srv.shutdown()
     log("stopped")
