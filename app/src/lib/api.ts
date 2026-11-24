@@ -73,17 +73,44 @@ export type ChatRequest = {
   dev?: boolean;
 };
 
+/**
+ * Send a message and stream the reply. The worker runs the turn on its own, so when the phone drops
+ * the connection (app switched, screen off, network change) this reconnects and continues from the
+ * last event it got, for up to 15 minutes without progress.
+ */
 export async function streamChat(url: string, req: ChatRequest, onEvent: (e: StreamEvent) => void, signal: AbortSignal) {
   workerUrl = url;
-  const r = await wfetch("/chat", { method: "POST", body: JSON.stringify(req), signal, headers: { "Content-Type": "application/json" } });
-  if (r.status === 401) throw new AuthError();
-  if (!r.ok || !r.body) throw new Error(`Worker answered ${r.status}`);
-  const reader = r.body.getReader();
+  const st = { turn: "", next: 0, ended: false };
+  let r: Response | null = await wfetch("/chat", { method: "POST", body: JSON.stringify(req), signal, headers: { "Content-Type": "application/json" } });
+  let lastProgress = Date.now();
+  for (let attempt = 0; ; attempt++) {
+    try {
+      if (!r) r = await wfetch(`/chat/events?chat_id=${encodeURIComponent(req.chat_id)}&turn=${st.turn}&from=${st.next}`, { signal });
+      if (r.status === 401) throw new AuthError();
+      if (!r.ok || !r.body) throw new Error(`Worker answered ${r.status}`);
+      const before = st.next;
+      await readTurn(r.body, st, onEvent);
+      if (st.next > before) { lastProgress = Date.now(); attempt = 0; }
+      if (st.ended) return;
+    } catch (e) {
+      if (signal.aborted || e instanceof AuthError || e instanceof TurnGone || !st.turn) throw e;
+      if (Date.now() - lastProgress > 15 * 60_000) throw e;
+    }
+    r = null;
+    await waitVisible(signal);
+    await new Promise((ok) => setTimeout(ok, Math.min(1000 * 2 ** attempt, 10_000)));
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+  }
+}
+
+class TurnGone extends Error {}
+async function readTurn(body: ReadableStream<Uint8Array>, st: { turn: string; next: number; ended: boolean }, onEvent: (e: StreamEvent) => void) {
+  const reader = body.getReader();
   const dec = new TextDecoder();
   let buf = "";
   for (;;) {
     const { value, done } = await reader.read();
-    if (done) break;
+    if (done) return;
     buf += dec.decode(value, { stream: true });
     let i: number;
     while ((i = buf.indexOf("\n\n")) >= 0) {
@@ -91,9 +118,23 @@ export async function streamChat(url: string, req: ChatRequest, onEvent: (e: Str
       buf = buf.slice(i + 2);
       const line = block.split("\n").find((l) => l.startsWith("data:"));
       if (!line) continue;
-      try { onEvent(JSON.parse(line.slice(5))); } catch { /* ignore a broken frame */ }
+      let e: StreamEvent & { i?: number; id?: string };
+      try { e = JSON.parse(line.slice(5)); } catch { continue; }
+      if ((e.t as string) === "turn") { st.turn = e.id || ""; continue; }
+      if ((e.t as string) === "gone") throw new TurnGone("The worker restarted and this reply was lost. Send the message again.");
+      if (typeof e.i === "number") { if (e.i < st.next) continue; st.next = e.i + 1; }
+      if (e.t === "done" || e.t === "error") st.ended = true;
+      onEvent(e);
     }
   }
+}
+function waitVisible(signal: AbortSignal) {
+  if (!document.hidden) return Promise.resolve();
+  return new Promise<void>((ok) => {
+    const go = () => { document.removeEventListener("visibilitychange", go); signal.removeEventListener("abort", go); ok(); };
+    document.addEventListener("visibilitychange", go);
+    signal.addEventListener("abort", go);
+  });
 }
 
 export const cancelChat = (chat_id: string) =>
