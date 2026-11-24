@@ -423,7 +423,8 @@ def plan_usage(force: bool = False) -> dict:
             if not k.startswith("_") and k not in windows:
                 windows[k] = v
     data = {"windows": windows, "source": source, "at": int(time.time()),
-            "error": "" if windows else (err or ("Connect Claude first" if not token else "No usage data yet"))}
+            "error": "" if windows else ("Connect Claude first" if not token else
+                                         "Plan usage shows up after your first message in this run")}
     USAGE_CACHE.update(at=time.time(), data=data)
     return data
 
