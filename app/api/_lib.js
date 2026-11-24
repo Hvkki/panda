@@ -29,11 +29,13 @@ function send(res, status, body) {
 }
 
 const timeout = (ms) => AbortSignal.timeout(ms);
+// Kaggle answers 404 to some default client User-Agents, so always send our own.
+const UA = "panda-app/1.0";
 
 async function kaggleRpc(service, method, body) {
   const r = await fetch(`https://api.kaggle.com/v1/${service}/${method}`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${env("KAGGLE_API_TOKEN")}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Bearer ${env("KAGGLE_API_TOKEN")}`, "Content-Type": "application/json", "User-Agent": UA },
     body: JSON.stringify(body),
     signal: timeout(25000),
   });
@@ -47,14 +49,10 @@ async function workerUrl() {
   const ds = env("ENDPOINT_DATASET");
   if (!ds) return "";
   const [owner, slug] = ds.split("/");
-  const headers = { Authorization: `Bearer ${env("KAGGLE_API_TOKEN")}` };
+  const headers = { Authorization: `Bearer ${env("KAGGLE_API_TOKEN")}`, "User-Agent": UA };
   const tries = [
-    () => fetch(`https://www.kaggle.com/api/v1/datasets/download/${owner}/${slug}/endpoint.json?t=${Date.now()}`,
+    () => fetch(`https://www.kaggle.com/api/v1/datasets/download/${owner}/${slug}/endpoint.json`,
       { headers, redirect: "follow", signal: timeout(15000) }),
-    () => fetch("https://api.kaggle.com/v1/datasets.DatasetApiService/DownloadDatasetRaw", {
-      method: "POST", headers: { ...headers, "Content-Type": "application/json" },
-      body: JSON.stringify({ ownerSlug: owner, datasetSlug: slug, fileName: "endpoint.json" }),
-      redirect: "follow", signal: timeout(15000) }),
   ];
   for (const t of tries) {
     try {

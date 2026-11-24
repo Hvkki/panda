@@ -156,6 +156,7 @@ def run_claude(req: dict, emit) -> None:
     p.stdin.write(prompt)
     p.stdin.close()
     seen_tools: set = set()
+    sent_session = ""
     done = False
     try:
         for line in p.stdout:
@@ -164,8 +165,9 @@ def run_claude(req: dict, emit) -> None:
             except ValueError:
                 continue
             kind = ev.get("type")
-            if kind == "system" and ev.get("session_id"):
-                emit({"t": "session", "id": ev["session_id"]})
+            if kind == "system" and ev.get("session_id") and ev["session_id"] != sent_session:
+                sent_session = ev["session_id"]
+                emit({"t": "session", "id": sent_session})
             elif kind == "stream_event":
                 e = ev.get("event") or {}
                 if e.get("type") == "content_block_delta":

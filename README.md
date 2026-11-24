@@ -66,9 +66,14 @@ Kaggle ── notebook "panda-worker" ── worker.py ── claude -p (stream-
 Run `claude setup-token` again, export the new `CLAUDE_CODE_OAUTH_TOKEN`, and run
 `python3 scripts/setup-kaggle.py`. Stop and Start the worker.
 
-## Not verified
+## Verified on Kaggle (24 Nov 2026)
 
-The worker's HTTP API and the Vercel function were exercised against stand-ins for `claude` and
-`cloudflared`. These have not been run against the real services yet: the Claude Code install on
-Kaggle, the Kaggle calls in `app/api` (`SaveKernel`, `GetKernelSessionStatus`, and the endpoint
-dataset download), and a Vercel deployment. Check them on the first real Start.
+Run with a placeholder Claude token: Start through `SaveKernel`, the worker installing the real
+`claude` CLI and `cloudflared`, the quick-tunnel URL published to the endpoint dataset, the Vercel
+function finding it (status "on"), the chat stream through the tunnel, Stop, and the kernel
+finishing. Claude answered "401 OAuth access token is invalid", which is the expected reply to a fake
+token.
+
+Not verified: a real reply with your real `setup-token` token, the deployed Vercel site, and the
+browser UI against a live worker. Kaggle's API answers 404 to some default client User-Agents, so
+`app/api` sends its own.
