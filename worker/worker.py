@@ -118,6 +118,19 @@ def install():
 
 # ── Claude Code runner ───────────────────────────────────────────────────────
 RUNNING: dict[str, subprocess.Popen] = {}   # chat id -> live claude process
+LIVE: dict[str, dict] = {}   # chat id -> idle claude process kept for the next message
+LIVE_MAX = 4                 # idle processes kept at once (each holds ~200 MB)
+LIVE_IDLE = 50 * 60          # Claude Code's prompt cache lasts 1 hour; after that a restart costs nothing extra
+
+
+def trim_live() -> None:
+    """Stop kept processes that idled too long or exceed LIVE_MAX (oldest first). Call with RUN_LOCK held."""
+    now = time.time()
+    for chat, l in sorted(LIVE.items(), key=lambda kv: kv[1]["at"]):
+        if now - l["at"] > LIVE_IDLE or len(LIVE) > LIVE_MAX or l["p"].poll() is not None:
+            if l["p"].poll() is None:
+                l["p"].kill()
+            LIVE.pop(chat, None)
 RUN_LOCK = threading.Lock()
 TURNS: dict = {}   # chat_id -> the latest turn's buffered events, so a dropped stream can resume
 
@@ -263,17 +276,45 @@ def run_claude(req: dict, emit) -> None:
     if system:
         cmd += ["--append-system-prompt", system]
     t0 = time.time()
-    p = subprocess.Popen(cmd, cwd=folder_for(req), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True, bufsize=1)
+    cwd = folder_for(req)
+    # Keep one Claude process per chat between messages, like a normal Claude Code session. Starting a new
+    # process with --resume for every message makes Claude Code rebuild the request, and part of the chat
+    # is no longer a cache hit, so it gets written to the cache again (the expensive part of plan usage).
+    keep = not req.get("scheduled") and not prompt.startswith("/")
+    key = json.dumps([model, effort, system, str(cwd), sorted(env.items())])
     with RUN_LOCK:
         old = RUNNING.get(chat)
         if old and old.poll() is None:
             old.kill()
+        live = LIVE.pop(chat, None)
+    p = None
+    if live and keep and live["p"].poll() is None and live["key"] == key and sid and live["sid"] == sid:
+        p, errors = live["p"], live["errors"]
+        errors.clear()
+    elif live and live["p"].poll() is None:
+        live["p"].kill()
+    try:
+        if p is None:
+            if keep:
+                cmd += ["--input-format", "stream-json"]
+            p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True, bufsize=1)
+            errors = []
+            threading.Thread(target=lambda: errors.extend(scrub(l) for l in p.stderr), daemon=True).start()
+        if keep:
+            p.stdin.write(json.dumps({"type": "user", "session_id": sid, "parent_tool_use_id": None,
+                                      "message": {"role": "user", "content": prompt}}) + "\n")
+            p.stdin.flush()
+        else:
+            p.stdin.write(prompt)
+            p.stdin.close()
+    except (OSError, ValueError) as exc:  # the kept process died between messages
+        if p is not None and p.poll() is None:
+            p.kill()
+        emit({"t": "error", "message": "Claude stopped unexpectedly, send the message again. " + scrub(exc)})
+        return
+    with RUN_LOCK:
         RUNNING[chat] = p
-    errors: list[str] = []
-    threading.Thread(target=lambda: errors.extend(scrub(l) for l in p.stderr), daemon=True).start()
-    p.stdin.write(prompt)
-    p.stdin.close()
     seen_tools: set = set()
     sent_session = ""
     done = False
@@ -324,13 +365,19 @@ def run_claude(req: dict, emit) -> None:
                 emit({"t": "done", "session_id": ev.get("session_id"), "text": ev.get("result") or "",
                       "error": bool(ev.get("is_error")), "secs": round(time.time() - t0, 1),
                       "usage": turn_usage(ev, ctx), "turns": ev.get("num_turns")})
-        p.wait(timeout=30)
+                if keep:
+                    break
+        if not keep:
+            p.wait(timeout=30)
     finally:
-        if p.poll() is None:
-            p.kill()
         with RUN_LOCK:
             if RUNNING.get(chat) is p:
                 RUNNING.pop(chat, None)
+            if keep and done and p.poll() is None and sent_session:
+                LIVE[chat] = {"p": p, "key": key, "sid": sent_session, "errors": errors, "at": time.time()}
+                trim_live()
+            elif p.poll() is None:
+                p.kill()
         if req.get("dev"):
             dev_snapshot(branch)
     if not done:
@@ -387,20 +434,31 @@ USAGE_CACHE: dict = {"at": 0.0, "data": None}
 WINDOW_KEYS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_oauth_apps")
 
 
+SESSION_TOT: dict = {}   # session id -> Claude Code's running totals at the end of the previous turn
+
+
 def turn_usage(ev: dict, ctx: int) -> dict:
-    """Token totals for one turn, from Claude Code's result event."""
+    """Token totals for one turn. Claude Code's result event reports totals for the whole session so far
+    (also after --resume), so this subtracts what the session had already used."""
     u = ev.get("usage") or {}
     mu = ev.get("modelUsage") or {}
     window = max([int(m.get("contextWindow") or 0) for m in mu.values() if isinstance(m, dict)] or [0])
     tot = lambda k: sum(int(m.get(k) or 0) for m in mu.values() if isinstance(m, dict))
-    return {
+    now = {
         "input": tot("inputTokens") or int(u.get("input_tokens") or 0),
         "output": tot("outputTokens") or int(u.get("output_tokens") or 0),
         "cache_read": tot("cacheReadInputTokens") or int(u.get("cache_read_input_tokens") or 0),
         "cache_write": tot("cacheCreationInputTokens") or int(u.get("cache_creation_input_tokens") or 0),
-        "cost": round(float(ev.get("total_cost_usd") or 0), 4),
-        "ctx": ctx, "window": window or 1000000,
+        "cost": float(ev.get("total_cost_usd") or 0),
     }
+    sid = str(ev.get("session_id") or "")
+    prev = SESSION_TOT.get(sid) or {}
+    SESSION_TOT[sid] = now
+    if any(now[k] < prev.get(k, 0) for k in now):  # counters restarted (e.g. after /compact)
+        prev = {}
+    out = {k: now[k] - prev.get(k, 0) for k in now}
+    out["cost"] = round(out["cost"], 4)
+    return {**out, "ctx": ctx, "window": window or 1000000}
 
 
 def _pct(v) -> float | None:
@@ -1348,9 +1406,11 @@ def main():
         if tunnel.poll() is not None:
             log("tunnel exited, stopping")
             break
+        with RUN_LOCK:
+            trim_live()
         STOP.wait(5)
     with RUN_LOCK:
-        for p in RUNNING.values():
+        for p in list(RUNNING.values()) + [l["p"] for l in LIVE.values()]:
             if p.poll() is None:
                 p.kill()
     login_stop()
