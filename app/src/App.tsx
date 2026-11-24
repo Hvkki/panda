@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AuthError, cancelChat, ensureWorker, getPassword, setPassword, streamChat, type StreamEvent } from "./lib/api";
-import { uid, useChats, type Chat, type Message } from "./lib/store";
+import { uid, useChats, useProjects, type Chat, type Message } from "./lib/store";
 import { Login } from "./components/Login";
-import { Sidebar } from "./components/Sidebar";
+import { Sidebar, type View } from "./components/Sidebar";
+import { ProjectsPage } from "./components/ProjectsPage";
+import { DeveloperPage } from "./components/DeveloperPage";
 import { ChatView } from "./components/ChatView";
 import { Composer } from "./components/Composer";
 import { SessionChip, useWorker } from "./components/SessionChip";
@@ -25,9 +27,13 @@ export default function App() {
 
 function Shell({ onLogout }: { onLogout: () => void }) {
   const { chats, add, remove, patchChat, patchMessage } = useChats();
+  const { projects, addProject, patchProject, removeProject } = useProjects();
+  const projectsRef = useRef(projects);
+  useEffect(() => { projectsRef.current = projects; }, [projects]);
+  const [projectId, setProjectId] = useState<string | null>(null);
   const worker = useWorker(onLogout);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [view, setView] = useState<"chat" | "files">("chat");
+  const [view, setView] = useState<View>("chat");
   const [sideOpen, setSideOpen] = useState(() => window.innerWidth > 900);
   const [draft, setDraft] = useState({ model: "default", effort: "medium" });
   const aborts = useRef(new Map<string, AbortController>());
@@ -65,6 +71,8 @@ function Shell({ onLogout }: { onLogout: () => void }) {
       await streamChat(url, {
         chat_id: chat.id, message: text, model: chat.model, effort: chat.effort, session_id: chat.session_id,
         history: history.filter((m) => m.content).map((m) => ({ role: m.role, content: m.content })),
+        system: projectsRef.current.find((p) => p.id === chat.project_id)?.instructions || undefined,
+        folder: chat.project_id, dev: chat.dev,
       }, onEvent, ctl.signal);
       if (!failed) upd((m) => (m.status === "streaming" ? { ...m, status: "done" } : m));
     } catch (e) {
@@ -84,10 +92,10 @@ function Shell({ onLogout }: { onLogout: () => void }) {
     runTurn(chat, body, history);
   }, [patchChat, runTurn]);
 
-  const startChat = (text: string, attached: string[]) => {
+  const startChat = (text: string, attached: string[], project_id?: string) => {
     const title = text.replace(/\s+/g, " ").slice(0, 48) + (text.length > 48 ? "…" : "");
     const chat: Chat = { id: uid(), title: title || "New chat", model: draft.model, effort: draft.effort, pinned: false,
-      created: Date.now(), updated: Date.now(), messages: [] };
+      created: Date.now(), updated: Date.now(), messages: [], project_id };
     add(chat);
     setActiveId(chat.id);
     setView("chat");
@@ -113,13 +121,21 @@ function Shell({ onLogout }: { onLogout: () => void }) {
     patchChat(active.id, (c) => ({ ...c, model, effort }));
   };
 
+  // The Developer chat: one per browser, created the first time the tab is opened.
+  const devChat = chats.find((c) => c.dev) || null;
+  useEffect(() => {
+    if (view === "developer" && !devChat) add({ id: uid(), title: "Developer", model: "default", effort: "high", pinned: false,
+      created: Date.now(), updated: Date.now(), messages: [], dev: true });
+  }, [view, devChat, add]);
+  const activeProject = active?.project_id ? projects.find((p) => p.id === active.project_id) : undefined;
+
   const closeSideOnMobile = () => { if (window.innerWidth <= 900) setSideOpen(false); };
   const online = worker.state === "on";
 
   return (
     <div className={`app ${sideOpen ? "side-open" : ""}`}>
       {sideOpen && <div className="side-scrim" onClick={() => setSideOpen(false)} />}
-      <Sidebar chats={chats} activeId={view === "chat" ? activeId : null} view={view} onGo={(v) => { setView(v); closeSideOnMobile(); }}
+      <Sidebar chats={chats} activeId={view === "chat" ? activeId : null} view={view} onGo={(v) => { setView(v); if (v === "projects") setProjectId(null); closeSideOnMobile(); }}
         onNew={() => { setActiveId(null); setView("chat"); closeSideOnMobile(); }}
         onOpen={(id) => { setActiveId(id); setView("chat"); closeSideOnMobile(); }}
         onRename={(id, title) => patchChat(id, (c) => ({ ...c, title }))}
@@ -129,13 +145,28 @@ function Shell({ onLogout }: { onLogout: () => void }) {
       <main className="main">
         <header className="topbar">
           <button className="icon-btn" onClick={() => setSideOpen((v) => !v)} aria-label="Sidebar"><IconSidebar /></button>
-          <div className="topbar-title">{view === "chat" ? active?.title || "" : ""}</div>
+          <div className="topbar-title">
+            {view === "chat" && activeProject && <button className="crumb" onClick={() => { setProjectId(activeProject.id); setView("projects"); }}>{activeProject.name} / </button>}
+            {view === "chat" ? active?.title || "" : ""}
+          </div>
           <SessionChip worker={worker} />
           {(active || view !== "chat") && (
             <button className="icon-btn" onClick={() => { setActiveId(null); setView("chat"); }} aria-label="New chat"><IconPlus /></button>
           )}
         </header>
-        {view === "files" ? <FilesPage online={online} /> : active ? (
+        {view === "files" ? <FilesPage online={online} /> : view === "projects" ? (
+          <ProjectsPage projects={projects} chats={chats} openId={projectId} online={online} draft={draft}
+            onDraft={(model, effort) => setDraft({ model, effort })} onOpenProject={setProjectId}
+            onOpenChat={(id) => { setActiveId(id); setView("chat"); }}
+            onStartChat={(text, attached, pid) => startChat(text, attached, pid)}
+            onAdd={addProject} onPatch={patchProject} onRemove={removeProject} />
+        ) : view === "developer" ? (
+          <DeveloperPage online={online} chat={devChat && (
+            <ChatView key={devChat.id} chat={devChat} canAttach={online}
+              onModel={(model, effort) => patchChat(devChat.id, (c) => ({ ...c, model, effort }))}
+              onSend={(t, a) => send(devChat, t, a)} onRetry={() => retry(devChat)} onStop={() => stop(devChat)} />
+          )} />
+        ) : active ? (
           <ChatView key={active.id} chat={active} onModel={setModel} canAttach={online}
             onSend={(t, a) => send(active, t, a)} onRetry={() => retry(active)} onStop={() => stop(active)} />
         ) : (

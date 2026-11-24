@@ -3,7 +3,9 @@ import { API_BASE } from "./config";
 // ── password (the only credential the browser holds) ────────────────────────
 const PW_KEY = "panda.password";
 export const getPassword = () => { try { return localStorage.getItem(PW_KEY) || ""; } catch { return ""; } };
-export const setPassword = (v: string) => { try { v ? localStorage.setItem(PW_KEY, v) : localStorage.removeItem(PW_KEY); } catch { /* private mode */ } };
+export const setPassword = (v: string) => {
+  try { if (v) localStorage.setItem(PW_KEY, v); else localStorage.removeItem(PW_KEY); } catch { /* private mode */ }
+};
 
 export type WorkerState = { state: "on" | "starting" | "off"; url?: string; uptime?: number; note?: string };
 let workerUrl = "";
@@ -59,6 +61,12 @@ export type StreamEvent =
 export type ChatRequest = {
   chat_id: string; message: string; model: string; effort: string; session_id?: string;
   history: { role: string; content: string }[];
+  /** Project instructions (added to Claude's system prompt). */
+  system?: string;
+  /** Project id: the chat runs in its own folder on the worker. */
+  folder?: string;
+  /** The Developer chat: may change Panda; sees the developer variables. */
+  dev?: boolean;
 };
 
 export async function streamChat(url: string, req: ChatRequest, onEvent: (e: StreamEvent) => void, signal: AbortSignal) {
@@ -104,9 +112,26 @@ export async function downloadFile(path: string) {
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
-export async function uploadFile(f: File): Promise<string> {
-  const r = await wfetch("/upload", { method: "POST", body: f, headers: { "X-File-Name": f.name } });
+export type UploadTarget = { folder?: string; dev?: boolean };
+export async function uploadFile(f: File, target: UploadTarget = {}): Promise<string> {
+  const headers: Record<string, string> = { "X-File-Name": f.name };
+  if (target.folder) headers["X-Folder"] = target.folder;
+  if (target.dev) headers["X-Dev"] = "1";
+  const r = await wfetch("/upload", { method: "POST", body: f, headers });
   if (!r.ok) throw new Error(`Upload failed (${r.status})`);
   return (await r.json()).path;
 }
+// ── developer variables (stored in the private Kaggle dataset by the worker) ──
+export async function getDevEnv(): Promise<string[]> {
+  const r = await wfetch("/devenv");
+  if (!r.ok) throw new Error(`Worker answered ${r.status}`);
+  return (await r.json()).names;
+}
+export async function setDevEnv(set: Record<string, string | null>): Promise<{ names: string[]; saved: boolean }> {
+  const r = await wfetch("/devenv", { method: "POST", body: JSON.stringify({ set }), headers: { "Content-Type": "application/json" } });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || d.error) throw new Error(d.error || `Worker answered ${r.status}`);
+  return d;
+}
+
 export const workerOnline = () => !!workerUrl;

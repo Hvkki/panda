@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { ModelPicker } from "./ModelSheet";
 import { IconPlus, IconSend, IconStop, IconX } from "./Icons";
-import { uploadFile } from "../lib/api";
+import { uploadFile, type UploadTarget } from "../lib/api";
 
 type Props = {
   model: string;
@@ -14,9 +14,12 @@ type Props = {
   autoFocus?: boolean;
   /** Attaching needs the worker to be online. */
   canAttach: boolean;
+  /** Where attachments go on the worker (a project's or the Developer folder). */
+  target?: UploadTarget;
+  placeholder?: string;
 };
 
-export function Composer({ model, effort, onModel, onSend, onStop, busy, autoFocus, canAttach }: Props) {
+export function Composer({ model, effort, onModel, onSend, onStop, busy, autoFocus, canAttach, target, placeholder }: Props) {
   const [text, setText] = useState("");
   const [files, setFiles] = useState<{ name: string; path?: string; error?: string }[]>([]);
   const input = useRef<HTMLInputElement>(null);
@@ -26,7 +29,7 @@ export function Composer({ model, effort, onModel, onSend, onStop, busy, autoFoc
     for (const f of Array.from(list || []).slice(0, 10)) {
       setFiles((p) => [...p, { name: f.name }]);
       try {
-        const path = await uploadFile(f);
+        const path = await uploadFile(f, target);
         setFiles((p) => p.map((x) => (x.name === f.name && !x.path ? { ...x, path } : x)));
       } catch (e) {
         setFiles((p) => p.map((x) => (x.name === f.name && !x.path ? { ...x, error: (e as Error).message } : x)));
@@ -56,7 +59,7 @@ export function Composer({ model, effort, onModel, onSend, onStop, busy, autoFoc
           ))}
         </div>
       )}
-      <textarea ref={area} rows={1} autoFocus={autoFocus} value={text} placeholder="Ask anything"
+      <textarea ref={area} rows={1} autoFocus={autoFocus} value={text} placeholder={placeholder || "Ask anything"}
         onChange={(e) => {
           setText(e.target.value);
           e.target.style.height = "auto";

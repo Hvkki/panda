@@ -1,13 +1,15 @@
 import { useState } from "react";
 import type { Chat } from "../lib/store";
 import { Wordmark } from "./Logo";
-import { IconEdit, IconGear, IconGrid, IconPin, IconPlus, IconTrash } from "./Icons";
+import { IconCode, IconEdit, IconFolder, IconGear, IconGrid, IconPin, IconPlus, IconTrash } from "./Icons";
+
+export type View = "chat" | "files" | "projects" | "developer";
 
 type Props = {
   chats: Chat[];
   activeId: string | null;
-  view: "chat" | "files";
-  onGo: (v: "chat" | "files") => void;
+  view: View;
+  onGo: (v: View) => void;
   onNew: () => void;
   onOpen: (id: string) => void;
   onRename: (id: string, title: string) => void;
@@ -18,12 +20,14 @@ type Props = {
 
 export function Sidebar(p: Props) {
   const [menu, setMenu] = useState<string | null>(null);
-  const sorted = [...p.chats].sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updated - a.updated);
+  const sorted = p.chats.filter((c) => !c.dev).sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updated - a.updated);
   return (
     <aside className="sidebar">
       <div className="side-top"><Wordmark /></div>
       <nav className="side-nav">
         <button onClick={p.onNew}><IconPlus /> New chat</button>
+        <button className={p.view === "projects" ? "active" : ""} onClick={() => p.onGo("projects")}><IconFolder /> Projects</button>
+        <button className={p.view === "developer" ? "active" : ""} onClick={() => p.onGo("developer")}><IconCode /> Developer</button>
         <button className={p.view === "files" ? "active" : ""} onClick={() => p.onGo("files")}><IconGrid /> Files</button>
       </nav>
       <div className="side-list">

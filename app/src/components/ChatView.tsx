@@ -140,7 +140,8 @@ export function ChatView({ chat, onModel, onSend, onRetry, onStop, canAttach }: 
       </div>
       <div className="chat-bottom">
         <Composer model={chat.model} effort={chat.effort} onModel={onModel} onSend={onSend} onStop={onStop}
-          busy={busy} autoFocus canAttach={canAttach} />
+          busy={busy} autoFocus canAttach={canAttach} target={{ folder: chat.project_id, dev: chat.dev }}
+          placeholder={chat.dev ? "Tell Claude what to change in Panda" : undefined} />
       </div>
     </div>
   );

@@ -14,7 +14,13 @@ export type Message = {
 export type Chat = {
   id: string; title: string; model: string; effort: string; pinned: boolean;
   session_id?: string; created: number; updated: number; messages: Message[];
+  /** Set when the chat belongs to a project. */
+  project_id?: string;
+  /** The single Developer chat. */
+  dev?: boolean;
 };
+
+export type Project = { id: string; name: string; instructions: string; created: number; updated: number };
 
 // Chats live in this browser only (no database). Clearing site data clears them.
 const KEY = "panda.chats.v1";
@@ -41,4 +47,26 @@ export function useChats() {
   const add = useCallback((c: Chat) => setChats((prev) => [c, ...prev]), []);
   const remove = useCallback((id: string) => setChats((prev) => prev.filter((c) => c.id !== id)), []);
   return { chats, add, remove, patchChat, patchMessage };
+}
+
+// Projects live in this browser too.
+const PKEY = "panda.projects.v1";
+const loadProjects = (): Project[] => {
+  try { return JSON.parse(localStorage.getItem(PKEY) || "[]"); } catch { return []; }
+};
+
+export function useProjects() {
+  const [projects, setProjects] = useState<Project[]>(loadProjects);
+  useEffect(() => {
+    try { localStorage.setItem(PKEY, JSON.stringify(projects)); } catch { /* storage full or blocked */ }
+  }, [projects]);
+  const addProject = useCallback((name: string) => {
+    const p: Project = { id: uid(), name, instructions: "", created: Date.now(), updated: Date.now() };
+    setProjects((prev) => [p, ...prev]);
+    return p;
+  }, []);
+  const patchProject = useCallback((id: string, patch: Partial<Project>) =>
+    setProjects((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch, updated: Date.now() } : p))), []);
+  const removeProject = useCallback((id: string) => setProjects((prev) => prev.filter((p) => p.id !== id)), []);
+  return { projects, addProject, patchProject, removeProject };
 }

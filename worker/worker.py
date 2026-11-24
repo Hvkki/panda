@@ -19,6 +19,7 @@ worker.json (private Kaggle dataset, attached to the notebook):
   endpoint_dataset    optional   "user/panda-endpoint", used with quick tunnels
   kaggle_api_token    optional   to publish the quick-tunnel URL
   kaggle_username     optional   same
+  dev_env             optional   {"NAME": "value"} only the Developer chat sees (set in the app)
   secret_dataset      optional   "user/panda-secret"; where "Connect Claude" saves the new token
   max_runtime_secs    optional   default 39600 (11 h, Kaggle stops at 12 h)
 
@@ -71,7 +72,8 @@ STOP = threading.Event()
 
 def scrub(s) -> str:
     s = "" if s is None else str(s)
-    for secret in (CFG.get("claude_oauth_token"), PASSWORD, CFG.get("cloudflared_token"), CFG.get("kaggle_api_token")):
+    for secret in (CFG.get("claude_oauth_token"), PASSWORD, CFG.get("cloudflared_token"), CFG.get("kaggle_api_token"),
+                   *(CFG.get("dev_env") or {}).values()):
         if secret:
             s = s.replace(secret, "***")
     return s
@@ -126,6 +128,28 @@ def tool_label(name: str, inp: dict) -> str:
     return f"{name}: {str(detail).strip().splitlines()[0][:140]}" if detail else name
 
 
+DEV_PROMPT = """This is Panda's Developer chat. Here you may change Panda itself.
+Panda is a web app (React, Vite, in app/) on Vercel plus this Kaggle worker (worker/worker.py), from the
+GitHub repo {repo}, branch {branch}. Work in ./panda in the current directory. If it is missing, clone it:
+  git clone https://x-access-token:$GITHUB_TOKEN@github.com/{repo}.git panda && cd panda && git checkout {branch}
+Commit and push your changes to that branch. To publish the web app (needs VERCEL_TOKEN):
+  cd panda/app && npm ci && cd .. && python3 scripts/deploy-app.py
+Worker changes take effect the next time the worker is started from the app.
+Developer variables available in your environment: {names}. If one you need is missing, ask the owner to add
+it in Developer -> Env variables. Never print their values."""
+
+
+def folder_for(req: dict) -> Path:
+    if req.get("dev"):
+        name = "developer"
+    else:
+        name = re.sub(r"[^A-Za-z0-9_-]", "", str(req.get("folder") or ""))[:64]
+        name = f"projects/{name}" if name else ""
+    d = WORKSPACE / name if name else WORKSPACE
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def run_claude(req: dict, emit) -> None:
     """Run one turn. emit(event: dict) is called for every piece of progress."""
     chat = str(req.get("chat_id") or "chat")
@@ -147,8 +171,19 @@ def run_claude(req: dict, emit) -> None:
         cmd += ["--model", model]
     if sid:
         cmd += ["--resume", sid]
+    system = str(req.get("system") or "")[:20000]
+    env = ENV
+    if req.get("dev"):
+        dev_env = CFG.get("dev_env") or {}
+        env = dict(ENV, **dev_env)
+        branch = dev_env.get("PANDA_BRANCH") or "claude/amazing-mccarthy-ejh4o9"
+        repo = dev_env.get("PANDA_REPO") or "hvkki/panda"
+        system = DEV_PROMPT.format(repo=repo, branch=branch, names=", ".join(sorted(dev_env)) or "none yet") + (
+            "\n\n" + system if system else "")
+    if system:
+        cmd += ["--append-system-prompt", system]
     t0 = time.time()
-    p = subprocess.Popen(cmd, cwd=WORKSPACE, env=ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+    p = subprocess.Popen(cmd, cwd=folder_for(req), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True, bufsize=1)
     with RUN_LOCK:
         old = RUNNING.get(chat)
@@ -303,6 +338,19 @@ def login_code(code: str) -> dict:
     return {"ok": True, "saved": saved}
 
 
+def set_dev_env(changes: dict) -> dict:
+    env = dict(CFG.get("dev_env") or {})
+    for name, value in changes.items():
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", str(name)):
+            return {"error": f"Bad name: {name}. Use CAPITALS, digits and _."}
+        if value is None or value == "":
+            env.pop(name, None)
+        else:
+            env[name] = str(value)
+    CFG["dev_env"] = env
+    return {"names": sorted(env), "saved": save_config()}
+
+
 def save_config() -> bool:
     """Write worker.json back to the private dataset so the next run has the new token."""
     ds = CFG.get("secret_dataset") or (CFG.get("kaggle_username") and f"{CFG['kaggle_username']}/panda-secret")
@@ -324,7 +372,7 @@ class Handler(BaseHTTPRequestHandler):
     # helpers
     def cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "authorization, content-type, x-file-name")
+        self.send_header("Access-Control-Allow-Headers", "authorization, content-type, x-file-name, x-folder, x-dev")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Max-Age", "86400")
 
@@ -372,6 +420,8 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/status":
             return self.send_json({"ok": True, "uptime": int(time.time() - T0), "max": MAX_RUNTIME,
                                    "busy": list(RUNNING), "claude": bool(CFG.get("claude_oauth_token"))})
+        if u.path == "/devenv":
+            return self.send_json({"names": sorted(CFG.get("dev_env") or {})})
         if u.path == "/files":
             return self.send_json({"files": list_files()})
         if u.path == "/file":
@@ -396,6 +446,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(login_start())
             if u.path == "/login/code":
                 return self.send_json(login_code(str(json.loads(self.body() or b"{}").get("code") or "")))
+            if u.path == "/devenv":
+                return self.send_json(set_dev_env(json.loads(self.body() or b"{}").get("set") or {}))
             if u.path == "/upload":
                 return self.upload()
             if u.path == "/stop":
@@ -451,13 +503,14 @@ class Handler(BaseHTTPRequestHandler):
     def upload(self):
         name = os.path.basename(self.headers.get("X-File-Name") or "upload.bin") or "upload.bin"
         data = self.body(MAX_UPLOAD)
-        dest = WORKSPACE / "uploads"
-        dest.mkdir(exist_ok=True)
+        base = folder_for({"folder": self.headers.get("X-Folder") or "", "dev": self.headers.get("X-Dev") == "1"})
+        dest = base / "uploads"
+        dest.mkdir(parents=True, exist_ok=True)
         target = dest / name
         if target.exists():
             target = dest / f"{int(time.time())}-{name}"
         target.write_bytes(data)
-        self.send_json({"path": str(target.relative_to(WORKSPACE)), "size": len(data)})
+        self.send_json({"path": str(target.relative_to(base)), "size": len(data)})
 
     def send_file(self, rel: str):
         target = (WORKSPACE / rel).resolve()
