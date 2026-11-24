@@ -401,37 +401,13 @@ def _oauth_usage(token: str) -> dict:
     return out
 
 
-def _header_usage(token: str) -> dict:
-    """Fallback: a 1-token request; the reply headers carry the plan's 5-hour and weekly use."""
-    import urllib.error
-    for model in ("claude-haiku-4-5", "claude-haiku-5-5", "claude-sonnet-4-5"):
-        body = json.dumps({"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}],
-                           "system": "You are Claude Code, Anthropic's official CLI for Claude."}).encode()
-        rq = urllib.request.Request("https://api.anthropic.com/v1/messages", data=body, headers={
-            "Authorization": f"Bearer {token}", "anthropic-version": "2023-06-01",
-            "anthropic-beta": "oauth-2025-04-20", "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(rq, timeout=30) as r:
-                h = r.headers
-        except urllib.error.HTTPError as e:
-            h = e.headers
-        out = {}
-        for k, tag in (("five_hour", "5h"), ("seven_day", "7d")):
-            pct = _pct(h.get(f"anthropic-ratelimit-unified-{tag}-utilization"))
-            if pct is not None:
-                out[k] = {"pct": pct, "resets_at": _epoch(h.get(f"anthropic-ratelimit-unified-{tag}-reset"))}
-        if out:
-            return out
-    return {}
-
-
 def plan_usage(force: bool = False) -> dict:
     if not force and USAGE_CACHE["data"] and time.time() - USAGE_CACHE["at"] < 60:
         return USAGE_CACHE["data"]
     token = CFG.get("claude_oauth_token") or ""
     windows, source, err = {}, "", ""
     if token:
-        for name, fn in (("account", _oauth_usage), ("headers", _header_usage)):
+        for name, fn in (("account", _oauth_usage),):
             try:
                 windows = fn(token)
             except Exception as exc:
