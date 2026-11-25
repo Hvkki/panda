@@ -7,8 +7,8 @@ Reads a KEY=value file with sections ("# ── Developer …", "# ── Chat �
 Supabase setup) and sends them to the worker:
   * Developer section → Developer → Env variables (only the Developer chat sees them)
   * Chat section      → API keys every chat can use
-  * GITHUB_TOKEN      → Settings → GitHub (git and gh signed in for every chat). When the file has two
-                        different GitHub tokens, the one that reaches the most private repos wins.
+  * GITHUB_TOKEN      → Settings → GitHub (git and gh signed in for every chat), unless the token already
+                        on the worker reaches private repos: then that one is kept.
 Asks for the app password (not echoed). Start the worker in the app first.
 """
 import getpass
@@ -52,23 +52,27 @@ def main():
         sys.exit("The worker is not online. Press Start in the app, wait until it says Online, then run this again.")
     w = st["url"].rstrip("/")
 
-    gh = {v for v in (tokens["dev"].get("GITHUB_TOKEN"), tokens["chat"].get("GITHUB_TOKEN")) if v}
-    dev = {k: v for k, v in tokens["dev"].items() if k not in SKIP_DEV}
+    file_gh = tokens["dev"].get("GITHUB_TOKEN") or tokens["chat"].get("GITHUB_TOKEN")
+    # GitHub is handled below, so a token already on the worker isn't replaced by an older one.
+    dev = {k: v for k, v in tokens["dev"].items() if k not in SKIP_DEV and k != "GITHUB_TOKEN"}
+    chat = {k: v for k, v in tokens["chat"].items() if k != "GITHUB_TOKEN"}
     print("Developer variables:", len(call(w, pw, "/devenv", {"set": dev}).get("names", [])), "saved")
-    print("Chat API keys:", len(call(w, pw, "/env", {"set": tokens["chat"]}).get("names", [])), "saved")
+    print("Chat API keys:", len(call(w, pw, "/env", {"set": chat}).get("names", [])), "saved")
 
-    best = None
-    for t in gh:
-        chk = call(w, pw, "/github", {"token": t})
-        print(f"GitHub token …{t[-4:]}: {chk.get('login')} · {chk.get('repos')} repos, {chk.get('private')} private")
-        if chk.get("connected") and (best is None or chk.get("private", 0) > best[1].get("private", 0)):
-            best = (t, chk)
-    if best:
-        chk = call(w, pw, "/github", {"token": best[0]})
-        print(f"Using …{best[0][-4:]} for GitHub.")
-        for h in chk.get("hints") or []:
-            print("  !", h)
-
+    now = call(w, pw, "/github", {"recheck": True})
+    if now.get("connected"):
+        print(f"GitHub token on the worker: {now.get('login')} · {now.get('repos')} repos, {now.get('private')} private")
+    if file_gh and not (now.get("connected") and now.get("private")):
+        chk = call(w, pw, "/github", {"token": file_gh})
+        if chk.get("error") or not chk.get("connected"):
+            print("GitHub token from the file was refused:", chk.get("error"))
+        else:
+            print(f"Switched to the file's GitHub token: {chk.get('login')} · {chk.get('repos')} repos, {chk.get('private')} private")
+            now = chk
+    elif now.get("connected"):
+        print("Kept the worker's GitHub token (it already reaches private repos).")
+    for h in now.get("hints") or []:
+        print("  !", h)
 
 if __name__ == "__main__":
     main()
