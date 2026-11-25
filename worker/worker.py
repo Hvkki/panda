@@ -1434,7 +1434,7 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/delete":
                 return self.delete_file(str(json.loads(self.body() or b"{}").get("path") or ""))
             if u.path in ("/skills", "/mcp", "/memory", "/settings", "/schedules", "/schedules/run",
-                          "/notifications/clear", "/browser/act"):
+                          "/notifications/clear", "/browser/act", "/github", "/browser/cookies"):
                 return self.send_json(self.change(u.path, json.loads(self.body(4 << 20) or b"{}")))
             if u.path == "/upload":
                 return self.upload()
