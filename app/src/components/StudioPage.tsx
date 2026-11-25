@@ -39,6 +39,7 @@ ring.data.materials.append(rm)
 `;
 
 function Viewer({ url }: { url: string }) {
+  const [loadErr, setLoadErr] = useState("");
   const host = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const el = host.current;
@@ -75,7 +76,7 @@ function Viewer({ url }: { url: string }) {
       camera.position.copy(c).add(new THREE.Vector3(1, 0.7, 1).normalize().multiplyScalar(r * 2.6));
       camera.near = r / 100; camera.far = r * 100;
       camera.updateProjectionMatrix();
-    }, undefined, () => {});
+    }, undefined, () => { if (!dead) setLoadErr("Could not load the 3D model."); });
     const loop = () => { raf = requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); };
     loop();
     return () => {
@@ -90,10 +91,11 @@ function Viewer({ url }: { url: string }) {
         (Array.isArray(mat) ? mat : mat ? [mat] : []).forEach((x) => x.dispose());
       });
       renderer.dispose();
+      renderer.forceContextLoss();
       renderer.domElement.remove();
     };
   }, [url]);
-  return <div ref={host} className="studio-viewer" />;
+  return <><div ref={host} className="studio-viewer" />{loadErr && <p className="studio-err">{loadErr}</p>}</>;
 }
 
 /** Write a Blender script, render it on the worker, and look at the picture or turn the model around. */
@@ -111,10 +113,12 @@ export function StudioPage({ online }: { online: boolean }) {
   const [tab, setTab] = useState<"render" | "model">("render");
   const [imgUrl, setImgUrl] = useState("");
   const [modelUrl, setModelUrl] = useState("");
+  const alive = useRef(true);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
 
   useEffect(() => { try { localStorage.setItem(KEY, script); } catch { /* blocked */ } }, [script]);
 
-  const refresh = useCallback(() => blenderStatus().then(setStatus).catch((e) => setErr(e.message)), []);
+  const refresh = useCallback(() => blenderStatus().then(setStatus).catch((e) => setErr(e instanceof Error ? e.message : String(e))), []);
   useEffect(() => { if (online) refresh(); }, [online, refresh]);
   useEffect(() => {
     if (!status?.installing) return;
@@ -133,13 +137,13 @@ export function StudioPage({ online }: { online: boolean }) {
   useEffect(() => {
     let dead = false, url = "";
     if (!job?.image) { setImgUrl(""); return; }
-    fetchWorkFile(job.image).then((b) => { if (dead) return; url = URL.createObjectURL(b); setImgUrl(url); }).catch((e) => setErr(e.message));
+    fetchWorkFile(job.image).then((b) => { if (dead) return; url = URL.createObjectURL(b); setImgUrl(url); }).catch((e) => setErr(e instanceof Error ? e.message : String(e)));
     return () => { dead = true; if (url) URL.revokeObjectURL(url); };
   }, [job?.image]);
   useEffect(() => {
     let dead = false, url = "";
     if (!job?.model) { setModelUrl(""); return; }
-    fetchWorkFile(job.model).then((b) => { if (dead) return; url = URL.createObjectURL(b); setModelUrl(url); }).catch((e) => setErr(e.message));
+    fetchWorkFile(job.model).then((b) => { if (dead) return; url = URL.createObjectURL(b); setModelUrl(url); }).catch((e) => setErr(e instanceof Error ? e.message : String(e)));
     return () => { dead = true; if (url) URL.revokeObjectURL(url); };
   }, [job?.model]);
 
@@ -152,14 +156,16 @@ export function StudioPage({ online }: { online: boolean }) {
     setErr(""); setBusy(true); setSecs(0); setJob(null);
     try {
       const { id } = await blenderRender({ script, name, width: w, height: h, samples });
-      for (;;) {
+      for (let n = 0; alive.current; n++) {
+        if (n > 700) throw new Error("The render is taking too long.");
         await new Promise((r) => setTimeout(r, 2000));
+        if (!alive.current) return;
         const j = await blenderJob(id);
         setJob(j);
         if (j.state !== "running") { if (j.state === "error") setErr(j.error || "Render failed"); else setTab("render"); break; }
       }
-    } catch (e) { setErr((e as Error).message); }
-    setBusy(false);
+    } catch (e) { if (alive.current) setErr(e instanceof Error ? e.message : String(e)); }
+    if (alive.current) setBusy(false);
   };
 
   if (!online) return <div className="studio"><StartNote what="the 3D studio" /></div>;
