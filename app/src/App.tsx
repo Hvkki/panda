@@ -29,7 +29,7 @@ export default function App() {
 }
 
 const PLACE_KEY = "panda.place.v1";
-const VIEWS: View[] = ["chat", "files", "projects", "developer", "customize"];
+const VIEWS: View[] = ["chat", "files", "projects", "developer", "studio", "customize"];
 function lastPlace(): { view: View; activeId: string | null; projectId: string | null } {
   try {
     const p = JSON.parse(localStorage.getItem(PLACE_KEY) || "{}");
