@@ -51,6 +51,7 @@ const wfetch = (path: string, init: RequestInit = {}) => {
 // ── chat stream ─────────────────────────────────────────────────────────────
 export type StreamEvent =
   | { t: "session"; id: string }
+  | { t: "turn"; id: string }
   | { t: "text"; d: string }
   | { t: "thinking"; d: string }
   | { t: "tool"; id: string; label: string }
@@ -80,12 +81,26 @@ export type ChatRequest = {
  */
 export async function streamChat(url: string, req: ChatRequest, onEvent: (e: StreamEvent) => void, signal: AbortSignal) {
   workerUrl = url;
-  const st = { turn: "", next: 0, ended: false };
-  let r: Response | null = await wfetch("/chat", { method: "POST", body: JSON.stringify(req), signal, headers: { "Content-Type": "application/json" } });
+  const r = await wfetch("/chat", { method: "POST", body: JSON.stringify(req), signal, headers: { "Content-Type": "application/json" } });
+  return followTurn(req.chat_id, r, onEvent, signal);
+}
+
+/**
+ * Pick up the reply the worker is running (or ran) for a chat, from the first event. Used after the
+ * page was reloaded mid-reply, which phones do when they reclaim memory from a background tab.
+ */
+export async function resumeChat(url: string, chat_id: string, turn: string, onEvent: (e: StreamEvent) => void, signal: AbortSignal) {
+  workerUrl = url;
+  return followTurn(chat_id, null, onEvent, signal, turn);
+}
+
+async function followTurn(chat_id: string, first: Response | null, onEvent: (e: StreamEvent) => void, signal: AbortSignal, turn = "") {
+  const st = { turn, next: 0, ended: false };
+  let r: Response | null = first;
   let lastProgress = Date.now();
   for (let attempt = 0; ; attempt++) {
     try {
-      if (!r) r = await wfetch(`/chat/events?chat_id=${encodeURIComponent(req.chat_id)}&turn=${st.turn}&from=${st.next}`, { signal });
+      if (!r) r = await wfetch(`/chat/events?chat_id=${encodeURIComponent(chat_id)}&turn=${st.turn}&from=${st.next}`, { signal });
       if (r.status === 401) throw new AuthError();
       if (!r.ok || !r.body) throw new Error(`Worker answered ${r.status}`);
       const before = st.next;
@@ -103,7 +118,7 @@ export async function streamChat(url: string, req: ChatRequest, onEvent: (e: Str
   }
 }
 
-class TurnGone extends Error {}
+export class TurnGone extends Error {}
 async function readTurn(body: ReadableStream<Uint8Array>, st: { turn: string; next: number; ended: boolean }, onEvent: (e: StreamEvent) => void) {
   const reader = body.getReader();
   const dec = new TextDecoder();
@@ -120,7 +135,7 @@ async function readTurn(body: ReadableStream<Uint8Array>, st: { turn: string; ne
       if (!line) continue;
       let e: StreamEvent & { i?: number; id?: string };
       try { e = JSON.parse(line.slice(5)); } catch { continue; }
-      if ((e.t as string) === "turn") { st.turn = e.id || ""; continue; }
+      if (e.t === "turn") { st.turn = e.id || ""; onEvent(e); continue; }
       if ((e.t as string) === "gone") throw new TurnGone("The worker restarted and this reply was lost. Send the message again.");
       if (typeof e.i === "number") { if (e.i < st.next) continue; st.next = e.i + 1; }
       if (e.t === "done" || e.t === "error") st.ended = true;
@@ -167,7 +182,7 @@ export async function uploadFile(f: File, target: UploadTarget = {}): Promise<st
   return (await r.json()).path;
 }
 // ── developer variables (stored in the private Kaggle dataset by the worker) ──
-export const getDevEnv = () => wjson<{ names: string[] }>("/devenv").then((d) => d.names);
+export const getDevEnv = () => wjson<{ names: string[] }>("/devenv").then((d) => d.names || []);
 export const setDevEnv = (set: Record<string, string | null>) => wjson<{ names: string[] }>("/devenv", { set });
 
 export const workerOnline = () => !!workerUrl;
@@ -199,7 +214,7 @@ export const change = <T = { ok: boolean }>(path: string, body: unknown) => wjso
 export type PlanWindow = { pct: number; resets_at: number | null; used?: number; limit?: number };
 export type PlanUsage = { windows: Record<string, PlanWindow>; source: string; at: number; error: string };
 export const getUsage = (fresh = false) => wjson<PlanUsage>(`/usage${fresh ? "?fresh=1" : ""}`);
-export const getNotes = () => wjson<{ notifications: Note[] }>("/notifications").then((d) => d.notifications);
+export const getNotes = () => wjson<{ notifications: Note[] }>("/notifications").then((d) => (Array.isArray(d.notifications) ? d.notifications : []));
 export const mcpStatus = () => wjson<{ text: string }>("/mcp/status").then((d) => d.text);
 export const setEnv = (set: Record<string, string | null>) => wjson<{ names: string[] }>("/env", { set });
 export const deleteFile = (path: string) => wjson("/delete", { path });

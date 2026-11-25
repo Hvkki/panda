@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AuthError, cancelChat, ensureWorker, getPassword, setPassword, streamChat, type Note, type StreamEvent } from "./lib/api";
+import { AuthError, TurnGone, cancelChat, ensureWorker, getPassword, resumeChat, sessionAction, setPassword, streamChat, type Note, type StreamEvent } from "./lib/api";
 import { applySettings, getSettings } from "./lib/settings";
 import { CustomizePage } from "./components/CustomizePage";
 import { BrowserPanel } from "./components/BrowserPanel";
@@ -42,6 +42,45 @@ function Shell({ onLogout }: { onLogout: () => void }) {
   const aborts = useRef(new Map<string, AbortController>());
   const active = chats.find((c) => c.id === activeId) || null;
 
+  /** Handle a reply's stream events: write them into the assistant message `replyId`. */
+  const handlers = useCallback((chat: Chat, replyId: string) => {
+    const upd = (fn: (m: Message) => Message) => patchMessage(chat.id, replyId, fn);
+    const h = { failed: false, flush: () => {}, onEvent: (_e: StreamEvent) => {} };
+    // Text arrives a few characters at a time. Re-rendering a long chat for every piece froze phones,
+    // so pieces are collected and shown at most ~8 times a second.
+    let bufText = "", bufThinking = "", timer: number | undefined;
+    h.flush = () => {
+      window.clearTimeout(timer); timer = undefined;
+      if (!bufText && !bufThinking) return;
+      const t = bufText, th = bufThinking; bufText = ""; bufThinking = "";
+      upd((m) => ({ ...m, content: m.content + t, thinking: th ? (m.thinking || "") + th : m.thinking }));
+    };
+    h.onEvent = (e: StreamEvent) => {
+      if (e.t === "text" || e.t === "thinking") {
+        if (e.t === "text") bufText += e.d; else bufThinking += e.d;
+        if (timer === undefined) timer = window.setTimeout(h.flush, 120);
+        return;
+      }
+      h.flush();
+      if (e.t === "session") patchChat(chat.id, (c) => ({ ...c, session_id: e.id }));
+      else if (e.t === "turn") upd((m) => (m.turn === e.id ? m : { ...m, turn: e.id }));
+      else if (e.t === "tool") upd((m) => {
+        const tools = m.tools || [];
+        return tools.some((t) => t.id === e.id)
+          ? { ...m, tools: tools.map((t) => (t.id === e.id ? { ...t, label: e.label } : t)) }
+          : { ...m, tools: [...tools, { id: e.id, label: e.label, done: false }] };
+      });
+      else if (e.t === "tool_done") upd((m) => ({ ...m, tools: (m.tools || []).map((t) => (t.id === e.id ? { ...t, done: true, error: e.error } : t)) }));
+      else if (e.t === "limits") window.dispatchEvent(new Event("panda:limits"));
+      else if (e.t === "done") {
+        if (e.session_id) patchChat(chat.id, (c) => ({ ...c, session_id: e.session_id }));
+        if (e.error) h.failed = true;
+        upd((m) => ({ ...m, content: e.text || m.content, secs: e.secs, usage: e.usage, status: e.error ? "error" : "done", error: e.error ? e.text : undefined }));
+      } else if (e.t === "error") { h.failed = true; upd((m) => ({ ...m, status: "error", error: e.message })); }
+    };
+    return h;
+  }, [patchChat, patchMessage]);
+
   /** Run one turn: make sure the worker is up, stream Claude Code's reply into the assistant message. */
   const runTurn = useCallback(async (chat: Chat, text: string, history: Message[]) => {
     const reply: Message = { id: uid(), role: "assistant", content: "", status: "waiting", tools: [] };
@@ -53,55 +92,58 @@ function Shell({ onLogout }: { onLogout: () => void }) {
       const url = await ensureWorker((s) => worker.setState(s), ctl.signal);
       worker.setState("on");
       upd((m) => ({ ...m, status: "streaming" }));
-      let failed = false;
-      // Text arrives a few characters at a time. Re-rendering a long chat for every piece froze phones,
-      // so pieces are collected and shown at most ~8 times a second.
-      let bufText = "", bufThinking = "", timer: number | undefined;
-      const flush = () => {
-        window.clearTimeout(timer); timer = undefined;
-        if (!bufText && !bufThinking) return;
-        const t = bufText, th = bufThinking; bufText = ""; bufThinking = "";
-        upd((m) => ({ ...m, content: m.content + t, thinking: th ? (m.thinking || "") + th : m.thinking }));
-      };
-      const onEvent = (e: StreamEvent) => {
-        if (e.t === "text" || e.t === "thinking") {
-          if (e.t === "text") bufText += e.d; else bufThinking += e.d;
-          if (timer === undefined) timer = window.setTimeout(flush, 120);
-          return;
-        }
-        flush();
-        if (e.t === "session") patchChat(chat.id, (c) => ({ ...c, session_id: e.id }));
-        else if (e.t === "tool") upd((m) => {
-          const tools = m.tools || [];
-          return tools.some((t) => t.id === e.id)
-            ? { ...m, tools: tools.map((t) => (t.id === e.id ? { ...t, label: e.label } : t)) }
-            : { ...m, tools: [...tools, { id: e.id, label: e.label, done: false }] };
-        });
-        else if (e.t === "tool_done") upd((m) => ({ ...m, tools: (m.tools || []).map((t) => (t.id === e.id ? { ...t, done: true, error: e.error } : t)) }));
-        else if (e.t === "limits") window.dispatchEvent(new Event("panda:limits"));
-        else if (e.t === "done") {
-          if (e.session_id) patchChat(chat.id, (c) => ({ ...c, session_id: e.session_id }));
-          if (e.error) failed = true;
-          upd((m) => ({ ...m, content: e.text || m.content, secs: e.secs, usage: e.usage, status: e.error ? "error" : "done", error: e.error ? e.text : undefined }));
-        } else if (e.t === "error") { failed = true; upd((m) => ({ ...m, status: "error", error: e.message })); }
-      };
+      const h = handlers(chat, reply.id);
       await streamChat(url, {
         chat_id: chat.id, message: text, model: chat.model, effort: chat.effort, session_id: chat.session_id,
         history: history.filter((m) => m.content).map((m) => ({ role: m.role, content: m.content })),
         system: projectsRef.current.find((p) => p.id === chat.project_id)?.instructions || undefined,
         folder: chat.project_id, dev: chat.dev,
-      }, onEvent, ctl.signal);
-      flush();
-      if (!failed) upd((m) => (m.status === "streaming" ? { ...m, status: "done" } : m));
-      notifyReply(chat.dev ? "Developer" : chat.title, failed);
+      }, h.onEvent, ctl.signal);
+      h.flush();
+      if (!h.failed) upd((m) => (m.status === "streaming" ? { ...m, status: "done" } : m));
+      notifyReply(chat.dev ? "Developer" : chat.title, h.failed);
     } catch (e) {
       if (e instanceof AuthError) return onLogout();
       const stopped = ctl.signal.aborted;
       upd((m) => ({ ...m, status: stopped ? "done" : "error", error: stopped ? undefined : (e as Error).message }));
     } finally {
-      aborts.current.delete(chat.id);
+      if (aborts.current.get(chat.id) === ctl) aborts.current.delete(chat.id);
     }
-  }, [patchChat, patchMessage, worker, onLogout]);
+  }, [patchChat, patchMessage, worker, onLogout, handlers]);
+
+  // A reply still marked as running when the page loads was cut off by a reload (phones reload
+  // background tabs to save memory). The worker kept running it: pick it up from the start.
+  const resumed = useRef(false);
+  useEffect(() => {
+    if (resumed.current) return;
+    resumed.current = true;
+    for (const chat of chats) {
+      const m = chat.messages[chat.messages.length - 1];
+      if (m?.role !== "assistant" || (m.status !== "streaming" && m.status !== "waiting")) continue;
+      const upd = (fn: (x: Message) => Message) => patchMessage(chat.id, m.id, fn);
+      const ctl = new AbortController();
+      aborts.current.set(chat.id, ctl);
+      (async () => {
+        try {
+          if (!m.turn) throw new TurnGone();
+          const s = await sessionAction("status");
+          if (s.state !== "on" || !s.url) throw new Error("The worker stopped before this reply finished. Send the message again.");
+          upd((x) => ({ ...x, content: "", thinking: undefined, tools: [], status: "streaming", turn: m.turn }));
+          const h = handlers(chat, m.id);
+          await resumeChat(s.url, chat.id, m.turn, h.onEvent, ctl.signal);
+          h.flush();
+          if (!h.failed) upd((x) => (x.status === "streaming" ? { ...x, status: "done" } : x));
+        } catch (e) {
+          if (e instanceof AuthError) return;
+          const stopped = ctl.signal.aborted;
+          const msg = e instanceof TurnGone ? "This reply was interrupted. Send the message again." : (e as Error).message;
+          upd((x) => ({ ...x, status: stopped ? "done" : "error", error: stopped ? undefined : msg }));
+        } finally {
+          if (aborts.current.get(chat.id) === ctl) aborts.current.delete(chat.id);
+        }
+      })();
+    }
+  }, [chats, handlers, patchMessage]);
 
   const send = useCallback((chat: Chat, text: string, attached: string[]) => {
     if (getSettings().notifyReplies && typeof Notification !== "undefined" && Notification.permission === "default") Notification.requestPermission().catch(() => {});
@@ -134,9 +176,13 @@ function Shell({ onLogout }: { onLogout: () => void }) {
     setView("chat");
   };
 
+  /** Stop always ends the reply on screen, even if its stream was already lost (e.g. after a reload). */
   const stop = (chat: Chat) => {
     aborts.current.get(chat.id)?.abort();
+    aborts.current.delete(chat.id);
     cancelChat(chat.id);
+    patchChat(chat.id, (c) => ({ ...c, messages: c.messages.map((m) =>
+      m.role === "assistant" && (m.status === "streaming" || m.status === "waiting") ? { ...m, status: "done" } : m) }));
   };
 
   const retry = (chat: Chat) => {

@@ -315,6 +315,8 @@ def run_claude(req: dict, emit) -> None:
         return
     with RUN_LOCK:
         RUNNING[chat] = p
+        if (req.get("_turn") or {}).get("cancel"):  # Stop was pressed before Claude started
+            p.kill()
     seen_tools: set = set()
     sent_session = ""
     done = False
@@ -380,7 +382,9 @@ def run_claude(req: dict, emit) -> None:
                 p.kill()
         if req.get("dev"):
             dev_snapshot(branch)
-    if not done:
+    if not done and (req.get("_turn") or {}).get("cancel"):
+        emit({"t": "error", "message": "Stopped."})
+    elif not done:
         tail = " ".join(errors)[-400:] or f"claude exited with code {p.returncode}"
         emit({"t": "error", "message": tail})
 
@@ -1117,6 +1121,9 @@ class Handler(BaseHTTPRequestHandler):
                 chat = str(json.loads(self.body() or b"{}").get("chat_id"))
                 with RUN_LOCK:
                     p = RUNNING.get(chat)
+                    turn = TURNS.get(chat)
+                    if turn and not turn["done"]:
+                        turn["cancel"] = True  # Claude may not have started yet (e.g. preparing the repo)
                 if p and p.poll() is None:
                     p.kill()
                 return self.send_json({"ok": True})
@@ -1229,6 +1236,8 @@ class Handler(BaseHTTPRequestHandler):
             with turn["cond"]:
                 turn["events"].append(ev)
                 turn["cond"].notify_all()
+
+        req["_turn"] = turn
 
         def work():
             try:
