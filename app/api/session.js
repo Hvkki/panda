@@ -77,6 +77,19 @@ module.exports = async (req, res) => {
     return out.ok ? send(res, 200, { state: "starting", kernel: free }) : send(res, 502, { error: out.error });
   }
 
+  if (action === "runs") {
+    // Diagnostics: each notebook's Kaggle status and the end of its log.
+    const out = await Promise.all(kernels().map(async (k) => {
+      const [userName, kernelSlug] = k.split("/");
+      const st = await kaggleRpc("kernels.KernelsApiService", "GetKernelSessionStatus", { userName, kernelSlug });
+      const lg = await kaggleRpc("kernels.KernelsApiService", "ListKernelSessionOutput", { userName, kernelSlug });
+      let lines = [];
+      try { lines = JSON.parse(lg.data.log || "[]").map((l) => String(l.data || "").trimEnd()).join("").split("\n"); } catch { /* no log yet */ }
+      return { kernel: k, status: st.data.status, failure: st.data.failureMessage || "", log: lines.slice(-25) };
+    }));
+    return send(res, 200, { runs: out });
+  }
+
   if (action !== "start") return send(res, 400, { error: "unknown action" });
   if (beat) return send(res, 200, { state: "on", url, uptime: beat.uptime, note: "already running" });
   if ((await running()).length) return send(res, 200, { state: "starting", note: "already starting" });

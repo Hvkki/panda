@@ -124,6 +124,8 @@ async function followTurn(chat_id: string, first: Response | null, onEvent: (e: 
       if (Date.now() - lastProgress > 15 * 60_000) throw e;
     }
     r = null;
+    // The worker may have moved to a new address (new tunnel, or a relay to a fresh run): look it up.
+    if (attempt > 0) await sessionAction("status").catch(() => null);
     await waitVisible(signal);
     await new Promise((ok) => setTimeout(ok, Math.min(1000 * 2 ** attempt, 10_000)));
     if (signal.aborted) throw new DOMException("Aborted", "AbortError");

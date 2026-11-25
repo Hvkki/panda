@@ -1395,23 +1395,32 @@ def start_tunnel() -> tuple[subprocess.Popen, str]:
                              env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log("named tunnel started (url is configured in Cloudflare)")
         return p, ""
-    p = subprocess.Popen(["cloudflared", "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{PORT}"],
-                         env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    found: list = []
+    # Cloudflare sometimes refuses a new quick tunnel for a while (rate limit): retry with growing waits.
+    tail: list = []
+    for wait in (0, 15, 30, 60, 120, 180):
+        time.sleep(wait)
+        p = subprocess.Popen(["cloudflared", "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{PORT}"],
+                             env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        found: list = []
 
-    def reader():
-        for line in p.stdout:
-            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
-            if m and not found:
-                found.append(m.group(0))
+        def reader(p=p, found=found):
+            for line in p.stdout:
+                tail.append(line.strip())
+                del tail[:-5]
+                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+                if m and not found:
+                    found.append(m.group(0))
 
-    threading.Thread(target=reader, daemon=True).start()
-    for _ in range(90):
-        if found:
-            return p, found[0]
-        if p.poll() is not None:
-            break
-        time.sleep(1)
+        threading.Thread(target=reader, daemon=True).start()
+        for _ in range(90):
+            if found:
+                return p, found[0]
+            if p.poll() is not None:
+                break
+            time.sleep(1)
+        if p.poll() is None:
+            p.kill()
+        log("cloudflared gave no tunnel URL, retrying:", " | ".join(tail)[-300:])
     raise RuntimeError("cloudflared did not give a tunnel URL")
 
 
@@ -1649,9 +1658,17 @@ def main():
         if age > MAX_RUNTIME + (RELAY_GRACE if HANDOFF["state"] else 0):
             log("time limit reached, stopping")
             break
-        if tunnel.poll() is not None:
-            log("tunnel exited, stopping")
-            break
+        if tunnel.poll() is not None:  # reconnect instead of stopping; the app finds the new URL
+            log("tunnel exited, opening a new one")
+            try:
+                tunnel, url = start_tunnel()
+            except RuntimeError as exc:
+                log("no new tunnel, stopping:", exc)
+                break
+            if url:
+                HANDOFF["url"] = url
+                wait_reachable(url)
+                threading.Thread(target=publish_endpoint, args=(url,), daemon=True).start()
         with RUN_LOCK:
             trim_live()
         STOP.wait(5)
