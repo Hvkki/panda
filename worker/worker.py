@@ -1104,12 +1104,77 @@ def start_browser():
                 break
             time.sleep(1)
         sh("npx -y @playwright/mcp@latest --help >/dev/null", timeout=600)  # warm the npx cache
+        restore_cookies()
         BROWSER["state"] = "ready"
         log("browser ready")
+        threading.Thread(target=keep_cookies, daemon=True).start()
     except Exception as exc:
         BROWSER.update(state="error", error=scrub(exc)[:300])
         log("browser failed:", exc)
 
+
+
+# Logins survive fresh runs: the browser's cookies are kept in the private dataset (browser_cookies) and
+# put back when the browser starts. A Playwright storage-state file can be imported too (Settings).
+COOKIE_FIELDS = ("name", "value", "domain", "path", "secure", "httpOnly", "sameSite", "expires")
+
+
+def _clean_cookie(c: dict) -> dict | None:
+    if not c.get("name") or "domain" not in c:
+        return None
+    out = {k: c[k] for k in COOKIE_FIELDS if k in c and c[k] is not None}
+    if out.get("sameSite") not in ("Strict", "Lax", "None"):
+        out.pop("sameSite", None)
+    if not isinstance(out.get("expires"), (int, float)) or out["expires"] <= 0:
+        out.pop("expires", None)  # session cookie
+    return out
+
+
+def restore_cookies() -> int:
+    cookies = [c for c in (_clean_cookie(x) for x in CFG.get("browser_cookies") or [] if isinstance(x, dict)) if c]
+    if not cookies or cdp_pages() is None:
+        return 0
+    try:
+        cdp("", [("Storage.setCookies", {"cookies": cookies})], browser=True)
+        log(f"browser logins restored ({len(cookies)} cookies)")
+        return len(cookies)
+    except Exception as exc:
+        log("restoring browser cookies failed:", scrub(exc))
+        return 0
+
+
+def save_cookies() -> int:
+    try:
+        got = cdp("", [("Storage.getCookies", {})], browser=True)[0].get("cookies") or []
+    except Exception:
+        return 0
+    cookies = [c for c in (_clean_cookie(x) for x in got) if c]
+    if cookies and cookies != CFG.get("browser_cookies"):
+        with CFG_LOCK:
+            CFG["browser_cookies"] = cookies
+        save_soon()
+    return len(cookies)
+
+
+def keep_cookies():
+    while BROWSER.get("proc") and BROWSER["proc"].poll() is None:
+        time.sleep(300)
+        save_cookies()
+
+
+def import_cookies(state) -> dict:
+    """Take cookies from a Playwright storage state ({"cookies": [...]}) or a plain list."""
+    raw = state.get("cookies") if isinstance(state, dict) else state
+    if not isinstance(raw, list):
+        return {"error": "Expected a storage-state JSON with a cookies list."}
+    cookies = [c for c in (_clean_cookie(x) for x in raw if isinstance(x, dict)) if c]
+    with CFG_LOCK:
+        have = {(c["name"], c["domain"], c.get("path", "/")): c for c in CFG.get("browser_cookies") or [] if isinstance(c, dict) and "domain" in c}
+        for c in cookies:
+            have[(c["name"], c["domain"], c.get("path", "/"))] = c
+        CFG["browser_cookies"] = list(have.values())
+    save_soon()
+    return {"ok": True, "imported": len(cookies), "restored": restore_cookies()}
 
 def cdp_pages():
     try:
@@ -1399,6 +1464,8 @@ class Handler(BaseHTTPRequestHandler):
                 save_soon()
                 return {"schedules": CFG["schedules"]}
             return upsert_schedule(b.get("schedule") or {})
+        if path == "/browser/cookies":
+            return import_cookies(b.get("state"))
         if path == "/github":
             token = str(b.get("token") or "").strip()
             if token and not re.fullmatch(r"[A-Za-z0-9_]{20,255}", token):
