@@ -241,8 +241,8 @@ def folder_for(req: dict) -> Path:
 
 
 def run_claude(req: dict, emit) -> None:
-    RESTORED.wait(15 * 60)  # a relayed run first takes over the old run's files and sessions
     """Run one turn. emit(event: dict) is called for every piece of progress."""
+    RESTORED.wait(15 * 60)  # a relayed run first takes over the old run's files and sessions
     chat = str(req.get("chat_id") or "chat")
     model = str(req.get("model") or "")
     model = model if model in MODELS or MODEL_ID.match(model) else "default"
@@ -303,14 +303,15 @@ def run_claude(req: dict, emit) -> None:
         live["p"].kill()
     try:
         if p is None:
-            if keep:
-                cmd += ["--input-format", "stream-json"]
+            if keep:  # replay: Claude Code acknowledges each message, so its reply can be told apart
+                cmd += ["--input-format", "stream-json", "--replay-user-messages"]
             p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True, bufsize=1)
             errors = []
             threading.Thread(target=lambda: errors.extend(scrub(l) for l in p.stderr), daemon=True).start()
+        msg_id = str(uuid.uuid4())
         if keep:
-            p.stdin.write(json.dumps({"type": "user", "session_id": sid, "parent_tool_use_id": None,
+            p.stdin.write(json.dumps({"type": "user", "uuid": msg_id, "session_id": sid, "parent_tool_use_id": None,
                                       "message": {"role": "user", "content": prompt}}) + "\n")
             p.stdin.flush()
         else:
@@ -329,6 +330,10 @@ def run_claude(req: dict, emit) -> None:
     sent_session = ""
     done = False
     ctx = 0  # tokens in the context window after the latest API call
+    # A kept process can also answer things other than this message: a background command finishing
+    # between messages makes Claude Code run an extra turn of its own. Skip output until Claude Code
+    # says it started on this message (--replay-user-messages makes it say so).
+    mine = not keep
     try:
         for line in p.stdout:
             try:
@@ -336,6 +341,12 @@ def run_claude(req: dict, emit) -> None:
             except ValueError:
                 continue
             kind = ev.get("type")
+            if kind == "command_lifecycle" or (kind == "user" and ev.get("isReplay")):
+                if (ev.get("command_uuid") or ev.get("uuid")) == msg_id and ev.get("state", "started") == "started":
+                    mine = True
+                continue
+            if not mine:
+                continue
             if kind == "system" and ev.get("subtype") == "init":
                 note_commands(bool(req.get("dev")), ev)
             if kind == "system" and ev.get("session_id") and ev["session_id"] != sent_session:
@@ -1537,6 +1548,20 @@ def handoff_done(ok: bool) -> dict:
     return {"ok": True}
 
 
+def wait_reachable(url: str, secs: int = 180) -> bool:
+    """A new quick-tunnel name takes a little while to resolve. Don't hand the URL to anyone before it
+    works: a phone or Vercel that looks it up too early caches "no such host" for minutes."""
+    end = time.time() + secs
+    while time.time() < end:
+        try:
+            if json.loads(urllib.request.urlopen(url + "/health", timeout=10).read()).get("ok"):
+                return True
+        except Exception:
+            pass
+        time.sleep(3)
+    return False
+
+
 def take_over(my_url: str) -> None:
     """New run: pull the previous run's state. On any failure, start fresh (and tell the old run)."""
     H = {"Authorization": "Bearer " + PASSWORD, "Content-Type": "application/json"}
@@ -1603,6 +1628,7 @@ def main():
     HANDOFF["url"] = url
     if url:
         log("PANDA_URL=" + url)
+        log("tunnel reachable" if wait_reachable(url) else "tunnel not confirmed reachable yet")
         if PANDA_PREV:
             take_over(url)
     RESTORED.set()
