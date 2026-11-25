@@ -43,9 +43,19 @@ export async function ensureWorker(onState: (s: WorkerState["state"]) => void, s
   return s.url!;
 }
 
-const wfetch = (path: string, init: RequestInit = {}) => {
+/** Call the worker. When its run has handed over to a fresh one (see "relay" in worker.py), it answers
+ * 409 with the new run's URL: switch to it and send the request again. */
+const wfetch = async (path: string, init: RequestInit = {}) => {
   if (!workerUrl) throw new Error("The worker is offline");
-  return fetch(`${workerUrl}${path}`, { ...init, headers: { ...(init.headers || {}), Authorization: `Bearer ${getPassword()}` } });
+  const go = () => fetch(`${workerUrl}${path}`, { ...init, headers: { ...(init.headers || {}), Authorization: `Bearer ${getPassword()}` } });
+  let r = await go();
+  for (let hops = 0; r.status === 409 && hops < 3; hops++) {
+    const moved = (await r.clone().json().catch(() => ({}))).moved;
+    if (typeof moved !== "string" || !moved.startsWith("https://")) break;
+    workerUrl = moved.replace(/\/+$/, "");
+    r = await go();
+  }
+  return r;
 };
 
 // ── chat stream ─────────────────────────────────────────────────────────────

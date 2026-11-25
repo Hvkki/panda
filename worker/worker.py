@@ -23,6 +23,10 @@ worker.json (private Kaggle dataset, attached to the notebook):
   secret_dataset      optional   "user/panda-secret"; where "Connect Claude" saves the new token
   max_runtime_secs    optional   default 39600 (11 h, Kaggle stops at 12 h)
 
+Relay: Kaggle ends a run after 12 h. Half an hour before this run's limit it asks the web app to start a
+fresh run, which takes everything over (files, Claude sessions, browser cookies, settings) at a moment
+when no reply is running, so a long chat or Developer change is never cut off. See "relay" below.
+
 Nothing secret is printed.
 """
 from __future__ import annotations
@@ -51,6 +55,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 # ── config ───────────────────────────────────────────────────────────────────
+# Filled in by the web app when it starts a run (api/session.js); empty when run by hand.
+PANDA_APP = ""   # the web app's https URL, to ask it for a relay
+PANDA_PREV = ""  # the URL of the run this one takes over from
 _cfg_path = (glob.glob("/kaggle/input/**/worker.json", recursive=True) or [None])[0]
 CFG = json.load(open(_cfg_path)) if _cfg_path else json.loads(os.environ["PANDA_WORKER_CFG"])
 PASSWORD = CFG["app_password"]
@@ -234,6 +241,7 @@ def folder_for(req: dict) -> Path:
 
 
 def run_claude(req: dict, emit) -> None:
+    RESTORED.wait(15 * 60)  # a relayed run first takes over the old run's files and sessions
     """Run one turn. emit(event: dict) is called for every piece of progress."""
     chat = str(req.get("chat_id") or "chat")
     model = str(req.get("model") or "")
@@ -842,7 +850,10 @@ def run_schedule(s: dict):
 
 
 def scheduler():
+    RESTORED.wait()
     while not STOP.wait(30):
+        if HANDOFF["state"]:  # handing over: the next run takes the schedules
+            continue
         now = time.time()
         for s in list(CFG.get("schedules") or []):
             if schedule_due(s, now) and ("sched-" + s["id"]) not in RUNNING:
@@ -883,6 +894,7 @@ def start_browser():
         exe = sorted(glob.glob(str(HOME / ".cache/ms-playwright/chromium-*/chrome-linux*/chrome")))
         if not exe:
             raise RuntimeError("chromium not found after install")
+        RESTORED.wait()  # the profile (cookies, logins) may come from the previous run
         prof = WORK / "browser-profile"
         prof.mkdir(exist_ok=True)
         BROWSER["proc"] = subprocess.Popen(
@@ -1047,9 +1059,13 @@ class Handler(BaseHTTPRequestHandler):
     def _get(self):
         u = urlparse(self.path)
         if u.path == "/health":
-            return self.send_json({"ok": True, "uptime": int(time.time() - T0)})
+            return self.send_json({"ok": True, "uptime": int(time.time() - T0), **moved_to()})
         if not self.authed():
             return self.send_json({"error": "unauthorized"}, 401)
+        if self.redirected(u.path):
+            return
+        if u.path == "/handoff/archive":
+            return self.send_archive()
         if u.path == "/chat/events":
             q = parse_qs(u.query)
             with RUN_LOCK:
@@ -1114,7 +1130,13 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if not self.authed():
             return self.send_json({"error": "unauthorized"}, 401)
+        if self.redirected(u.path):
+            return
         try:
+            if u.path == "/handoff":
+                return self.send_json(handoff_begin(str(json.loads(self.body() or b"{}").get("url") or "")))
+            if u.path == "/handoff/done":
+                return self.send_json(handoff_done(bool(json.loads(self.body() or b"{}").get("ok"))))
             if u.path == "/chat":
                 return self.chat(json.loads(self.body() or b"{}"))
             if u.path == "/cancel":
@@ -1214,6 +1236,31 @@ class Handler(BaseHTTPRequestHandler):
                     threading.Thread(target=start_browser, daemon=True).start()
         save_soon()
         return {"ok": True}
+
+    def redirected(self, path: str) -> bool:
+        """After the handover, send the app to the new run (it retries there). Replies that were
+        already streaming from this run can still be read here."""
+        m = moved_to()
+        if not m or path.startswith("/handoff") or path == "/chat/events":
+            return False
+        self.send_json({"error": "This run handed over to a new one.", **m}, 409)
+        return True
+
+    def send_archive(self):
+        if HANDOFF["state"] != "ready":
+            return self.send_json({"state": HANDOFF["state"] or "running"}, 409)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        p = subprocess.Popen(archive_cmd(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            shutil.copyfileobj(p.stdout, self.wfile, 1 << 20)
+        finally:
+            if p.poll() is None:
+                p.kill()
+            p.wait()
 
     def delete_file(self, rel: str):
         target = (WORKSPACE / rel).resolve()
@@ -1390,6 +1437,156 @@ def publish_endpoint(url: str):
         log("endpoint published")
 
 
+# ── relay: hand over to a fresh run before Kaggle's time limit ─────────────────
+# Old run                                         New run
+#  limit - 30 min: ask the app for a new run   ->  starts on the other Kaggle notebook, opens its tunnel
+#                                              <-  POST /handoff {url}
+#  waits until no reply is running, then stops
+#  taking new ones (the app is sent to the new
+#  run, which holds requests until it is ready)
+#                                              <-  GET /handoff/archive (files, sessions, cookies, settings)
+#                                              <-  POST /handoff/done; publishes its URL, takes over
+#  keeps answering "moved" for a few minutes, then exits.
+RELAY_LEAD = 30 * 60          # start the next run this long before MAX_RUNTIME
+RELAY_GRACE = 40 * 60         # Kaggle's hard stop is 12 h; MAX_RUNTIME defaults to 11 h
+RESTORED = threading.Event()  # set once this run has its state (at once when it is not a relay)
+HANDOFF = {"state": "", "to": "", "asked": 0.0, "done": 0.0, "url": ""}  # "" | waiting | freezing | ready | moved
+CARRY = [WORK / "workspace", WORK / "browser-profile", HOME / ".claude", HOME / ".codex", HOME / ".claude.json"]
+CARRY_SKIP = ["node_modules", "__pycache__", ".npm", "Cache", "Code Cache", "GPUCache", "CacheStorage",
+              "ScriptCache", "shell-snapshots"]
+STATE_FILE = WORK / "workspace" / ".panda-state.json"
+
+
+def moved_to() -> dict:
+    return {"moved": HANDOFF["to"]} if HANDOFF["state"] in ("freezing", "ready", "moved") else {}
+
+
+def archive_cmd() -> list:
+    paths = [str(p.relative_to("/")) for p in CARRY if p.exists()]
+    return ["tar", "-czf", "-", "-C", "/", *[f"--exclude={x}" for x in CARRY_SKIP], *paths]
+
+
+def ask_relay():
+    """Ask the web app to start the next run (it holds the Kaggle token)."""
+    HANDOFF["asked"] = time.time()
+    if not PANDA_APP or not HANDOFF["url"]:
+        log("no relay: this run was not started by the app or has no public URL")
+        return
+    try:
+        req = urllib.request.Request(PANDA_APP + "/api/session", data=json.dumps({"action": "relay", "from": HANDOFF["url"]}).encode(),
+                                     headers={"Authorization": "Bearer " + PASSWORD, "Content-Type": "application/json"})
+        log("relay requested:", urllib.request.urlopen(req, timeout=60).read().decode()[:200])
+    except Exception as exc:
+        log("relay request failed (retrying in 5 min):", exc)
+        HANDOFF["asked"] = time.time() - 20 * 60  # the main loop asks again 25 min after the last try
+
+
+def handoff_begin(url: str) -> dict:
+    """The new run is up. Wait for a quiet moment, then freeze and pack up."""
+    if not re.fullmatch(r"https://[A-Za-z0-9.-]+(:\d+)?", url):
+        return {"error": "bad url"}
+    if HANDOFF["state"]:
+        return {"ok": True, "state": HANDOFF["state"]}
+    HANDOFF.update(state="waiting", to=url)
+    log("handing over to", url)
+
+    def drain():
+        while True:
+            with RUN_LOCK:
+                busy = [c for c, t in TURNS.items() if not t["done"]]
+                late = time.time() - T0 > MAX_RUNTIME
+                if not busy or late:
+                    HANDOFF["state"] = "freezing"  # new chats now wait in redirected() below
+                    for p in list(RUNNING.values()) + [l["p"] for l in LIVE.values()]:
+                        if p.poll() is None:
+                            p.kill()
+                    LIVE.clear()
+                    break
+            time.sleep(2)
+        for _ in range(20):  # killed replies emit their last event
+            if all(t["done"] for t in TURNS.values()):
+                break
+            time.sleep(0.5)
+        login_stop()
+        if BROWSER["proc"]:
+            BROWSER["proc"].terminate()  # Chromium writes its cookies on exit
+            try:
+                BROWSER["proc"].wait(15)
+            except subprocess.TimeoutExpired:
+                BROWSER["proc"].kill()
+        with RUN_LOCK, CFG_LOCK:
+            turns = {c: {"id": t["id"], "events": t["events"], "at": t["at"]} for c, t in TURNS.items()}
+            STATE_FILE.write_text(json.dumps({"cfg": CFG, "turns": turns}))
+        flush_now()
+        HANDOFF["state"] = "ready"
+        log("ready to hand over", "(forced: time limit)" if late else "")
+
+    threading.Thread(target=drain, daemon=True).start()
+    return {"ok": True, "state": "waiting"}
+
+
+def handoff_done(ok: bool) -> dict:
+    if not ok:  # the new run could not take over: carry on here until the limit
+        HANDOFF.update(state="", to="")
+        STATE_FILE.unlink(missing_ok=True)
+        threading.Thread(target=start_browser, daemon=True).start()
+        log("handover failed; this run continues")
+    else:
+        HANDOFF.update(state="moved", done=time.time())
+        log("handed over")
+    return {"ok": True}
+
+
+def take_over(my_url: str) -> None:
+    """New run: pull the previous run's state. On any failure, start fresh (and tell the old run)."""
+    H = {"Authorization": "Bearer " + PASSWORD, "Content-Type": "application/json"}
+    call = lambda path, body=None, t=60: urllib.request.urlopen(urllib.request.Request(
+        PANDA_PREV + path, data=None if body is None else json.dumps(body).encode(), headers=H), timeout=t)
+    try:
+        call("/handoff", {"url": my_url})
+    except Exception as exc:
+        log("previous run not reachable, starting fresh:", exc)
+        return
+    ok = False
+    tgz = WORK / ".handoff.tgz"
+    deadline = time.time() + RELAY_LEAD + RELAY_GRACE
+    try:
+        while time.time() < deadline:
+            try:
+                with call("/handoff/archive", t=600) as r, open(tgz, "wb") as f:
+                    shutil.copyfileobj(r, f, 1 << 20)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code != 409:
+                    raise
+            time.sleep(3)  # still waiting for a quiet moment
+        r = subprocess.run(["tar", "-xzf", str(tgz), "-C", "/"], capture_output=True, text=True, timeout=900)
+        if r.returncode != 0:
+            raise RuntimeError("unpacking failed: " + r.stderr[-200:])
+        state = json.loads(STATE_FILE.read_text())
+        with CFG_LOCK:
+            CFG.clear()
+            CFG.update(state["cfg"])
+        ENV["CLAUDE_CODE_OAUTH_TOKEN"] = CFG.get("claude_oauth_token", "")
+        with RUN_LOCK:
+            for c, t in state["turns"].items():
+                TURNS[c] = {**t, "done": True, "cond": threading.Condition()}
+        apply_skills()
+        apply_memory()
+        apply_mcp()
+        ok = True
+        log("took over from the previous run")
+    except Exception as exc:
+        log("takeover failed, starting fresh:", exc)
+    finally:
+        tgz.unlink(missing_ok=True)
+        STATE_FILE.unlink(missing_ok=True)
+        try:
+            call("/handoff/done", {"ok": ok})
+        except Exception:
+            pass
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 def main():
     install()
@@ -1400,16 +1597,28 @@ def main():
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     log(f"api listening on 127.0.0.1:{PORT}")
+    threading.Thread(target=scheduler, daemon=True).start()
+    threading.Thread(target=start_browser, daemon=True).start()  # installs now, launches once restored
     tunnel, url = start_tunnel()
+    HANDOFF["url"] = url
     if url:
         log("PANDA_URL=" + url)
+        if PANDA_PREV:
+            take_over(url)
+    RESTORED.set()
+    if url:
         threading.Thread(target=publish_endpoint, args=(url,), daemon=True).start()
     log("ready")
-    threading.Thread(target=scheduler, daemon=True).start()
-    threading.Thread(target=start_browser, daemon=True).start()
     while not STOP.is_set():
         watch_memory()
-        if time.time() - T0 > MAX_RUNTIME:
+        age = time.time() - T0
+        if HANDOFF["state"] == "moved" and time.time() - HANDOFF["done"] > 5 * 60:
+            log("handed over, stopping")
+            break
+        if not HANDOFF["state"] and age > MAX_RUNTIME - RELAY_LEAD and time.time() - HANDOFF["asked"] > 25 * 60:
+            threading.Thread(target=ask_relay, daemon=True).start()
+            HANDOFF["asked"] = time.time()
+        if age > MAX_RUNTIME + (RELAY_GRACE if HANDOFF["state"] else 0):
             log("time limit reached, stopping")
             break
         if tunnel.poll() is not None:
