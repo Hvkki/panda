@@ -21,6 +21,8 @@ export const IconBell = (p: P) => <S {...p}><path d="M6 16V11a6 6 0 1 1 12 0v5l2
 export const IconPower = (p: P) => <S {...p}><path d="M12 3v9" /><path d="M6.3 7.3a8 8 0 1 0 11.4 0" /></S>;
 export const IconBrain = (p: P) => <S {...p}><path d="M9 4a3 3 0 0 0-3 3 3 3 0 0 0-2 5 3 3 0 0 0 2 5 3 3 0 0 0 3 3h0V4zM15 4a3 3 0 0 1 3 3 3 3 0 0 1 2 5 3 3 0 0 1-2 5 3 3 0 0 1-3 3V4z" /></S>;
 export const IconTool = (p: P) => <S {...p}><path d="M14.7 6.3a4 4 0 0 0 5 5L13 18a2.8 2.8 0 0 1-4-4z" /><path d="m9 14-5 5" /></S>;
+export const IconLock = (p: P) => <S {...p}><rect x="5" y="11" width="14" height="10" rx="2" /><path d="M8 11V8a4 4 0 0 1 8 0v3" /></S>;
+export const IconGitHub = (p: P) => <S {...p}><path d="M9 19c-4.3 1.4-4.3-2.5-6-3m12 5v-3.5c0-1 .1-1.4-.5-2 2.8-.3 5.5-1.4 5.5-6a4.6 4.6 0 0 0-1.3-3.2 4.2 4.2 0 0 0-.1-3.2s-1.1-.3-3.5 1.3a12.3 12.3 0 0 0-6.2 0C6.5 2.8 5.4 3.1 5.4 3.1a4.2 4.2 0 0 0-.1 3.2A4.6 4.6 0 0 0 4 9.5c0 4.6 2.7 5.7 5.5 6-.6.6-.6 1.2-.5 2V21" /></S>;
 export const IconX = (p: P) => <S {...p}><path d="M6 6l12 12M18 6 6 18" /></S>;
 export const IconMic = (p: P) => <S {...p}><rect x="9" y="3" width="6" height="12" rx="3" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3" /></S>;
 export const IconMenu = (p: P) => <S {...p}><path d="M4 7h16M4 12h16M4 17h10" /></S>;

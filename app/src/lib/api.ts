@@ -66,7 +66,8 @@ export type StreamEvent =
   | { t: "turn"; id: string }
   | { t: "text"; d: string }
   | { t: "thinking"; d: string }
-  | { t: "tool"; id: string; label: string }
+  | { t: "break" }
+  | { t: "tool"; id: string; label: string; parent?: string }
   | { t: "tool_done"; id: string; error: boolean }
   | { t: "done"; session_id?: string; text: string; error: boolean; secs: number; usage?: TurnUsage }
   | { t: "limits" }
@@ -82,6 +83,8 @@ export type ChatRequest = {
   system?: string;
   /** Project id: the chat runs in its own folder on the worker. */
   folder?: string;
+  /** owner/name of the project's GitHub repo: cloned into the project folder on first use. */
+  repo?: string;
   /** The Developer chat: may change Panda; sees the developer variables. */
   dev?: boolean;
 };
@@ -249,3 +252,13 @@ export async function browserShot(tab: string): Promise<{ url: string; w: number
 /** Claude Code's slash commands on the worker (from its init event). */
 export type SlashList = { commands: string[]; skills: string[] };
 export const getCommands = (dev = false) => wjson<SlashList>(`/commands${dev ? "?dev=1" : ""}`);
+
+// ── GitHub (one token for every chat; git and gh on the worker are signed in with it) ──
+export type GitHubCheck = { connected: boolean; error?: string; login?: string; name?: string; avatar?: string;
+  kind?: "classic" | "fine-grained" | "oauth" | "app" | "other"; scopes?: string[]; repos?: number; private?: number;
+  push?: number; hints?: string[] };
+export type GitHubRepo = { full_name: string; private: boolean; push: boolean; default_branch: string; pushed_at: string; description: string };
+export const getGitHub = () => wjson<GitHubCheck>("/github");
+export const setGitHub = (token: string) => wjson<GitHubCheck>("/github", { token });
+export const recheckGitHub = () => wjson<GitHubCheck>("/github", { recheck: true });
+export const getRepos = (fresh = false) => wjson<{ repos: GitHubRepo[] }>(`/github/repos${fresh ? "?fresh=1" : ""}`).then((d) => d.repos || []);

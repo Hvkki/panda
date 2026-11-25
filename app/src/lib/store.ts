@@ -1,13 +1,17 @@
 import type { TurnUsage } from "./api";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-export type Tool = { id: string; label: string; done: boolean; error?: boolean };
+export type Tool = { id: string; label: string; done: boolean; error?: boolean; parent?: string };
+/** A reply in the order it happened: paragraphs of text and the tool calls between them. */
+export type Part = { k: "text"; text: string } | { k: "tool"; id: string };
 export type Message = {
   id: string;
   role: "user" | "assistant";
   content: string;
   thinking?: string;
   tools?: Tool[];
+  /** Order of text and tools (replies from before this existed have only content + tools). */
+  parts?: Part[];
   status?: "waiting" | "streaming" | "done" | "error";
   error?: string;
   secs?: number;
@@ -24,7 +28,7 @@ export type Chat = {
   dev?: boolean;
 };
 
-export type Project = { id: string; name: string; instructions: string; created: number; updated: number };
+export type Project = { id: string; name: string; instructions: string; created: number; updated: number; repo?: string };
 
 // Chats live in this browser only (no database). Clearing site data clears them.
 // Each chat is stored under its own key, so a reply streaming into one chat re-saves only that chat.

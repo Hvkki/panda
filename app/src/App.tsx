@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AuthError, TurnGone, cancelChat, ensureWorker, getPassword, resumeChat, sessionAction, setPassword, streamChat, type Note, type StreamEvent } from "./lib/api";
 import { applySettings, getSettings } from "./lib/settings";
+import { useDismiss } from "./lib/dismiss";
 import { CustomizePage } from "./components/CustomizePage";
 import { BrowserPanel } from "./components/BrowserPanel";
 import { NotificationsModal, SearchModal, SettingsModal, useNotes } from "./components/Panels";
@@ -48,34 +49,46 @@ function Shell({ onLogout }: { onLogout: () => void }) {
     const h = { failed: false, flush: () => {}, onEvent: (_e: StreamEvent) => {} };
     // Text arrives a few characters at a time. Re-rendering a long chat for every piece froze phones,
     // so pieces are collected and shown at most ~8 times a second.
-    let bufText = "", bufThinking = "", timer: number | undefined;
+    let bufText = "", bufThinking = "", timer: number | undefined, newPara = false;
     h.flush = () => {
       window.clearTimeout(timer); timer = undefined;
       if (!bufText && !bufThinking) return;
-      const t = bufText, th = bufThinking; bufText = ""; bufThinking = "";
-      upd((m) => ({ ...m, content: m.content + t, thinking: th ? (m.thinking || "") + th : m.thinking }));
+      const t = bufText, th = bufThinking, para = newPara; bufText = ""; bufThinking = ""; newPara = false;
+      upd((m) => {
+        if (!t) return { ...m, thinking: (m.thinking || "") + th };
+        const parts = [...(m.parts || [])];
+        const lastPart = parts[parts.length - 1];
+        if (lastPart?.k === "text" && !para) parts[parts.length - 1] = { k: "text", text: lastPart.text + t };
+        else parts.push({ k: "text", text: t });
+        const sep = m.content && (para || lastPart?.k === "tool") ? "\n\n" : "";
+        return { ...m, parts, content: m.content + sep + t, thinking: th ? (m.thinking || "") + th : m.thinking };
+      });
     };
     h.onEvent = (e: StreamEvent) => {
       if (e.t === "text" || e.t === "thinking") {
         if (e.t === "text") bufText += e.d; else bufThinking += e.d;
-        if (timer === undefined) timer = window.setTimeout(h.flush, 120);
+        if (timer === undefined) timer = window.setTimeout(h.flush, 80);
         return;
       }
       h.flush();
+      if (e.t === "break") { newPara = true; return; }
       if (e.t === "session") patchChat(chat.id, (c) => ({ ...c, session_id: e.id }));
       else if (e.t === "turn") upd((m) => (m.turn === e.id ? m : { ...m, turn: e.id }));
       else if (e.t === "tool") upd((m) => {
         const tools = m.tools || [];
-        return tools.some((t) => t.id === e.id)
-          ? { ...m, tools: tools.map((t) => (t.id === e.id ? { ...t, label: e.label } : t)) }
-          : { ...m, tools: [...tools, { id: e.id, label: e.label, done: false }] };
+        if (tools.some((t) => t.id === e.id)) return { ...m, tools: tools.map((t) => (t.id === e.id ? { ...t, label: e.label } : t)) };
+        const parts = e.parent ? m.parts || [] : [...(m.parts || []), { k: "tool" as const, id: e.id }];
+        return { ...m, parts, tools: [...tools, { id: e.id, label: e.label, done: false, parent: e.parent || undefined }] };
       });
       else if (e.t === "tool_done") upd((m) => ({ ...m, tools: (m.tools || []).map((t) => (t.id === e.id ? { ...t, done: true, error: e.error } : t)) }));
       else if (e.t === "limits") window.dispatchEvent(new Event("panda:limits"));
       else if (e.t === "done") {
         if (e.session_id) patchChat(chat.id, (c) => ({ ...c, session_id: e.session_id }));
         if (e.error) h.failed = true;
-        upd((m) => ({ ...m, content: e.text || m.content, secs: e.secs, usage: e.usage, status: e.error ? "error" : "done", error: e.error ? e.text : undefined }));
+        // Keep the streamed text: the result holds only the last paragraph. Use it only if nothing streamed.
+        upd((m) => ({ ...m, content: m.content || e.text, parts: m.content ? m.parts : e.text ? [{ k: "text", text: e.text }] : m.parts,
+          secs: e.secs, usage: e.usage, status: e.error ? "error" : "done", error: e.error ? e.text : undefined,
+          tools: (m.tools || []).map((t) => (t.done ? t : { ...t, done: true })) }));
       } else if (e.t === "error") { h.failed = true; upd((m) => ({ ...m, status: "error", error: e.message })); }
     };
     return h;
@@ -97,6 +110,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
         chat_id: chat.id, message: text, model: chat.model, effort: chat.effort, session_id: chat.session_id,
         history: history.filter((m) => m.content).map((m) => ({ role: m.role, content: m.content })),
         system: projectsRef.current.find((p) => p.id === chat.project_id)?.instructions || undefined,
+        repo: projectsRef.current.find((p) => p.id === chat.project_id)?.repo || undefined,
         folder: chat.project_id, dev: chat.dev,
       }, h.onEvent, ctl.signal);
       h.flush();
@@ -128,7 +142,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
           if (!m.turn) throw new TurnGone();
           const s = await sessionAction("status");
           if (s.state !== "on" || !s.url) throw new Error("The worker stopped before this reply finished. Send the message again.");
-          upd((x) => ({ ...x, content: "", thinking: undefined, tools: [], status: "streaming", turn: m.turn }));
+          upd((x) => ({ ...x, content: "", thinking: undefined, tools: [], parts: [], status: "streaming", turn: m.turn }));
           const h = handlers(chat, m.id);
           await resumeChat(s.url, chat.id, m.turn, h.onEvent, ctl.signal);
           h.flush();
@@ -208,6 +222,8 @@ function Shell({ onLogout }: { onLogout: () => void }) {
   const title = view === "chat" ? active?.title || "" : view === "developer" ? "Developer"
     : view === "projects" ? "Projects" : view === "files" ? "Files" : view === "customize" ? "Customize" : "";
   const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  useDismiss(menuOpen, () => setMenuOpen(false), [menuRef]);
   // Slash commands Panda answers itself (/usage, /clear), sent by the composer.
   useEffect(() => {
     const usage = () => setModal("usage");
@@ -254,13 +270,12 @@ function Shell({ onLogout }: { onLogout: () => void }) {
             title={headChat ? `Context ${Math.round(headUsage.pct)}% used` : "Usage"}>
             <UsageRing pct={headChat ? headUsage.pct : plan.data?.windows.five_hour?.pct ?? 0} />
           </button>
-          <div className="menu-anchor">
+          <div className="menu-anchor" ref={menuRef}>
             <button className="icon-btn" onClick={() => setMenuOpen((v) => !v)} aria-label="More" aria-expanded={menuOpen}>
               <IconDots /><span className={`state-dot ${worker.state}`} />
             </button>
             {menuOpen && (
               <>
-                <div className="menu-scrim" onClick={() => setMenuOpen(false)} />
                 <div className="top-menu" role="menu">
                   <div className="top-menu-session"><SessionChip worker={worker} /></div>
                   <button onClick={() => { setMenuOpen(false); setActiveId(null); setView("chat"); }}><IconPlus size={18} /> New chat</button>

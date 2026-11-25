@@ -38,6 +38,7 @@ import json
 import mimetypes
 import os
 import pty
+import queue
 import re
 import struct
 import shutil
@@ -48,6 +49,7 @@ import uuid
 import termios
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -76,7 +78,11 @@ MODEL_ID = re.compile(r"^claude-[a-z0-9.-]{3,40}(\[1m\])?$")  # full ids like cl
 EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 
 ENV = dict(os.environ, CLAUDE_CODE_OAUTH_TOKEN=CFG.get("claude_oauth_token", ""), IS_SANDBOX="1",  # root inside a disposable VM
-           PATH=f"{BIN}:{os.environ.get('PATH', '')}")
+           PATH=f"{BIN}:{os.environ.get('PATH', '')}",
+           # MCP tools (the browser alone has ~20) are looked up when needed instead of sent with every request.
+           ENABLE_TOOL_SEARCH="true",
+           # No side requests: tips, prompt suggestions, and other background calls that cost plan usage.
+           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION="false")
 ENV.pop("ANTHROPIC_API_KEY", None)  # an API key would override the subscription login
 STOP = threading.Event()
 
@@ -240,6 +246,32 @@ def folder_for(req: dict) -> Path:
     return d
 
 
+
+def start_reader(p: subprocess.Popen) -> None:
+    """Read a claude process's stdout on a thread into p.lines (None at the end).
+    While p.idle is set (kept between messages) nothing should happen. If Claude starts a turn on its own
+    anyway (a background command finished, a hook fired), stop the process: such turns cost plan usage
+    and nobody sees them. The chat's next message starts a fresh process with --resume."""
+    p.lines = queue.Queue()
+    p.idle = threading.Event()
+
+    def read():
+        for line in p.stdout:
+            if p.idle.is_set():
+                try:
+                    kind = json.loads(line).get("type")
+                except ValueError:
+                    kind = ""
+                if kind in ("assistant", "stream_event", "user"):
+                    log("a kept Claude process started a turn on its own; stopped it to save plan usage")
+                    p.kill()
+                    break
+                continue
+            p.lines.put(line)
+        p.lines.put(None)
+
+    threading.Thread(target=read, daemon=True).start()
+
 def run_claude(req: dict, emit) -> None:
     """Run one turn. emit(event: dict) is called for every piece of progress."""
     RESTORED.wait(15 * 60)  # a relayed run first takes over the old run's files and sessions
@@ -253,8 +285,16 @@ def run_claude(req: dict, emit) -> None:
         sid = ""
         hist = req.get("history") or []
         if hist and not prompt.startswith("/"):  # the session is gone (new run): give Claude the earlier conversation as plain text
-            lines = [f"{'User' if h.get('role') == 'user' else 'Assistant'}: {h.get('content', '')}"
-                     for h in hist[-40:] if h.get("content")]
+            lines, size = [], 0
+            for h in reversed(hist[-40:]):  # newest first, up to ~40k characters in all
+                if not h.get("content"):
+                    continue
+                text = str(h["content"])
+                text = text if len(text) <= 4000 else text[:2000] + "\n[…]\n" + text[-1500:]
+                if size + len(text) > 40000:
+                    break
+                size += len(text)
+                lines.insert(0, f"{'User' if h.get('role') == 'user' else 'Assistant'}: {text}")
             prompt = ("[Earlier conversation, restored because the session was lost]\n" + "\n\n".join(lines)
                       + "\n[End of earlier conversation]\n\n" + prompt)
     cmd = ["claude", "-p"]
@@ -273,7 +313,7 @@ def run_claude(req: dict, emit) -> None:
         env.update(dev_env)
         branch = dev_env.get("PANDA_BRANCH") or "claude/amazing-mccarthy-ejh4o9"
         repo = dev_env.get("PANDA_REPO") or "hvkki/panda"
-        token = dev_env.get("GITHUB_TOKEN", "")
+        token = dev_env.get("GITHUB_TOKEN", "") or gh_token()
         emit({"t": "tool", "id": "dev-repo", "label": "Preparing the Panda repo"})
         note = dev_repo(repo, branch, token)
         emit({"t": "tool_done", "id": "dev-repo", "error": bool(note)})
@@ -285,6 +325,11 @@ def run_claude(req: dict, emit) -> None:
         cmd += ["--append-system-prompt", system]
     t0 = time.time()
     cwd = folder_for(req)
+    repo = str(req.get("repo") or "")
+    if repo and not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+        repo = req["repo"] = ""
+    if repo and not req.get("dev"):
+        ensure_repo(repo, cwd, emit)
     # Keep one Claude process per chat between messages, like a normal Claude Code session. Starting a new
     # process with --resume for every message makes Claude Code rebuild the request, and part of the chat
     # is no longer a cache hit, so it gets written to the cache again (the expensive part of plan usage).
@@ -309,6 +354,8 @@ def run_claude(req: dict, emit) -> None:
                                  stderr=subprocess.PIPE, text=True, bufsize=1)
             errors = []
             threading.Thread(target=lambda: errors.extend(scrub(l) for l in p.stderr), daemon=True).start()
+            start_reader(p)
+        p.idle.clear()
         msg_id = str(uuid.uuid4())
         if keep:
             p.stdin.write(json.dumps({"type": "user", "uuid": msg_id, "session_id": sid, "parent_tool_use_id": None,
@@ -335,7 +382,7 @@ def run_claude(req: dict, emit) -> None:
     # says it started on this message (--replay-user-messages makes it say so).
     mine = not keep
     try:
-        for line in p.stdout:
+        for line in iter(p.lines.get, None):
             try:
                 ev = json.loads(line)
             except ValueError:
@@ -354,6 +401,10 @@ def run_claude(req: dict, emit) -> None:
                 emit({"t": "session", "id": sent_session})
             elif kind == "stream_event":
                 e = ev.get("event") or {}
+                if ev.get("parent_tool_use_id"):
+                    continue  # a subagent's own text; its result reaches the main reply through the tool
+                if e.get("type") == "content_block_start" and (e.get("content_block") or {}).get("type") == "text":
+                    emit({"t": "break"})  # a new paragraph of the reply (often after tool calls)
                 if e.get("type") == "content_block_delta":
                     d = e.get("delta") or {}
                     if d.get("type") == "text_delta":
@@ -376,7 +427,8 @@ def run_claude(req: dict, emit) -> None:
                 for b in (ev.get("message") or {}).get("content") or []:
                     if b.get("type") == "tool_use":
                         seen_tools.add(b.get("id"))
-                        emit({"t": "tool", "id": b.get("id"), "label": tool_label(b.get("name", "tool"), b.get("input"))})
+                        emit({"t": "tool", "id": b.get("id"), "label": tool_label(b.get("name", "tool"), b.get("input")),
+                              "parent": ev.get("parent_tool_use_id") or ""})
             elif kind == "user":
                 for b in (ev.get("message") or {}).get("content") or []:
                     if isinstance(b, dict) and b.get("type") == "tool_result":
@@ -387,6 +439,7 @@ def run_claude(req: dict, emit) -> None:
                       "error": bool(ev.get("is_error")), "secs": round(time.time() - t0, 1),
                       "usage": turn_usage(ev, ctx), "turns": ev.get("num_turns")})
                 if keep:
+                    p.idle.set()
                     break
         if not keep:
             p.wait(timeout=30)
@@ -682,7 +735,7 @@ SKILL_RE = r"[a-z0-9][a-z0-9-]{0,63}"
 
 
 def settings() -> dict:
-    return {"browser": True, "memory": True, **(CFG.get("settings") or {})}
+    return {"browser": False, "memory": True, **(CFG.get("settings") or {})}
 
 
 def _flush():
@@ -806,8 +859,141 @@ def extra_system(req: dict) -> str:
                      "do that step in the Browser panel, then continue.")
     if CFG.get("env"):
         parts.append("API keys available as environment variables: " + ", ".join(sorted(CFG["env"])) + ".")
+    if gh_token():
+        login = (GH.get("check") or {}).get("login") or "the user"
+        parts.append(f"GitHub: git and the gh CLI are already signed in as {login} (private repos included). Clone, "
+                     "commit, push and open pull requests directly; do not ask for a token and never print it.")
+    if re.fullmatch(r"[\w.-]+/[\w.-]+", str(req.get("repo") or "")) and not req.get("dev"):
+        parts.append(f"This project works on the GitHub repo {req['repo']}, checked out in ./{str(req['repo']).split('/')[-1]}.")
     return "\n\n".join(parts)
 
+
+
+# ── GitHub ───────────────────────────────────────────────────────────────────
+# One token for every chat (Settings → GitHub in the app). git and gh are signed in with it, so Claude can
+# clone, push and open pull requests without asking for a key.
+GH: dict = {"check": None, "repos": None, "repos_at": 0.0}
+GH_LOCK = threading.Lock()
+
+
+def gh_token() -> str:
+    return ((CFG.get("github") or {}).get("token") or (CFG.get("dev_env") or {}).get("GITHUB_TOKEN")
+            or (CFG.get("env") or {}).get("GITHUB_TOKEN") or "")
+
+
+def gh_api(path: str, token: str) -> tuple[int, dict, object]:
+    rq = urllib.request.Request("https://api.github.com" + path, headers={
+        "Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "panda-worker"})
+    try:
+        with urllib.request.urlopen(rq, timeout=20) as r:
+            return r.status, dict(r.headers), json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.load(e)
+        except ValueError:
+            body = {}
+        return e.code, dict(e.headers or {}), body
+
+
+def gh_repos(token: str, pages: int = 10) -> list:
+    """Every repo the token can reach: own, collaborator and organization repos, private included."""
+    out = []
+    for page in range(1, pages + 1):
+        st, _, data = gh_api(f"/user/repos?per_page=100&page={page}&sort=pushed"
+                             "&affiliation=owner,collaborator,organization_member", token)
+        if st != 200 or not isinstance(data, list):
+            break
+        out += [{"full_name": r["full_name"], "private": bool(r.get("private")), "default_branch": r.get("default_branch") or "main",
+                 "push": bool((r.get("permissions") or {}).get("push")), "pushed_at": r.get("pushed_at") or "",
+                 "description": (r.get("description") or "")[:140]} for r in data]
+        if len(data) < 100:
+            break
+    return out
+
+
+def github_check(token: str) -> dict:
+    """Who the token belongs to, what it can reach, and what to change when private repos are missing."""
+    if not token:
+        return {"connected": False}
+    st, hdr, user = gh_api("/user", token)
+    if st == 401:
+        return {"connected": False, "error": "GitHub says this token is invalid or expired."}
+    if st != 200 or not isinstance(user, dict):
+        return {"connected": False, "error": f"GitHub answered {st}: {(user or {}).get('message', '') if isinstance(user, dict) else ''}"}
+    kind = ("fine-grained" if token.startswith("github_pat_") else "classic" if token.startswith("ghp_")
+            else "oauth" if token.startswith("gho_") else "app" if token.startswith(("ghs_", "ghu_")) else "other")
+    scopes = [x.strip() for x in (hdr.get("X-OAuth-Scopes") or hdr.get("x-oauth-scopes") or "").split(",") if x.strip()]
+    repos = gh_repos(token)
+    with GH_LOCK:
+        GH.update(repos=repos, repos_at=time.time())
+    private = sum(r["private"] for r in repos)
+    hints = []
+    if kind == "classic" and "repo" not in scopes:
+        hints.append("This classic token has no “repo” scope, so GitHub hides your private repos and refuses pushes. "
+                     "Edit the token on GitHub and tick “repo” (and “workflow” to change GitHub Actions files).")
+    if kind == "fine-grained":
+        if private == 0:
+            hints.append("Fine-grained tokens see only the repos picked under “Repository access”. Edit the token on GitHub: "
+                         "choose “All repositories” (or select yours), then under Repository permissions set "
+                         "Contents: Read and write, Pull requests: Read and write, Metadata: Read.")
+        elif not any(r["push"] for r in repos):
+            hints.append("The token can read your repos but not push. Set Repository permissions → Contents: Read and write.")
+        hints.append("Repos owned by an organization only show up if the token's “Resource owner” is that organization "
+                     "and the organization allows fine-grained tokens. A classic token with the “repo” scope avoids this.")
+    if hdr.get("X-GitHub-SSO") or hdr.get("x-github-sso"):
+        hints.append("An organization uses SAML single sign-on: on GitHub, open the token and press “Configure SSO” → Authorize.")
+    return {"connected": True, "login": user.get("login", ""), "name": user.get("name") or "", "avatar": user.get("avatar_url", ""),
+            "kind": kind, "scopes": scopes, "repos": len(repos), "private": private,
+            "push": sum(r["push"] for r in repos), "hints": hints, "at": int(time.time())}
+
+
+def apply_github() -> None:
+    """Sign git and gh in with the saved token (or sign them out)."""
+    token = gh_token()
+    cred = HOME / ".git-credentials"
+    if not token:
+        cred.unlink(missing_ok=True)
+        for k in ("GH_TOKEN", "GITHUB_TOKEN"):
+            ENV.pop(k, None)
+        return
+    cred.write_text(f"https://x-access-token:{token}@github.com\n")
+    cred.chmod(0o600)
+    ENV["GH_TOKEN"] = ENV["GITHUB_TOKEN"] = token
+    chk = GH.get("check") or {}
+    login = chk.get("login") or "panda"
+    for args in (["credential.helper", "store"], ["user.name", chk.get("name") or login],
+                 ["user.email", f"{login}@users.noreply.github.com"], ["init.defaultBranch", "main"]):
+        subprocess.run(["git", "config", "--global", *args], env=ENV, capture_output=True, timeout=30)
+    threading.Thread(target=install_gh, daemon=True).start()
+
+
+def install_gh() -> None:
+    if shutil.which("gh", path=ENV["PATH"]):
+        return
+    try:
+        st, _, rel = gh_api("/repos/cli/cli/releases/latest", gh_token())
+        asset = next(a["browser_download_url"] for a in rel["assets"] if a["name"].endswith("_linux_amd64.tar.gz"))
+        sh(f"curl -fsSL {asset} | tar xz -C /tmp && cp /tmp/gh_*_linux_amd64/bin/gh {BIN}/gh", timeout=300, check=True)
+        log("gh installed")
+    except Exception as exc:
+        log("installing gh failed:", scrub(exc))
+
+
+def ensure_repo(repo: str, cwd: Path, emit) -> str:
+    """Clone a project's GitHub repo into its folder the first time it is needed. Returns the folder name."""
+    name = repo.split("/")[-1]
+    d = cwd / name
+    if (d / ".git").exists():
+        return name
+    emit({"t": "tool", "id": "repo-clone", "label": f"Cloning {repo}"})
+    r = subprocess.run(["git", "clone", f"https://github.com/{repo}.git", str(d)], cwd=cwd, env=ENV,
+                       capture_output=True, text=True, timeout=900)
+    emit({"t": "tool_done", "id": "repo-clone", "error": r.returncode != 0})
+    if r.returncode != 0:
+        log("clone failed:", scrub(r.stderr)[-300:])
+        return ""
+    return name
 
 # ── scheduled tasks and notifications ────────────────────────────────────────
 NOTES_MAX = 60
@@ -1098,6 +1284,19 @@ class Handler(BaseHTTPRequestHandler):
                 "settings": settings(), "save": SAVE["state"], "browser": BROWSER["state"],
                 "browser_error": BROWSER["error"], "uptime": int(time.time() - T0), "max": MAX_RUNTIME,
                 "claude": bool(CFG.get("claude_oauth_token"))})
+        if u.path == "/github":
+            return self.send_json(GH.get("check") or {"connected": False})
+        if u.path == "/github/repos":
+            token = gh_token()
+            if not token:
+                return self.send_json({"error": "Connect GitHub first (Settings → GitHub)."}, 400)
+            with GH_LOCK:
+                fresh = GH["repos"] is not None and time.time() - GH["repos_at"] < 300
+            if not fresh or q.get("fresh", [""])[0] == "1":
+                repos = gh_repos(token)
+                with GH_LOCK:
+                    GH.update(repos=repos, repos_at=time.time())
+            return self.send_json({"repos": GH["repos"]})
         if u.path == "/commands":
             return self.send_json(slash_commands(q.get("dev", [""])[0] == "1"))
         if u.path == "/usage":
@@ -1200,6 +1399,24 @@ class Handler(BaseHTTPRequestHandler):
                 save_soon()
                 return {"schedules": CFG["schedules"]}
             return upsert_schedule(b.get("schedule") or {})
+        if path == "/github":
+            token = str(b.get("token") or "").strip()
+            if token and not re.fullmatch(r"[A-Za-z0-9_]{20,255}", token):
+                return {"error": "That doesn't look like a GitHub token (ghp_… or github_pat_…)."}
+            check = github_check(token or gh_token()) if (token or b.get("recheck")) else {"connected": False}
+            if token and not check.get("connected"):
+                return {"error": check.get("error") or "GitHub refused this token."}
+            if token or not b.get("recheck"):
+                with CFG_LOCK:
+                    CFG["github"] = {"token": token} if token else {}
+                    if not token:  # disconnect means everywhere: also drop copies in the variable lists
+                        for k in ("env", "dev_env"):
+                            if isinstance(CFG.get(k), dict):
+                                CFG[k].pop("GITHUB_TOKEN", None)
+            GH["check"] = check
+            apply_github()
+            save_soon()
+            return check
         if path == "/notifications/clear":
             with CFG_LOCK:
                 CFG["notifications"] = [n for n in CFG.get("notifications") or [] if b.get("id") and n["id"] != b["id"]]
@@ -1608,6 +1825,7 @@ def take_over(my_url: str) -> None:
         apply_skills()
         apply_memory()
         apply_mcp()
+        start_github()
         ok = True
         log("took over from the previous run")
     except Exception as exc:
@@ -1622,11 +1840,23 @@ def take_over(my_url: str) -> None:
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
+def start_github() -> None:
+    """Check the saved GitHub token and sign git and gh in (in the background: it calls GitHub)."""
+    def go():
+        try:
+            GH["check"] = github_check(gh_token())
+        except Exception as exc:
+            GH["check"] = {"connected": False, "error": scrub(exc)}
+        apply_github()
+    threading.Thread(target=go, daemon=True).start()
+
+
 def main():
     install()
     apply_skills()
     apply_memory()
     apply_mcp()
+    start_github()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()

@@ -38,11 +38,13 @@ All built on Claude Code itself:
 | Developer | One chat that edits Panda's own repo, pushes and redeploys; its own env variables |
 | Skills | Claude Code skills in `~/.claude/skills`, edited in Customize |
 | Connectors | MCP servers (`claude mcp add-json -s user`), remote URL or command |
-| Browser | Chromium + Playwright MCP; watch and take over (captchas, logins) in the Browser panel |
+| Browser | Chromium + Playwright MCP, off by default (turn on in Customize); watch and take over in the Browser panel |
 | Scheduled | Tasks the worker runs while online; results go to Notifications |
 | API keys | Environment variables every chat can use (names shown to Claude, never values) |
 | Memory | `~/.claude/CLAUDE.md`; Claude adds to it when you ask it to remember something |
-| Search, Settings | Search all chats; theme, text size, width, defaults, export/import |
+| GitHub | Settings → GitHub: one token signs in `git` and `gh` for every chat; shows which repos it reaches and how to fix a token that hides private ones. Projects can pick a repo, cloned on first use |
+| Appearance | Six themes (Paper, Sand, Graphite, Midnight, Mocha, Terminal), any accent colour, interface/reply/code fonts, density, corners, width, transcript or bubble messages |
+| Search, Settings | Search all chats; defaults, export/import |
 | Connect Claude | Settings → Claude account runs `claude setup-token` on the worker: open the link, paste the code |
 
 | Path | What it is |
@@ -81,6 +83,13 @@ All built on Claude Code itself:
    ```
 6. Open the app, enter the password, press **Start**. About 30 seconds later it says Online.
    Sending a message while offline starts the worker for you.
+
+## Plan usage
+
+The worker keeps plan usage down: MCP tool definitions are loaded only when Claude needs them
+(`ENABLE_TOOL_SEARCH`), non-essential background requests are off, the browser is off until you turn it
+on, a kept Claude process that starts a turn on its own (a finished background command) is stopped,
+and a conversation restored after a restart is capped at about 40k characters.
 
 ## Rotating the Claude token
 

@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { useDismiss } from "../lib/dismiss";
 import type { Chat } from "../lib/store";
 import { Wordmark } from "./Logo";
 import { IconBell, IconCode, IconEdit, IconFolder, IconGear, IconGrid, IconPin, IconPlus, IconSearch, IconSliders, IconTrash } from "./Icons";
@@ -23,6 +24,8 @@ type Props = {
 
 export function Sidebar(p: Props) {
   const [menu, setMenu] = useState<string | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  useDismiss(menu !== null, () => setMenu(null), [menuRef]);
   const sorted = p.chats.filter((c) => !c.dev).sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updated - a.updated);
   return (
     <aside className="sidebar">
@@ -40,11 +43,12 @@ export function Sidebar(p: Props) {
         <div className="side-label">Chats</div>
         {sorted.length === 0 && <div className="muted side-empty">No chats yet</div>}
         {sorted.map((c) => (
-          <div key={c.id} className={`side-item ${c.id === p.activeId ? "active" : ""}`}>
-            <button className="side-link" onClick={() => p.onOpen(c.id)}>{c.title || "New chat"}</button>
-            <button className="side-more" onClick={() => setMenu(menu === c.id ? null : c.id)}>⋯</button>
+          <div key={c.id} ref={menu === c.id ? menuRef : undefined} className={`side-item ${c.id === p.activeId ? "active" : ""}`}>
+            <button className="side-link" onClick={() => { setMenu(null); p.onOpen(c.id); }}>{c.title || "New chat"}</button>
+            <button className="side-more" aria-label="Chat options" aria-expanded={menu === c.id}
+              onClick={() => setMenu(menu === c.id ? null : c.id)}>⋯</button>
             {menu === c.id && (
-              <div className="side-menu" onMouseLeave={() => setMenu(null)}>
+              <div className="side-menu" role="menu">
                 <button onClick={() => { setMenu(null); const t = prompt("Rename", c.title); if (t?.trim()) p.onRename(c.id, t.trim()); }}><IconEdit size={15} /> Rename</button>
                 <button onClick={() => { setMenu(null); p.onPin(c.id); }}><IconPin size={15} /> {c.pinned ? "Unpin" : "Pin"}</button>
                 <button className="danger" onClick={() => { setMenu(null); if (confirm(`Delete "${c.title}"?`)) p.onDelete(c.id); }}><IconTrash size={15} /> Delete</button>

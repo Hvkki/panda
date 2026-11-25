@@ -1,3 +1,4 @@
+import { useEscape } from "../lib/dismiss";
 import { useEffect, useRef, useState } from "react";
 import { browserAct, browserShot, browserStatus, type BrowserTab } from "../lib/api";
 import { IconArrowLeft, IconChevron, IconGlobe, IconPlus, IconRetry, IconX } from "./Icons";
@@ -7,6 +8,7 @@ import { IconArrowLeft, IconChevron, IconGlobe, IconPlus, IconRetry, IconX } fro
  * Tap to click, type into the bar to send keys. Frames are fetched only while this is open.
  */
 export function BrowserPanel({ onClose }: { onClose: () => void }) {
+  useEscape(onClose);
   const [tabs, setTabs] = useState<BrowserTab[]>([]);
   const [tab, setTab] = useState("");
   const [state, setState] = useState("…");

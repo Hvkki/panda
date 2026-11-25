@@ -1,3 +1,5 @@
+import { useEscape } from "../lib/dismiss";
+import { Backdrop } from "./Panels";
 import { useCallback, useEffect, useState } from "react";
 import { getUsage, type PlanUsage, type PlanWindow } from "../lib/api";
 import type { Chat } from "../lib/store";
@@ -86,17 +88,15 @@ export function UsageSheet({ chat, online, plan, onClose }: {
   const [open, setOpen] = useState(false);
   useEffect(() => {
     plan.load(true);
-    const esc = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", esc);
-    return () => window.removeEventListener("keydown", esc);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  useEscape(onClose);
   const w = plan.data?.windows || {};
   const weekly = Object.entries(w).filter(([k]) => k.startsWith("seven_day")) as [string, PlanWindow][];
   const extra = w.extra_usage;
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal usage" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Usage">
+    <Backdrop onClose={onClose}>
+      <div className="modal usage" role="dialog" aria-modal="true" aria-label="Usage">
         <div className="us-head">
           <button className="icon-btn" onClick={onClose} aria-label="Close"><IconX /></button>
           <h2>Usage</h2>
@@ -148,6 +148,6 @@ export function UsageSheet({ chat, online, plan, onClose }: {
           )}
         </div>
       </div>
-    </div>
+    </Backdrop>
   );
 }

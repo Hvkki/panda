@@ -1,25 +1,35 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEscape } from "../lib/dismiss";
 import { getNotes, change, loginCode, loginStart, type Note } from "../lib/api";
-import { updateSettings, useSettings, type Settings } from "../lib/settings";
+import { ACCENTS, PALETTES, resetAppearance, updateSettings, useSettings, type Settings } from "../lib/settings";
 import { EFFORTS, MODELS } from "../lib/models";
 import type { Chat } from "../lib/store";
 import { IconX } from "./Icons";
+import { GitHubSettings } from "./GitHub";
 
 export function Modal({ title, onClose, children, wide }: { title: string; onClose: () => void; children: ReactNode; wide?: boolean }) {
-  useEffect(() => {
-    const esc = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", esc);
-    return () => window.removeEventListener("keydown", esc);
-  }, [onClose]);
+  useEscape(onClose);
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className={`modal ${wide ? "wide" : ""}`} onClick={(e) => e.stopPropagation()} role="dialog" aria-label={title}>
+    <Backdrop onClose={onClose}>
+      <div className={`modal ${wide ? "wide" : ""}`} role="dialog" aria-modal="true" aria-label={title}>
         <div className="modal-head">
           <h2>{title}</h2>
           <button className="icon-btn" onClick={onClose} aria-label="Close"><IconX /></button>
         </div>
         <div className="modal-body">{children}</div>
       </div>
+    </Backdrop>
+  );
+}
+
+/** Dimmed layer behind a dialog. Closes on a tap that starts and ends on it (not on a drag that
+ * started inside the dialog, e.g. selecting text). */
+export function Backdrop({ onClose, children, className = "modal-backdrop" }: { onClose: () => void; children: ReactNode; className?: string }) {
+  const down = useRef(false);
+  return (
+    <div className={className} onPointerDown={(e) => { down.current = e.target === e.currentTarget; }}
+      onClick={(e) => { if (down.current && e.target === e.currentTarget) onClose(); down.current = false; }}>
+      {children}
     </div>
   );
 }
@@ -107,8 +117,8 @@ export function NotificationsModal({ notes, online, onClose, onOpenNote, onChang
 }
 
 /* ── Settings ─────────────────────────────────────────────────────────────── */
-type Tab = "general" | "chat" | "claude" | "data";
-const TAB_LABEL: Record<Tab, string> = { general: "General", chat: "Chat", claude: "Claude account", data: "Data" };
+type Tab = "general" | "chat" | "claude" | "github" | "data";
+const TAB_LABEL: Record<Tab, string> = { general: "Appearance", chat: "Chat", claude: "Claude account", github: "GitHub", data: "Data" };
 
 function Row({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
   return (
@@ -139,6 +149,69 @@ function Pick({ k, label, hint, options }: { k: keyof Settings; label: string; h
   );
 }
 
+/** A row of buttons for 2–5 choices (easier to tap than a select). */
+function Seg({ k, label, hint, options }: { k: keyof Settings; label: string; hint?: string; options: [string, string][] }) {
+  const s = useSettings();
+  return (
+    <Row label={label} hint={hint}>
+      <div className="seg" role="radiogroup" aria-label={label}>
+        {options.map(([v, l]) => (
+          <button key={v} role="radio" aria-checked={String(s[k]) === v} className={String(s[k]) === v ? "on" : ""}
+            onClick={() => updateSettings({ [k]: v } as Partial<Settings>)}>{l}</button>
+        ))}
+      </div>
+    </Row>
+  );
+}
+
+function Appearance() {
+  const s = useSettings();
+  const swatch = (p: (typeof PALETTES)[number]) => {
+    const on = p.dark ? s.darkPalette === p.id : s.lightPalette === p.id;
+    return (
+      <button key={p.id} className={`swatch ${on ? "on" : ""}`} aria-pressed={on}
+        onClick={() => updateSettings(p.dark ? { darkPalette: p.id as Settings["darkPalette"], theme: s.theme === "light" ? "dark" : s.theme }
+          : { lightPalette: p.id as Settings["lightPalette"], theme: s.theme === "dark" ? "light" : s.theme })}>
+        <span className="swatch-art" style={{ background: p.bg, color: p.text }}>
+          <span style={{ background: p.panel }} /><span style={{ background: p.panel, width: "60%" }} />
+          <i style={{ background: "var(--accent)" }} />
+        </span>
+        <span className="swatch-name">{p.name}</span>
+      </button>
+    );
+  };
+  return <>
+    <Seg k="theme" label="Mode" options={[["system", "System"], ["light", "Light"], ["dark", "Dark"]]} />
+    <div className="set-block">
+      <div className="set-block-label">Light theme</div>
+      <div className="swatches">{PALETTES.filter((p) => !p.dark).map(swatch)}</div>
+      <div className="set-block-label">Dark theme</div>
+      <div className="swatches">{PALETTES.filter((p) => p.dark).map(swatch)}</div>
+    </div>
+    <div className="set-block">
+      <div className="set-block-label">Accent</div>
+      <div className="accents">
+        {ACCENTS.map((c) => (
+          <button key={c} className={`accent-dot ${s.accent.toLowerCase() === c ? "on" : ""}`} style={{ background: c }}
+            aria-label={`Accent ${c}`} aria-pressed={s.accent.toLowerCase() === c} onClick={() => updateSettings({ accent: c })} />
+        ))}
+        <label className="accent-dot custom" title="Custom colour" style={{ background: ACCENTS.includes(s.accent.toLowerCase()) ? undefined : s.accent }}>
+          <input type="color" value={s.accent} onChange={(e) => updateSettings({ accent: e.target.value })} aria-label="Custom accent colour" />
+        </label>
+      </div>
+    </div>
+    <Seg k="layout" label="Messages" hint="Transcript reads like Claude Code in a terminal" options={[["transcript", "Transcript"], ["bubbles", "Bubbles"]]} />
+    <Pick k="uiFont" label="Interface font" options={[["inter", "Inter"], ["geist", "Geist"], ["plex", "IBM Plex Sans"], ["system", "System"], ["mono", "Monospace"]]} />
+    <Seg k="font" label="Reply font" options={[["sans", "Sans"], ["serif", "Serif"], ["mono", "Mono"]]} />
+    <Pick k="codeFont" label="Code font" options={[["jetbrains", "JetBrains Mono"], ["geist-mono", "Geist Mono"], ["plex-mono", "IBM Plex Mono"], ["system", "System mono"]]} />
+    <Seg k="textSize" label="Text size" options={[["small", "S"], ["medium", "M"], ["large", "L"], ["xlarge", "XL"]]} />
+    <Seg k="density" label="Density" options={[["compact", "Compact"], ["cozy", "Cozy"], ["roomy", "Roomy"]]} />
+    <Seg k="radius" label="Corners" options={[["sharp", "Sharp"], ["soft", "Soft"], ["round", "Round"]]} />
+    <Seg k="width" label="Chat width" options={[["narrow", "Narrow"], ["wide", "Wide"], ["full", "Full"]]} />
+    <Row label="Reset appearance" hint="Back to Graphite / Paper with the clay accent"><button className="btn" onClick={resetAppearance}>Reset</button></Row>
+  </>;
+}
+
 export function SettingsModal({ online, chats, onImport, onClearAll, onLogout, onClose }: {
   online: boolean; chats: Chat[]; onImport: (c: Chat[]) => void; onClearAll: () => void; onLogout: () => void; onClose: () => void;
 }) {
@@ -150,20 +223,18 @@ export function SettingsModal({ online, chats, onImport, onClearAll, onLogout, o
           <button key={t} className={tab === t ? "active" : ""} onClick={() => setTab(t)}>{TAB_LABEL[t]}</button>
         ))}</div>
         <div className="set-panel">
-          {tab === "general" && <>
-            <Pick k="theme" label="Theme" options={[["system", "System"], ["light", "Light"], ["dark", "Dark"]]} />
-            <Pick k="textSize" label="Text size" options={[["small", "Small"], ["medium", "Medium"], ["large", "Large"]]} />
-            <Pick k="width" label="Chat width" options={[["narrow", "Narrow"], ["wide", "Wide"]]} />
-            <Pick k="font" label="Reply font" options={[["serif", "Serif"], ["sans", "Sans"]]} />
-          </>}
+          {tab === "general" && <Appearance />}
           {tab === "chat" && <>
             <Pick k="defaultModel" label="Default model" options={MODELS.map((m) => [m.id, m.name])} />
             <Pick k="defaultEffort" label="Default effort" options={EFFORTS.map((e) => [e.id, e.label])} />
             <Toggle k="showThinking" label="Show thinking" hint="Claude's reasoning, folded above the answer" />
+            <Toggle k="toolsOpen" label="Expand tool steps" hint="Show every command and file Claude touches, not just a summary" />
+            <Toggle k="showUsage" label="Show tokens under replies" hint="Input, cached and output tokens for each reply" />
             <Toggle k="enterToSend" label="Enter sends" hint="On a computer keyboard; Shift+Enter for a new line" />
             <Toggle k="notifyReplies" label="Notify when a reply is ready" hint="A browser notification when Panda is in the background" />
           </>}
           {tab === "claude" && <ClaudeAccount online={online} />}
+          {tab === "github" && <GitHubSettings online={online} />}
           {tab === "data" && <DataTab chats={chats} onImport={onImport} onClearAll={onClearAll} onLogout={onLogout} />}
         </div>
       </div>

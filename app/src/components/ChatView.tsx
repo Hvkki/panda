@@ -7,6 +7,7 @@ import { Composer } from "./Composer";
 import { fmtTokens } from "./UsageSheet";
 import { IconAlert, IconCheck, IconChevron, IconBrain, IconCopy, IconRetry, IconSpinner, IconX } from "./Icons";
 import { modelName } from "../lib/models";
+import { dialogOpen } from "../lib/dismiss";
 
 const Markdown = memo(function Markdown({ text }: { text: string }) {
   return (
@@ -100,25 +101,46 @@ export function toolSummary(tools: ToolT[]) {
   return s[0].toUpperCase() + s.slice(1);
 }
 
-function Activity({ m, live }: { m: Message; live: boolean }) {
-  const tools = m.tools || [];
-  const [open, setOpen] = useState(false);
+/** A run of tool calls between two paragraphs: one summary line that opens into the steps. */
+/** "Bash: npm test" → ["Bash", "npm test"]; MCP names lose their prefix. */
+function splitLabel(label: string): [string, string] {
+  const i = label.indexOf(":");
+  const name = (i < 0 ? label : label.slice(0, i)).trim().replace(/^mcp__([^_]+)__/, "$1 · ");
+  return [name, i < 0 ? "" : label.slice(i + 1).trim()];
+}
+
+function Activity({ tools, all, live }: { tools: ToolT[]; all: ToolT[]; live: boolean }) {
+  const { toolsOpen } = useSettings();
+  const [open, setOpen] = useState(toolsOpen);
   if (!tools.length) return null;
-  const current = live ? [...tools].reverse().find((t) => !t.done) : undefined;
+  const kids = (id: string) => all.filter((t) => t.parent === id);
+  const running = live ? [...tools].reverse().find((t) => !t.done) : undefined;
+  const current = running && ([...kids(running.id)].reverse().find((t) => !t.done) || running);
   const failed = tools.filter((t) => t.error).length;
+  const Step = ({ t, sub }: { t: ToolT; sub?: boolean }) => {
+    const [name, detail] = splitLabel(t.label);
+    const state = !t.done && live ? "run" : t.error ? "error" : "ok";
+    return (
+      <div className={`step ${state} ${sub ? "sub" : ""}`} title={t.label}>
+        <span className="step-dot" aria-hidden />
+        <span className="step-label"><b>{name}</b>{detail && <span className="step-detail">({detail})</span>}</span>
+      </div>
+    );
+  };
   return (
-    <div className={`activity ${open ? "open" : ""}`}>
+    <div className={`activity ${open ? "open" : ""} ${running ? "live" : ""}`}>
       <button className="activity-head" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
-        <span>{toolSummary(tools)}{failed ? <span className="act-err"> · {failed} failed</span> : null}</span>
+        <span className="act-icon">{running ? <IconSpinner size={14} /> : failed ? <IconAlert size={14} /> : <IconCheck size={14} />}</span>
+        <span className="act-sum">{toolSummary(tools)}{failed ? <span className="act-err"> · {failed} failed</span> : null}</span>
         <span className="chev side"><IconChevron size={14} /></span>
       </button>
-      {current && !open && <div className="act-now" title={current.label}>{current.label}</div>}
+      {current && !open && <div className="act-now" title={current.label}><span className="act-elbow">⎿</span>{current.label}</div>}
       {open && (
         <div className="activity-list">
           {tools.map((t) => (
-            <div key={t.id} className={`step ${t.error ? "error" : ""}`} title={t.label}>
-              <span className="step-icon">{!t.done && live ? <IconSpinner size={14} /> : t.error ? <IconAlert size={14} /> : <IconCheck size={14} />}</span>
-              <span className="step-label">{t.label}</span>
+            <div key={t.id}>
+              <Step t={t} />
+              {kids(t.id).map((k) => <Step key={k.id} t={k} sub />)}
             </div>
           ))}
         </div>
@@ -127,37 +149,62 @@ function Activity({ m, live }: { m: Message; live: boolean }) {
   );
 }
 
-/** The orange "Deliberating…" line while Claude works. */
+type Seg = { k: "text"; text: string } | { k: "tools"; tools: ToolT[] };
+/** Turn a reply's parts into paragraphs and runs of tool calls, in order. */
+function segments(m: Message): Seg[] {
+  const tools = m.tools || [];
+  if (!m.parts?.length) {  // replies saved before parts existed
+    const top = tools.filter((t) => !t.parent);
+    return [...(top.length ? [{ k: "tools", tools: top } as Seg] : []), ...(m.content ? [{ k: "text", text: m.content } as Seg] : [])];
+  }
+  const byId = new Map(tools.map((t) => [t.id, t]));
+  const out: Seg[] = [];
+  for (const p of m.parts) {
+    const prev = out[out.length - 1];
+    if (p.k === "text") { if (p.text.trim()) out.push({ k: "text", text: p.text }); continue; }
+    const t = byId.get(p.id);
+    if (!t) continue;
+    if (prev?.k === "tools") prev.tools.push(t); else out.push({ k: "tools", tools: [t] });
+  }
+  return out;
+}
+
+const GLYPHS = ["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
+/** The accent "Working…" line while Claude works. */
 function LiveStatus({ m }: { m: Message }) {
   const tools = m.tools || [];
   const word = m.status === "waiting" ? "Starting the worker" : tools.some((t) => !t.done) ? "Working"
-    : m.content ? "Generating" : m.thinking ? "Thinking" : "Deliberating";
-  const [secs, setSecs] = useState(0);
+    : m.content ? "Writing" : m.thinking ? "Thinking" : "Pondering";
+  const [{ tick, secs }, setT] = useState({ tick: 0, secs: 0 });
   useEffect(() => {
     const t0 = Date.now();
-    const id = window.setInterval(() => setSecs(Math.floor((Date.now() - t0) / 1000)), 1000);
+    const id = window.setInterval(() => setT((v) => ({ tick: v.tick + 1, secs: Math.floor((Date.now() - t0) / 1000) })), 120);
     return () => window.clearInterval(id);
   }, []);
   return (
-    <div className="live-status">
-      <span className="dots"><i /><i /><i /><i /></span>
-      <span>{word}…</span>
-      {secs >= 5 && <span className="live-secs">{secs}s</span>}
+    <div className="live-status" role="status">
+      <span className="live-glyph" aria-hidden>{GLYPHS[tick % GLYPHS.length]}</span>
+      <span className="live-word">{word}…</span>
+      <span className="live-secs">{secs >= 1 ? `${secs}s` : ""}{window.innerWidth > 700 ? " · esc to stop" : ""}</span>
     </div>
   );
 }
 
 const MessageView = memo(function MessageView({ m, model, onRetry }: { m: Message; model: string; onRetry?: () => void }) {
   const [copied, setCopied] = useState(false);
-  const { showThinking } = useSettings();
-  if (m.role === "user") return <div className="msg user"><div className="bubble">{m.content}</div></div>;
+  const { showThinking, showUsage } = useSettings();
+  if (m.role === "user") return <div className="msg user"><span className="gutter" aria-hidden>›</span><div className="bubble">{m.content}</div></div>;
   const live = m.status === "streaming" || m.status === "waiting";
   const u = m.usage;
   return (
     <div className="msg assistant">
       {m.thinking && showThinking && <Thinking text={m.thinking} live={live && !m.content} />}
-      <Activity m={m} live={live} />
-      {m.content && <div className="prose">{live ? <StreamingMarkdown text={m.content} /> : <Markdown text={m.content} />}</div>}
+      {segments(m).map((g, i, all) => {
+        const lastSeg = i === all.length - 1;
+        return g.k === "tools"
+          ? <Activity key={i} tools={g.tools} all={m.tools || []} live={live} />
+          : <div key={i} className="prose">{live && lastSeg ? <StreamingMarkdown text={g.text} /> : <Markdown text={g.text} />}</div>;
+      })}
       {m.status === "error" && <div className="error-note"><IconAlert size={15} /> {m.error || "Something went wrong."}</div>}
       {live ? <LiveStatus m={m} /> : (
         <div className="msg-actions">
@@ -168,7 +215,7 @@ const MessageView = memo(function MessageView({ m, model, onRetry }: { m: Messag
           {onRetry && <button className="tap" onClick={onRetry} title="Retry" aria-label="Retry"><IconRetry size={17} /></button>}
           <span className="muted meta-line">
             {modelName(model)}{m.secs ? ` · ${m.secs}s` : ""}
-            {u ? ` · ${fmtTokens(u.input + u.cache_write)} in · ${fmtTokens(u.cache_read)} cached · ${fmtTokens(u.output)} out` : ""}
+            {u && showUsage ? ` · ${fmtTokens(u.input + u.cache_write)} in · ${fmtTokens(u.cache_read)} cached · ${fmtTokens(u.output)} out` : ""}
           </span>
         </div>
       )}
@@ -204,6 +251,12 @@ export function ChatView({ chat, onSend, onRetry, onStop, canAttach, onModel }: 
     stick.current = true;
     onSend(next.text, next.attached);
   }, [busy, queue, last, onSend]);
+  useEffect(() => {
+    if (!busy) return;
+    const esc = (e: KeyboardEvent) => { if (e.key === "Escape" && !dialogOpen()) { setQueue([]); onStop(); } };
+    document.addEventListener("keydown", esc);
+    return () => document.removeEventListener("keydown", esc);
+  }, [busy, onStop]);
   const send = (text: string, attached: string[]) => {
     if (busy) setQueue((q) => [...q, { id: Date.now(), text, attached }]);
     else { stick.current = true; onSend(text, attached); }

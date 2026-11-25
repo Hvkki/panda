@@ -21,7 +21,7 @@ export function DeveloperPage({ online, chat }: { online: boolean; chat: ReactNo
       </div>
       {tab === "chat" ? (
         <div className="dev-chat">
-          <div className="dev-note muted small">Claude can change Panda here and publish it with <code>VERCEL_TOKEN</code>. Changes are kept in your Kaggle dataset between runs. Add <code>GITHUB_TOKEN</code> too if you want them pushed to GitHub.</div>
+          <div className="dev-note muted small">Claude can change Panda here and publish it with <code>VERCEL_TOKEN</code>. Changes are kept in your Kaggle dataset between runs. Connect GitHub in Settings → GitHub to have them pushed.</div>
           {chat}
         </div>
       ) : <div className="page dev-env"><EnvTab online={online} /></div>}

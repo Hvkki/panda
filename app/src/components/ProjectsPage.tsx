@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Chat, Project } from "../lib/store";
 import { Composer } from "./Composer";
+import { RepoPicker } from "./GitHub";
 import { IconArrowLeft, IconFolder, IconPlus, IconTrash } from "./Icons";
 
 type Props = {
@@ -48,6 +49,7 @@ export function ProjectsPage(p: Props) {
               <button key={x.id} className="project-card" onClick={() => p.onOpenProject(x.id)}>
                 <div className="project-name">{x.name}</div>
                 <div className="muted small project-desc">{x.instructions || "No instructions yet"}</div>
+                {x.repo && <div className="small project-repo"><code>{x.repo}</code></div>}
                 <div className="muted small">{n} chat{n === 1 ? "" : "s"} · updated {new Date(x.updated).toLocaleDateString()}</div>
               </button>
             );
@@ -90,6 +92,11 @@ function ProjectDetail(p: Props & { project: Project }) {
             <textarea className="instructions" rows={8} value={instructions} placeholder="e.g. Answer in Ukrainian. The code is in Python 3.12…"
               onChange={(e) => setInstructions(e.target.value)} onBlur={saveInstructions} />
             {instructions !== project.instructions && <button className="btn primary" onClick={saveInstructions}>Save</button>}
+          </div>
+          <div className="side-card">
+            <h3>GitHub repo</h3>
+            <p className="muted small">Cloned into this project's folder the first time a chat needs it. Claude can commit and push to it.</p>
+            <RepoPicker value={project.repo} online={p.online} onPick={(repo) => p.onPatch(project.id, { repo })} />
           </div>
           <div className="side-card">
             <h3>Files</h3>

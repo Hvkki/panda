@@ -62,7 +62,8 @@ export function Composer({ model, effort, onModel, onSend, onStop, busy, autoFoc
   const canModel = !!(model && effort && onModel);
   const openModel = () => canModel && setModelOpen(true);
   // The "/" menu: shown while the box holds just "/word" (no space yet).
-  const typed = /^\/([\w:.-]*)$/.exec(text)?.[1];
+  const [hidden, setHidden] = useState("");  // the text for which Escape closed the "/" menu
+  const typed = hidden === text ? undefined : /^\/([\w:.-]*)$/.exec(text)?.[1];
   const menu = typed === undefined || !commands ? [] : [
     ...[...LOCAL_COMMANDS].filter((n) => canModel || (n !== "model" && n !== "effort")),
     ...(slash?.commands || []).filter((n) => !LOCAL_COMMANDS.has(n)),
@@ -157,36 +158,36 @@ export function Composer({ model, effort, onModel, onSend, onStop, busy, autoFoc
             ))}
           </div>
         )}
+        <textarea ref={area} rows={1} autoFocus={autoFocus} value={text}
+          placeholder={busy ? "Queue a follow-up…" : placeholder || (commands ? "Message Claude Code  ·  / for commands" : "Message Claude Code")}
+          onChange={(e) => { setText(e.target.value); grow(); }}
+          onKeyDown={(e) => {
+            if (e.key === "Escape" && (menu.length || typed !== undefined)) { e.preventDefault(); e.stopPropagation(); setHidden(text); return; }
+            if ((e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) && menu.length && typed !== menu[0]) { e.preventDefault(); pick(menu[0]); return; }
+            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && window.innerWidth > 700 && getSettings().enterToSend) { e.preventDefault(); send(); }
+          }} />
         <div className="composer-row">
           <input ref={input} type="file" multiple hidden onChange={(e) => addFiles(e.target.files)} />
-          <button className="round-btn soft" disabled={!canAttach} onClick={() => input.current?.click()}
-            title={canAttach ? "Attach files" : "Start the worker to attach files"} aria-label="Attach files"><IconPlus /></button>
-          <textarea ref={area} rows={1} autoFocus={autoFocus} value={text}
-            placeholder={busy ? "Add to queue" : placeholder || (commands ? "Ask anything, or type / for commands" : "Ask anything")}
-            onChange={(e) => { setText(e.target.value); grow(); }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && window.innerWidth > 700 && getSettings().enterToSend) { e.preventDefault(); send(); }
-            }} />
-          {SpeechRec && (
-            <button className={`round-btn soft ${listening ? "rec" : ""}`} onClick={toggleMic}
-              aria-label={listening ? "Stop dictation" : "Dictate"} title={listening ? "Stop dictation" : "Dictate"}><IconMic /></button>
+          <button className="c-btn" disabled={!canAttach} onClick={() => input.current?.click()}
+            title={canAttach ? "Attach files" : "Start the worker to attach files"} aria-label="Attach files"><IconPlus size={18} /></button>
+          {canModel && (
+            <button type="button" className="c-chip" onClick={openModel} title="Model and effort">
+              {modelName(model!)} <span className="c-dim">{effortLabel(effort!)}</span> <IconChevron size={13} />
+            </button>
           )}
-          {busy && !hasInput ? (
-            <button className="round-btn soft" onClick={onStop} aria-label="Stop" title="Stop"><IconStop size={18} /></button>
-          ) : (
-            <button className="round-btn send" onClick={send} disabled={!hasInput || uploading}
-              aria-label={busy ? "Queue" : "Send"} title={busy ? "Queue" : "Send"}><IconSend size={18} /></button>
+          {commands && <button type="button" className="c-chip c-dim hide-narrow" onClick={() => { setText("/"); area.current?.focus(); }}>/ commands</button>}
+          <span className="grow" />
+          {SpeechRec && (
+            <button className={`c-btn ${listening ? "rec" : ""}`} onClick={toggleMic}
+              aria-label={listening ? "Stop dictation" : "Dictate"} title={listening ? "Stop dictation" : "Dictate"}><IconMic size={18} /></button>
+          )}
+          {busy && <button className="c-btn stop" onClick={onStop} aria-label="Stop" title="Stop (Esc)"><IconStop size={16} /></button>}
+          {(!busy || hasInput) && (
+            <button className="c-send" onClick={send} disabled={!hasInput || uploading}
+              aria-label={busy ? "Queue" : "Send"} title={busy ? "Queue" : "Send"}><IconSend size={17} /></button>
           )}
         </div>
       </div>
-      {canModel && (
-        <div className="composer-foot">
-          <button type="button" className="chip model-chip" onClick={openModel}>
-            {modelName(model!)} <span className="muted">{effortLabel(effort!)}</span> <IconChevron size={14} />
-          </button>
-          {commands && <button type="button" className="chip model-chip muted" onClick={() => { setText("/"); area.current?.focus(); }}>/ Commands</button>}
-        </div>
-      )}
       {modelOpen && canModel && <ModelSheet model={model!} effort={effort!} onChange={onModel!} onClose={() => setModelOpen(false)} />}
     </div>
   );

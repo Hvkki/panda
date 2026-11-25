@@ -1,6 +1,8 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import { useEscape } from "../lib/dismiss";
+import { Backdrop } from "./Panels";
 import { EFFORTS, MODELS, effortLabel, modelName } from "../lib/models";
-import { IconAlert, IconCheck, IconChevron } from "./Icons";
+import { IconAlert, IconCheck, IconChevron, IconX } from "./Icons";
 
 type Props = { model: string; effort: string; onChange: (model: string, effort: string) => void };
 
@@ -17,15 +19,14 @@ export function ModelPicker({ model, effort, onChange }: Props) {
 }
 
 export function ModelSheet({ model, effort, onChange, onClose }: Props & { onClose: () => void }) {
-  useEffect(() => {
-    const esc = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", esc);
-    return () => window.removeEventListener("keydown", esc);
-  }, [onClose]);
+  useEscape(onClose);
   return (
-    <div className="sheet-backdrop" onClick={onClose}>
-      <div className="sheet" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Choose model">
-        <div className="sheet-handle" />
+    <Backdrop className="sheet-backdrop" onClose={onClose}>
+      <div className="sheet" role="dialog" aria-modal="true" aria-label="Choose model">
+        <div className="sheet-head">
+          <span className="sheet-label">Model</span>
+          <button className="icon-btn" onClick={onClose} aria-label="Close"><IconX size={18} /></button>
+        </div>
         {MODELS.map((m) => (
           <button key={m.id} className="sheet-row" onClick={() => { onChange(m.id, effort); onClose(); }}>
             <div>
@@ -48,6 +49,6 @@ export function ModelSheet({ model, effort, onChange, onClose }: Props & { onClo
           </button>
         ))}
       </div>
-    </div>
+    </Backdrop>
   );
 }
