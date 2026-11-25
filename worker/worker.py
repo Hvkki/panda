@@ -381,13 +381,36 @@ def run_claude(req: dict, emit) -> None:
     # between messages makes Claude Code run an extra turn of its own. Skip output until Claude Code
     # says it started on this message (--replay-user-messages makes it say so).
     mine = not keep
+    # Background subagents/commands: when one is running at the end of a turn, keep listening. Claude Code
+    # starts a follow-up turn by itself when it finishes (a <task-notification>), and that turn is the real
+    # answer. Without this the reply ended early and the agent was killed with the process.
+    bg_pending = 0
+    bg_deadline = 0.0
     try:
-        for line in iter(p.lines.get, None):
+        while True:
+            try:
+                line = p.lines.get(timeout=30)
+            except queue.Empty:
+                if bg_deadline and time.time() > bg_deadline:
+                    bg_pending = 0
+                    emit({"t": "text", "d": "\n\n(Background work took too long, so I stopped waiting for it.)"})
+                    emit({"t": "done", "session_id": sent_session, "text": "", "error": False,
+                          "secs": round(time.time() - t0, 1), "usage": turn_usage({}, ctx), "turns": None})
+                    done = True
+                    if keep:
+                        p.idle.set()
+                    break
+                continue
+            if line is None:
+                break
             try:
                 ev = json.loads(line)
             except ValueError:
                 continue
             kind = ev.get("type")
+            if mine and bg_pending:
+                n = line.count("<task-notification>") if kind != "system" else int(ev.get("subtype") == "task_notification")
+                bg_pending = max(0, bg_pending - n)
             if kind == "command_lifecycle" or (kind == "user" and ev.get("isReplay")):
                 if (ev.get("command_uuid") or ev.get("uuid")) == msg_id and ev.get("state", "started") == "started":
                     mine = True
@@ -427,12 +450,20 @@ def run_claude(req: dict, emit) -> None:
                 for b in (ev.get("message") or {}).get("content") or []:
                     if b.get("type") == "tool_use":
                         seen_tools.add(b.get("id"))
+                        bi = b.get("input") or {}
+                        if not ev.get("parent_tool_use_id") and (
+                                (b.get("name") in ("Agent", "Task") and bi.get("run_in_background") is not False)
+                                or (b.get("name") == "Bash" and bi.get("run_in_background") is True)):
+                            bg_pending += 1
                         emit({"t": "tool", "id": b.get("id"), "label": tool_label(b.get("name", "tool"), b.get("input")),
                               "parent": ev.get("parent_tool_use_id") or ""})
             elif kind == "user":
                 for b in (ev.get("message") or {}).get("content") or []:
                     if isinstance(b, dict) and b.get("type") == "tool_result":
                         emit({"t": "tool_done", "id": b.get("tool_use_id"), "error": bool(b.get("is_error"))})
+            elif kind == "result" and bg_pending and keep and not (bg_deadline and time.time() > bg_deadline):
+                bg_deadline = bg_deadline or time.time() + 20 * 60
+                emit({"t": "break"})  # the turn ended but background work is still running: wait for its follow-up
             elif kind == "result":
                 done = True
                 emit({"t": "done", "session_id": ev.get("session_id"), "text": ev.get("result") or "",
