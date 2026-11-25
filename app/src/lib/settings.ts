@@ -29,7 +29,7 @@ const DEFAULTS: Settings = {
   theme: "system", lightPalette: "paper", darkPalette: "graphite", accent: "#d97757",
   uiFont: "inter", font: "sans", codeFont: "jetbrains", textSize: "medium", density: "cozy", radius: "soft",
   width: "narrow", layout: "transcript", toolsOpen: false, showUsage: true, showThinking: true,
-  enterToSend: true, notifyReplies: true, defaultModel: "default", defaultEffort: "medium",
+  enterToSend: true, notifyReplies: true, defaultModel: "sonnet", defaultEffort: "medium",
 };
 
 export const PALETTES: { id: LightPalette | DarkPalette; name: string; dark: boolean; bg: string; panel: string; text: string }[] = [
@@ -66,7 +66,13 @@ const FONT_STACK: Record<string, string> = {
 const KEY = "panda.settings.v1";
 let current: Settings = (() => {
   try {
-    return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(KEY) || "{}") };
+    const saved = JSON.parse(localStorage.getItem(KEY) || "{}");
+    // One time: the old default was "Default"; Sonnet 5.5 medium is the new one.
+    if (!localStorage.getItem(KEY + ".sonnet")) {
+      localStorage.setItem(KEY + ".sonnet", "1");
+      if (!saved.defaultModel || saved.defaultModel === "default") { saved.defaultModel = "sonnet"; saved.defaultEffort = "medium"; }
+    }
+    return { ...DEFAULTS, ...saved };
   } catch { return DEFAULTS; }
 })();
 const subs = new Set<() => void>();

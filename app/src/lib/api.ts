@@ -262,3 +262,18 @@ export const getGitHub = () => wjson<GitHubCheck>("/github");
 export const setGitHub = (token: string) => wjson<GitHubCheck>("/github", { token });
 export const recheckGitHub = () => wjson<GitHubCheck>("/github", { recheck: true });
 export const getRepos = (fresh = false) => wjson<{ repos: GitHubRepo[] }>(`/github/repos${fresh ? "?fresh=1" : ""}`).then((d) => d.repos || []);
+
+// ---- 3D studio (Blender on the worker) ----
+export type BlenderStatus = { ready: boolean; installing: boolean; log: string; error: string };
+export type RenderJob = { state: "running" | "done" | "error"; log: string; error?: string; image?: string; model?: string; blend?: string };
+export const blenderStatus = () => wjson<BlenderStatus>("/blender/status");
+export const blenderInstall = () => wjson<{ ok: boolean }>("/blender/install", {});
+export const blenderRender = (b: { script: string; name: string; width: number; height: number; samples: number }) =>
+  wjson<{ id: string }>("/blender/render", b);
+export const blenderJob = (id: string) => wjson<RenderJob>(`/blender/job?id=${encodeURIComponent(id)}`);
+/** Fetch a workspace file (with the worker's login) as a blob. */
+export async function fetchWorkFile(path: string): Promise<Blob> {
+  const r = await wfetch(`/file?path=${encodeURIComponent(path)}`);
+  if (!r.ok) throw new Error(`Worker answered ${r.status}`);
+  return r.blob();
+}
