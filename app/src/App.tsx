@@ -332,7 +332,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
           </div>
         )}
       </main>
-      {modal === "usage" && <UsageSheet chat={headChat} online={online} plan={plan} onClose={() => setModal(null)} />}
+      {modal === "usage" && <UsageSheet chat={headChat} chats={chats} online={online} plan={plan} onClose={() => setModal(null)} />}
       {modelOpen && headChat && <ModelSheet model={headChat.model} effort={headChat.effort} onClose={() => setModelOpen(false)}
         onChange={(model, effort) => patchChat(headChat.id, (c) => ({ ...c, model, effort }))} />}
       {browserOpen && online && <BrowserPanel onClose={() => setBrowserOpen(false)} />}

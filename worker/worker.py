@@ -421,6 +421,7 @@ def run_claude(req: dict, emit) -> None:
                 note_commands(bool(req.get("dev")), ev)
             if kind == "system" and ev.get("session_id") and ev["session_id"] != sent_session:
                 sent_session = ev["session_id"]
+                SID_CHAT[sent_session] = chat
                 emit({"t": "session", "id": sent_session})
             elif kind == "stream_event":
                 e = ev.get("event") or {}
@@ -490,6 +491,155 @@ def run_claude(req: dict, emit) -> None:
     elif not done:
         tail = " ".join(errors)[-400:] or f"claude exited with code {p.returncode}"
         emit({"t": "error", "message": tail})
+
+
+# ── token tracker ────────────────────────────────────────────────────────────
+# Every request Claude Code makes to the model goes through this local proxy (ANTHROPIC_BASE_URL), so
+# nothing is missed: chat turns, subagents, compaction, titles, anything else. It forwards bytes as they
+# come (streaming is unchanged) and records the model, the token counts and the plan usage Anthropic
+# reports in the response headers. The app shows it under Usage -> Token tracker.
+import http.client
+from collections import deque
+TRACK_PORT = PORT + 11
+TRACK_FILE = HOME / ".claude" / "panda-tokens.jsonl"   # ~/.claude is carried over to the next run
+TRACK: deque = deque(maxlen=3000)
+TRACK_LOCK = threading.Lock()
+SID_CHAT: dict = {}   # Claude session id -> Panda chat id
+HOP = ("connection", "keep-alive", "proxy-connection", "transfer-encoding", "te", "trailer", "upgrade",
+       "host", "content-length", "accept-encoding")
+
+
+def track_load() -> None:
+    try:
+        lines = TRACK_FILE.read_text().splitlines()[-3000:]
+    except OSError:
+        return
+    for l in lines:
+        try:
+            TRACK.append(json.loads(l))
+        except ValueError:
+            pass
+    SID_CHAT.update({e["sid"]: e["chat"] for e in TRACK if e.get("sid") and e.get("chat")})
+
+
+def track_add(e: dict) -> None:
+    with TRACK_LOCK:
+        TRACK.append(e)
+        try:
+            with open(TRACK_FILE, "a") as f:
+                f.write(json.dumps(e) + "\n")
+            if TRACK_FILE.stat().st_size > 4_000_000:
+                TRACK_FILE.write_text("".join(json.dumps(x) + "\n" for x in TRACK))
+        except OSError:
+            pass
+
+
+def _usage_from(data: bytes) -> tuple[dict, str]:
+    """Token usage and model from an SSE stream or a JSON body of /v1/messages."""
+    u, model = {}, ""
+    text = data.decode("utf8", "replace")
+    chunks = [l[5:].strip() for l in text.splitlines() if l.startswith("data:") and '"usage"' in l] or [text]
+    for c in chunks:
+        try:
+            ev = json.loads(c)
+        except ValueError:
+            continue
+        msg = ev.get("message") if ev.get("type") == "message_start" else ev
+        if isinstance(msg, dict):
+            model = msg.get("model") or model
+            u.update({k: v for k, v in (msg.get("usage") or ev.get("usage") or {}).items() if v is not None})
+    return u, model
+
+
+class TrackHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def forward(self):
+        t0 = time.time()
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n) if n else None
+        hd = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+        hd["Accept-Encoding"] = "identity"  # plain bytes, so the usage can be read
+        try:
+            c = http.client.HTTPSConnection("api.anthropic.com", timeout=900)
+            c.request(self.command, self.path, body=body, headers=hd)
+            r = c.getresponse()
+        except (OSError, http.client.HTTPException) as exc:
+            msg = json.dumps({"type": "error", "error": {"type": "api_error", "message": f"proxy: {exc}"}}).encode()
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+            return
+        self.send_response(r.status)
+        for k, v in r.getheaders():
+            if k.lower() not in HOP:
+                self.send_header(k, v)
+        nobody = self.command == "HEAD" or r.status in (204, 304)
+        if not nobody:
+            self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        is_msg = self.path.startswith("/v1/messages") and "count_tokens" not in self.path
+        head, tail = b"", b""  # message_start is at the start of the stream, message_delta at the end
+        try:
+            while not nobody:
+                ch = r.read1(65536)
+                if not ch:
+                    break
+                if is_msg and len(head) < 65536:
+                    head += ch
+                elif is_msg:
+                    tail = (tail + ch)[-16384:]
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(ch), ch))
+                self.wfile.flush()
+            if not nobody:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+        except (OSError, http.client.HTTPException):
+            self.close_connection = True
+        finally:
+            c.close()
+        if not is_msg:
+            return
+        try:
+            req = json.loads(body or b"{}")
+        except ValueError:
+            req = {}
+        u, model = _usage_from(head + b"\n" + tail)
+        hdr = {k.lower(): v for k, v in r.getheaders()}
+        f = lambda k: float(hdr[k]) if k in hdr else None
+        sid = self.headers.get("X-Claude-Code-Session-Id") or ""
+        cc = u.get("cache_creation") or {}
+        track_add({
+            "at": round(t0, 1), "ms": int((time.time() - t0) * 1000), "status": r.status, "sid": sid,
+            "chat": SID_CHAT.get(sid, ""), "model": model or str(req.get("model") or ""),
+            "msgs": len(req.get("messages") or []), "tools": len(req.get("tools") or []),
+            "in": int(u.get("input_tokens") or 0), "out": int(u.get("output_tokens") or 0),
+            "cr": int(u.get("cache_read_input_tokens") or 0), "cw": int(u.get("cache_creation_input_tokens") or 0),
+            "cw1h": int(cc.get("ephemeral_1h_input_tokens") or 0),
+            "think": int((u.get("output_tokens_details") or {}).get("thinking_tokens") or 0),
+            "u5h": f("anthropic-ratelimit-unified-5h-utilization"), "u7d": f("anthropic-ratelimit-unified-7d-utilization"),
+        })
+
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = forward
+
+
+def start_tracker() -> None:
+    """Start the proxy and send Claude Code through it. If it can't start, Claude Code talks to Anthropic directly."""
+    track_load()
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", TRACK_PORT), TrackHandler)
+    except OSError as exc:
+        log("token tracker not started:", exc)
+        return
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    ENV["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{TRACK_PORT}"
+    log(f"token tracker on 127.0.0.1:{TRACK_PORT}")
 
 
 # ── slash commands ───────────────────────────────────────────────────────────
@@ -1530,6 +1680,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"repos": GH["repos"]})
         if u.path == "/commands":
             return self.send_json(slash_commands(q.get("dev", [""])[0] == "1"))
+        if u.path == "/tokens":
+            with TRACK_LOCK:
+                return self.send_json({"calls": list(TRACK)[-int(q.get("n", ["1500"])[0] or 1500):]})
         if u.path == "/usage":
             return self.send_json(plan_usage(force=q.get("fresh", [""])[0] == "1"))
         if u.path == "/notifications":
@@ -2095,6 +2248,7 @@ def start_github() -> None:
 
 def main():
     install()
+    start_tracker()
     apply_skills()
     apply_memory()
     apply_mcp()

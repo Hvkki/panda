@@ -277,3 +277,7 @@ export async function fetchWorkFile(path: string): Promise<Blob> {
   if (!r.ok) throw new Error(`Worker answered ${r.status}`);
   return r.blob();
 }
+/** One model request Claude Code made, as recorded by the worker's token tracker (a local proxy). */
+export type TrackedCall = { at: number; ms: number; status: number; sid: string; chat: string; model: string; msgs: number; tools: number;
+  in: number; out: number; cr: number; cw: number; cw1h: number; think: number; u5h: number | null; u7d: number | null };
+export const getTokens = () => wjson<{ calls: TrackedCall[] }>("/tokens").then((d) => (Array.isArray(d.calls) ? d.calls : []));

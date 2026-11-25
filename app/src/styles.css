@@ -605,3 +605,6 @@ code, kbd, pre { font-family: var(--mono); }
 
 /* last, so it wins over component display rules */
 @media (max-width: 700px) { .hide-narrow { display: none !important; } }
+.us-more { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); }
+.us-calls { max-height: 340px; overflow: auto; font-size: .8em; }
+.us-calls > div span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
