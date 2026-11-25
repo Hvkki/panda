@@ -1489,7 +1489,7 @@ def ask_relay():
         log("relay requested:", urllib.request.urlopen(req, timeout=60).read().decode()[:200])
     except Exception as exc:
         log("relay request failed (retrying in 5 min):", exc)
-        HANDOFF["asked"] = time.time() - 20 * 60  # the main loop asks again 25 min after the last try
+        HANDOFF["asked"] = time.time()  # the main loop asks again in 5 min
 
 
 def handoff_begin(url: str) -> dict:
@@ -1641,7 +1641,9 @@ def main():
         if HANDOFF["state"] == "moved" and time.time() - HANDOFF["done"] > 5 * 60:
             log("handed over, stopping")
             break
-        if not HANDOFF["state"] and age > MAX_RUNTIME - RELAY_LEAD and time.time() - HANDOFF["asked"] > 25 * 60:
+        # Ask again every 5 min until the new run checks in (Kaggle can list a finished run as running
+        # for a while, and the app then answers "already starting"; asking again is harmless).
+        if not HANDOFF["state"] and age > MAX_RUNTIME - RELAY_LEAD and time.time() - HANDOFF["asked"] > 5 * 60:
             threading.Thread(target=ask_relay, daemon=True).start()
             HANDOFF["asked"] = time.time()
         if age > MAX_RUNTIME + (RELAY_GRACE if HANDOFF["state"] else 0):
@@ -1664,6 +1666,12 @@ def main():
         BROWSER["proc"].kill()
     tunnel.terminate()
     srv.shutdown()
+    if ON_KAGGLE:
+        # Kaggle saves /kaggle/working as the run's output when the script ends, which can take many
+        # minutes (and keeps the notebook listed as running, blocking the next start). Nothing reads
+        # that output: settings live in the private dataset, and a relay already carried the files.
+        for p in WORK.iterdir():
+            shutil.rmtree(p, ignore_errors=True) if p.is_dir() and not p.is_symlink() else p.unlink(missing_ok=True)
     log("stopped")
 
 

@@ -39,6 +39,8 @@ export async function ensureWorker(onState: (s: WorkerState["state"]) => void, s
     if (Date.now() > deadline) throw new Error("The worker did not come online in 10 minutes. Check the Kaggle notebook log.");
     await new Promise((res) => setTimeout(res, 5000));
     s = await sessionAction("status");
+    // A start right after a stop can be refused while Kaggle still lists the old run: try again.
+    if (s.state === "off") s = await sessionAction("start");
   }
   return s.url!;
 }
