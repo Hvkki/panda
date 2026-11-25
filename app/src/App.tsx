@@ -18,6 +18,7 @@ import { Logo } from "./components/Logo";
 import { IconDots, IconGauge, IconGlobe, IconPlus, IconSidebar, IconSliders } from "./components/Icons";
 import { UsageRing, UsageSheet, chatUsage, usePlanUsage } from "./components/UsageSheet";
 import { ModelSheet } from "./components/ModelSheet";
+import { StudioPage } from "./components/StudioPage";
 import { effortLabel, modelName } from "./lib/models";
 
 export default function App() {
@@ -238,7 +239,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
   const headProject = headChat?.project_id ? projects.find((p) => p.id === headChat.project_id) : undefined;
   const headUsage = chatUsage(headChat);
   const title = view === "chat" ? active?.title || "" : view === "developer" ? "Developer"
-    : view === "projects" ? "Projects" : view === "files" ? "Files" : view === "customize" ? "Customize" : "";
+    : view === "projects" ? "Projects" : view === "studio" ? "3D studio" : view === "files" ? "Files" : view === "customize" ? "Customize" : "";
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   useDismiss(menuOpen, () => setMenuOpen(false), [menuRef]);
@@ -305,7 +306,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
             )}
           </div>
         </header>
-        {view === "files" ? <FilesPage online={online} /> : view === "customize" ? <CustomizePage online={online} onAsk={ask} /> : view === "projects" ? (
+        {view === "studio" ? <StudioPage online={online} /> : view === "files" ? <FilesPage online={online} /> : view === "customize" ? <CustomizePage online={online} onAsk={ask} /> : view === "projects" ? (
           <ProjectsPage projects={projects} chats={chats} openId={projectId} online={online} draft={draft}
             onDraft={(model, effort) => setDraft({ model, effort })} onOpenProject={setProjectId}
             onOpenChat={(id) => { setActiveId(id); setView("chat"); }}
@@ -325,7 +326,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
           <div className="home">
             <h1 className="greeting serif"><Logo size={40} animated /> What are we working on?</h1>
             <div className="home-composer">
-              <Composer model={draft.model} effort={draft.effort} onModel={(model, effort) => setDraft({ model, effort })}
+              <Composer draftKey="home" model={draft.model} effort={draft.effort} onModel={(model, effort) => setDraft({ model, effort })}
                 onSend={startChat} autoFocus canAttach={false} />
             </div>
           </div>

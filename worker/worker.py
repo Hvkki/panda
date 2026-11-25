@@ -381,13 +381,36 @@ def run_claude(req: dict, emit) -> None:
     # between messages makes Claude Code run an extra turn of its own. Skip output until Claude Code
     # says it started on this message (--replay-user-messages makes it say so).
     mine = not keep
+    # Background subagents/commands: when one is running at the end of a turn, keep listening. Claude Code
+    # starts a follow-up turn by itself when it finishes (a <task-notification>), and that turn is the real
+    # answer. Without this the reply ended early and the agent was killed with the process.
+    bg_pending = 0
+    bg_deadline = 0.0
     try:
-        for line in iter(p.lines.get, None):
+        while True:
+            try:
+                line = p.lines.get(timeout=30)
+            except queue.Empty:
+                if bg_deadline and time.time() > bg_deadline:
+                    bg_pending = 0
+                    emit({"t": "text", "d": "\n\n(Background work took too long, so I stopped waiting for it.)"})
+                    emit({"t": "done", "session_id": sent_session, "text": "", "error": False,
+                          "secs": round(time.time() - t0, 1), "usage": turn_usage({}, ctx), "turns": None})
+                    done = True
+                    if keep:
+                        p.idle.set()
+                    break
+                continue
+            if line is None:
+                break
             try:
                 ev = json.loads(line)
             except ValueError:
                 continue
             kind = ev.get("type")
+            if mine and bg_pending:
+                n = line.count("<task-notification>") if kind != "system" else int(ev.get("subtype") == "task_notification")
+                bg_pending = max(0, bg_pending - n)
             if kind == "command_lifecycle" or (kind == "user" and ev.get("isReplay")):
                 if (ev.get("command_uuid") or ev.get("uuid")) == msg_id and ev.get("state", "started") == "started":
                     mine = True
@@ -427,12 +450,20 @@ def run_claude(req: dict, emit) -> None:
                 for b in (ev.get("message") or {}).get("content") or []:
                     if b.get("type") == "tool_use":
                         seen_tools.add(b.get("id"))
+                        bi = b.get("input") or {}
+                        if not ev.get("parent_tool_use_id") and (
+                                (b.get("name") in ("Agent", "Task") and bi.get("run_in_background") is not False)
+                                or (b.get("name") == "Bash" and bi.get("run_in_background") is True)):
+                            bg_pending += 1
                         emit({"t": "tool", "id": b.get("id"), "label": tool_label(b.get("name", "tool"), b.get("input")),
                               "parent": ev.get("parent_tool_use_id") or ""})
             elif kind == "user":
                 for b in (ev.get("message") or {}).get("content") or []:
                     if isinstance(b, dict) and b.get("type") == "tool_result":
                         emit({"t": "tool_done", "id": b.get("tool_use_id"), "error": bool(b.get("is_error"))})
+            elif kind == "result" and bg_pending and keep and not (bg_deadline and time.time() > bg_deadline):
+                bg_deadline = bg_deadline or time.time() + 20 * 60
+                emit({"t": "break"})  # the turn ended but background work is still running: wait for its follow-up
             elif kind == "result":
                 done = True
                 emit({"t": "done", "session_id": ev.get("session_id"), "text": ev.get("result") or "",
@@ -1261,6 +1292,141 @@ def browser_act(a: dict) -> dict:
 FAILS = {"n": 0, "until": 0.0}
 
 
+
+# ---------- 3D studio: Blender renders ----------
+BLENDER = {"installing": False, "log": "", "error": ""}
+JOBS: dict = {}
+
+BLENDER_WRAP = '''
+import bpy, os, sys
+out = os.environ["PANDA_3D_OUT"]
+W, H, S = int(os.environ["PANDA_3D_W"]), int(os.environ["PANDA_3D_H"]), int(os.environ["PANDA_3D_SAMPLES"])
+bpy.ops.wm.read_factory_settings(use_empty=True)
+exec(compile(open(os.path.join(out, "scene.py")).read(), "scene.py", "exec"), {"bpy": bpy, "__name__": "__main__"})
+scn = bpy.context.scene
+if not any(o.type == "LIGHT" for o in scn.objects):
+    bpy.ops.object.light_add(type="SUN", location=(4, -4, 8)); bpy.context.object.data.energy = 3
+    bpy.ops.object.light_add(type="AREA", location=(-4, -3, 4)); bpy.context.object.data.energy = 300
+if scn.camera is None:
+    import mathutils
+    pts = [o.matrix_world @ mathutils.Vector(c) for o in scn.objects if o.type == "MESH" for c in o.bound_box]
+    ctr = sum(pts, mathutils.Vector()) / len(pts) if pts else mathutils.Vector((0, 0, 0))
+    size = max((max(p[i] for p in pts) - min(p[i] for p in pts)) for i in range(3)) if pts else 2
+    bpy.ops.object.camera_add(location=ctr + mathutils.Vector((1.6, -2.0, 1.1)) * max(size, 1) * 1.6)
+    cam = bpy.context.object
+    cam.rotation_euler = (ctr - cam.location).to_track_quat("-Z", "Y").to_euler()
+    scn.camera = cam
+if scn.world is None:
+    scn.world = bpy.data.worlds.new("World")
+scn.world.use_nodes = True
+bg = scn.world.node_tree.nodes.get("Background")
+if bg and not os.environ.get("PANDA_3D_KEEPWORLD"):
+    bg.inputs[0].default_value = (0.05, 0.055, 0.07, 1)
+scn.render.engine = "CYCLES"
+scn.cycles.device = "CPU"
+scn.cycles.samples = S
+scn.render.resolution_x, scn.render.resolution_y = W, H
+scn.render.image_settings.file_format = "PNG"
+scn.render.filepath = os.path.join(out, "render.png")
+bpy.ops.render.render(write_still=True)
+try:
+    bpy.ops.export_scene.gltf(filepath=os.path.join(out, "model.glb"), export_format="GLB")
+except Exception as e:
+    print("glb export failed:", e)
+bpy.ops.wm.save_as_mainfile(filepath=os.path.join(out, "scene.blend"))
+print("PANDA_3D_DONE")
+'''
+
+
+def blender_cmd(script: str):
+    exe = shutil.which("blender")
+    if exe:
+        return [exe, "-b", "--factory-startup", "--python", script]
+    import importlib.util
+    try:
+        if importlib.util.find_spec("bpy"):
+            return [sys.executable, script]
+    except Exception:
+        pass
+    return None
+
+
+def blender_status() -> dict:
+    cmd = blender_cmd(str(WORK / "x"))
+    return {"ready": bool(cmd), "installing": BLENDER["installing"], "log": BLENDER["log"][-1500:], "error": BLENDER["error"]}
+
+
+def blender_install():
+    if BLENDER["installing"]:
+        return {"ok": True}
+    BLENDER.update(installing=True, log="Installing Blender (this takes a few minutes)...\n", error="")
+
+    def run():
+        try:
+            steps = [[sys.executable, "-m", "pip", "install", "bpy"],
+                     ["bash", "-c", "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq blender"]]
+            for st in steps:
+                p = subprocess.run(st, capture_output=True, text=True, timeout=1500)
+                BLENDER["log"] += (p.stdout + p.stderr)[-800:]
+                if blender_cmd(str(WORK / "x")):
+                    return
+            BLENDER["error"] = "Could not install Blender here."
+        except Exception as exc:
+            BLENDER["error"] = scrub(exc)
+        finally:
+            BLENDER["installing"] = False
+    threading.Thread(target=run, daemon=True).start()
+    return {"ok": True}
+
+
+def blender_render(b: dict) -> dict:
+    script = str(b.get("script") or "")
+    if not script.strip() or len(script) > 200000:
+        return {"error": "Write a Blender (bpy) script first."}
+    name = re.sub(r"[^A-Za-z0-9_-]+", "-", str(b.get("name") or "scene")).strip("-")[:40] or "scene"
+    out = WORKSPACE / "3d" / name
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "scene.py").write_text(script)
+    (out / "_run.py").write_text(BLENDER_WRAP)
+    cmd = blender_cmd(str(out / "_run.py"))
+    if not cmd:
+        return {"error": "Blender is not installed yet. Press Install Blender first."}
+    def num(k, lo, hi, d):
+        try:
+            return max(lo, min(hi, int(b.get(k) or d)))
+        except Exception:
+            return d
+    env = dict(os.environ, PANDA_3D_OUT=str(out), PANDA_3D_W=str(num("width", 64, 3840, 960)),
+               PANDA_3D_H=str(num("height", 64, 2160, 540)), PANDA_3D_SAMPLES=str(num("samples", 1, 512, 24)))
+    for old in ("render.png", "model.glb", "scene.blend"):
+        (out / old).unlink(missing_ok=True)
+    jid = uuid.uuid4().hex[:10]
+    job = JOBS[jid] = {"state": "running", "log": "", "started": time.time(), "dir": f"3d/{name}"}
+
+    def run():
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=1200, env=env, cwd=str(out))
+            job["log"] = (p.stdout + p.stderr)[-4000:]
+            ok = (out / "render.png").is_file()
+            job["state"] = "done" if ok else "error"
+            if ok:
+                job["image"] = f"3d/{name}/render.png"
+                if (out / "model.glb").is_file():
+                    job["model"] = f"3d/{name}/model.glb"
+                if (out / "scene.blend").is_file():
+                    job["blend"] = f"3d/{name}/scene.blend"
+            else:
+                job["error"] = "The render failed. See the log."
+        except subprocess.TimeoutExpired:
+            job["state"], job["error"] = "error", "The render took longer than 20 minutes."
+        except Exception as exc:
+            job["state"], job["error"] = "error", scrub(exc)
+    threading.Thread(target=run, daemon=True).start()
+    while len(JOBS) > 30:
+        JOBS.pop(next(iter(JOBS)))
+    return {"id": jid}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "panda"
@@ -1395,6 +1561,10 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(img)
             return
+        if u.path == "/blender/status":
+            return self.send_json(blender_status())
+        if u.path == "/blender/job":
+            return self.send_json(JOBS.get(parse_qs(u.query).get("id", [""])[0]) or {"state": "error", "error": "No such render."})
         if u.path == "/files":
             return self.send_json({"files": list_files()})
         if u.path == "/file":
@@ -1434,7 +1604,8 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/delete":
                 return self.delete_file(str(json.loads(self.body() or b"{}").get("path") or ""))
             if u.path in ("/skills", "/mcp", "/memory", "/settings", "/schedules", "/schedules/run",
-                          "/notifications/clear", "/browser/act", "/github", "/browser/cookies"):
+                          "/notifications/clear", "/browser/act", "/github", "/browser/cookies",
+                          "/blender/render", "/blender/install"):
                 return self.send_json(self.change(u.path, json.loads(self.body(4 << 20) or b"{}")))
             if u.path == "/upload":
                 return self.upload()
@@ -1449,6 +1620,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": "not found"}, 404)
 
     def change(self, path: str, b: dict) -> dict:
+        if path == "/blender/render":
+            return blender_render(b)
+        if path == "/blender/install":
+            return blender_install()
         if path == "/browser/act":
             return browser_act(b)
         if path == "/schedules/run":

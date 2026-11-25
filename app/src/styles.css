@@ -583,5 +583,25 @@ code, kbd, pre { font-family: var(--mono); }
 .bp-keys .btn { padding: 0 9px; flex: none; }
 .flip { display: inline-flex; transform: rotate(180deg); }
 
+
+/* 3D studio */
+.studio { padding: 20px; overflow: auto; height: 100%; display: flex; flex-direction: column; gap: 14px; }
+.studio-cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.studio-col { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.studio-card { border: 1px solid var(--border); background: var(--bg-2); border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.studio-code { width: 100%; min-height: 360px; resize: vertical; font-family: var(--code-font, ui-monospace, monospace); font-size: 12.5px; line-height: 1.5; padding: 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-2); color: var(--text); }
+.studio-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: end; }
+.studio-row label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+.studio-row input { width: 90px; min-height: 32px; padding: 0 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-2); color: var(--text); }
+.studio-tabs { display: flex; gap: 6px; }
+.studio-tabs button { min-height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: 8px; background: transparent; color: var(--muted); }
+.studio-tabs button.active { background: var(--bg-2); color: var(--text); }
+.studio-img { width: 100%; border-radius: 10px; border: 1px solid var(--border); }
+.studio-viewer { width: 100%; height: 420px; border-radius: 10px; overflow: hidden; border: 1px solid var(--border); }
+.studio-viewer canvas { display: block; }
+.studio-log { max-height: 200px; overflow: auto; font-size: 11.5px; white-space: pre-wrap; margin: 0; }
+.studio-err { color: var(--danger); margin: 0; }
+@media (max-width: 800px) { .studio-cols { grid-template-columns: 1fr; } }
+
 /* last, so it wins over component display rules */
 @media (max-width: 700px) { .hide-narrow { display: none !important; } }

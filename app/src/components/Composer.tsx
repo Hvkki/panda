@@ -21,6 +21,8 @@ type Props = {
   /** Where attachments go on the worker (a project's or the Developer folder). */
   target?: UploadTarget;
   placeholder?: string;
+  /** Keeps the unsent text in this browser under this key, so it survives closing the app. */
+  draftKey?: string;
   /** Load Claude Code's slash commands from the worker (needs it online); `dev` picks the Developer folder. */
   commands?: { online: boolean; dev?: boolean };
 };
@@ -55,8 +57,12 @@ type Rec = { lang: string; continuous: boolean; interimResults: boolean; start()
 const SpeechRec: (new () => Rec) | undefined =
   typeof window !== "undefined" ? ((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition) : undefined;
 
-export function Composer({ model, effort, onModel, onSend, onStop, busy, autoFocus, canAttach, target, placeholder, commands }: Props) {
-  const [text, setText] = useState("");
+export function Composer({ model, effort, onModel, onSend, onStop, busy, autoFocus, canAttach, target, placeholder, commands, draftKey }: Props) {
+  const key = "panda.draft." + (draftKey || "home");
+  const [text, setText] = useState(() => { try { return localStorage.getItem(key) || ""; } catch { return ""; } });
+  useEffect(() => {
+    try { text ? localStorage.setItem(key, text) : localStorage.removeItem(key); } catch { /* storage blocked */ }
+  }, [key, text]);
   const [modelOpen, setModelOpen] = useState(false);
   const slash = useCommands(commands);
   const canModel = !!(model && effort && onModel);

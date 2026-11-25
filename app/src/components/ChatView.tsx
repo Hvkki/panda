@@ -284,7 +284,7 @@ export function ChatView({ chat, onSend, onRetry, onStop, canAttach, onModel }: 
             ))}
           </div>
         )}
-        <Composer onSend={send} model={chat.model} effort={chat.effort} onModel={onModel}
+        <Composer draftKey={chat.id} onSend={send} model={chat.model} effort={chat.effort} onModel={onModel}
           commands={{ online: canAttach, dev: chat.dev }} onStop={() => { setQueue([]); onStop(); }}
           busy={busy} autoFocus canAttach={canAttach} target={{ folder: chat.project_id, dev: chat.dev }}
           placeholder={chat.dev ? "Tell Claude what to change in Panda" : undefined} />

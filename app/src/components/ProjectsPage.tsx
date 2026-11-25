@@ -73,7 +73,7 @@ function ProjectDetail(p: Props & { project: Project }) {
         onBlur={(e) => { const name = e.target.value.trim(); if (name && name !== project.name) p.onPatch(project.id, { name }); }} />
       <div className="project-layout">
         <div>
-          <Composer model={p.draft.model} effort={p.draft.effort} onModel={p.onDraft} canAttach={p.online}
+          <Composer draftKey={"project-" + project.id} model={p.draft.model} effort={p.draft.effort} onModel={p.onDraft} canAttach={p.online}
             target={{ folder: project.id }} placeholder={`New chat in ${project.name}`}
             onSend={(text, attached) => p.onStartChat(text, attached, project.id)} />
           <div className="project-chats">

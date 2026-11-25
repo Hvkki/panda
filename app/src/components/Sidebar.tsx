@@ -2,9 +2,9 @@ import { useRef, useState } from "react";
 import { useDismiss } from "../lib/dismiss";
 import type { Chat } from "../lib/store";
 import { Wordmark } from "./Logo";
-import { IconBell, IconCode, IconEdit, IconFolder, IconGear, IconGrid, IconPin, IconPlus, IconSearch, IconSliders, IconTrash } from "./Icons";
+import { IconBell, IconCode, IconCube, IconEdit, IconFolder, IconGear, IconGrid, IconPin, IconPlus, IconSearch, IconSliders, IconTrash } from "./Icons";
 
-export type View = "chat" | "files" | "projects" | "developer" | "customize";
+export type View = "chat" | "files" | "projects" | "developer" | "studio" | "customize";
 
 type Props = {
   chats: Chat[];
@@ -35,6 +35,7 @@ export function Sidebar(p: Props) {
         <button onClick={p.onSearch}><IconSearch /> Search</button>
         <button className={p.view === "projects" ? "active" : ""} onClick={() => p.onGo("projects")}><IconFolder /> Projects</button>
         <button className={p.view === "developer" ? "active" : ""} onClick={() => p.onGo("developer")}><IconCode /> Developer</button>
+        <button className={p.view === "studio" ? "active" : ""} onClick={() => p.onGo("studio")}><IconCube /> 3D studio</button>
         <button className={p.view === "files" ? "active" : ""} onClick={() => p.onGo("files")}><IconGrid /> Files</button>
         <button className={p.view === "customize" ? "active" : ""} onClick={() => p.onGo("customize")}><IconSliders /> Customize</button>
         <button onClick={p.onNotifications}><IconBell /> Notifications {p.unread > 0 && <span className="badge">{p.unread}</span>}</button>
