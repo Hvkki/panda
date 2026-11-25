@@ -93,7 +93,7 @@ function ProjectDetail(p: Props & { project: Project }) {
           </div>
           <div className="side-card">
             <h3>Files</h3>
-            <p className="muted small">Files you attach in this project go to its folder on the worker. They are lost when the worker stops, like all worker files.</p>
+            <p className="muted small">Files you attach in this project go to its folder on the worker. They are deleted when you press Stop, like all worker files.</p>
           </div>
           <button className="btn danger-text" onClick={() => {
             if (confirm(`Delete project "${project.name}"? Its chats stay in your chat list.`)) { p.onRemove(project.id); p.onOpenProject(null); }

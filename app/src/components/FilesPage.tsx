@@ -5,7 +5,7 @@ import { IconTrash } from "./Icons";
 
 const size = (n: number) => (n > 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 
-/** Files Claude Code made in the worker's workspace this run. They are lost when the worker stops. */
+/** Files Claude Code made in the worker's workspace. They carry over when the worker renews itself, and are lost when you press Stop. */
 export function FilesPage({ online }: { online: boolean }) {
   const [files, setFiles] = useState<WorkFile[] | null>(null);
   const [err, setErr] = useState("");
@@ -23,7 +23,7 @@ export function FilesPage({ online }: { online: boolean }) {
           <button className="btn" onClick={load}>Refresh</button>
         </div>}
       </div>
-      <p className="muted">Files live on the Kaggle worker and disappear when it stops. Download what you want to keep.</p>
+      <p className="muted">Files live on the Kaggle worker. They carry over when it renews itself every ~11 hours, but are deleted when you press Stop. Download what you want to keep.</p>
       {!online ? <StartNote what="see its files" /> : err ? <p className="login-msg">{err}</p> :
         files === null ? <p className="muted">Loading…</p> : files.length === 0 ? <p className="muted">No files yet.</p> : (
           <div className="card-list">

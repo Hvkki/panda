@@ -235,7 +235,7 @@ function Scheduled({ saved, reload }: P) {
   );
   return (
     <>
-      <p className="muted">Claude runs these on the worker and the results land in Notifications. They only run while the worker is online (it stops after about 11 hours or when you press Stop).</p>
+      <p className="muted">Claude runs these on the worker and the results land in Notifications. They run while the worker is online. It renews itself every ~11 hours without a break, so they keep running until you press Stop.</p>
       <button className="btn primary" onClick={() => setEdit(blank())}><IconPlus size={16} /> New task</button>
       <div className="card-list" style={{ marginTop: 14 }}>
         {saved.schedules.length === 0 && <p className="muted">No scheduled tasks yet.</p>}
