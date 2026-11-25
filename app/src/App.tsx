@@ -27,15 +27,33 @@ export default function App() {
   return <Shell onLogout={() => { setPassword(""); setSignedIn(false); }} />;
 }
 
+const PLACE_KEY = "panda.place.v1";
+const VIEWS: View[] = ["chat", "files", "projects", "developer", "customize"];
+function lastPlace(): { view: View; activeId: string | null; projectId: string | null } {
+  try {
+    const p = JSON.parse(localStorage.getItem(PLACE_KEY) || "{}");
+    return { view: VIEWS.includes(p.view) ? p.view : "chat", activeId: typeof p.activeId === "string" ? p.activeId : null,
+      projectId: typeof p.projectId === "string" ? p.projectId : null };
+  } catch { return { view: "chat", activeId: null, projectId: null }; }
+}
+
 function Shell({ onLogout }: { onLogout: () => void }) {
   const { chats, add, remove, patchChat, patchMessage, importChats, clearAll } = useChats();
   const { projects, addProject, patchProject, removeProject } = useProjects();
   const projectsRef = useRef(projects);
   useEffect(() => { projectsRef.current = projects; }, [projects]);
-  const [projectId, setProjectId] = useState<string | null>(null);
+  // The open page and chat survive a reload (phones reload background tabs), so a reply that is still
+  // streaming stays on screen instead of the app opening on a blank new chat.
+  const [projectId, setProjectId] = useState<string | null>(() => lastPlace().projectId);
   const worker = useWorker(onLogout);
-  const [activeId, setActiveId] = useState<string | null>(null);
-  const [view, setView] = useState<View>("chat");
+  const [activeId, setActiveId] = useState<string | null>(() => {
+    const id = lastPlace().activeId;
+    return id && chats.some((c) => c.id === id) ? id : null;
+  });
+  const [view, setView] = useState<View>(() => lastPlace().view);
+  useEffect(() => {
+    try { localStorage.setItem(PLACE_KEY, JSON.stringify({ view, activeId, projectId })); } catch { /* blocked */ }
+  }, [view, activeId, projectId]);
   const [sideOpen, setSideOpen] = useState(() => window.innerWidth > 900);
   const [draft, setDraft] = useState(() => ({ model: getSettings().defaultModel, effort: getSettings().defaultEffort }));
   const [modal, setModal] = useState<"search" | "notes" | "settings" | "usage" | null>(null);
@@ -96,7 +114,7 @@ function Shell({ onLogout }: { onLogout: () => void }) {
 
   /** Run one turn: make sure the worker is up, stream Claude Code's reply into the assistant message. */
   const runTurn = useCallback(async (chat: Chat, text: string, history: Message[]) => {
-    const reply: Message = { id: uid(), role: "assistant", content: "", status: "waiting", tools: [] };
+    const reply: Message = { id: uid(), role: "assistant", content: "", status: "waiting", tools: [], started: Date.now() };
     patchChat(chat.id, (c) => ({ ...c, messages: [...c.messages, reply] }));
     const upd = (fn: (m: Message) => Message) => patchMessage(chat.id, reply.id, fn);
     const ctl = new AbortController();

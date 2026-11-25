@@ -176,11 +176,12 @@ function LiveStatus({ m }: { m: Message }) {
   const word = m.status === "waiting" ? "Starting the worker" : tools.some((t) => !t.done) ? "Working"
     : m.content ? "Writing" : m.thinking ? "Thinking" : "Pondering";
   const [{ tick, secs }, setT] = useState({ tick: 0, secs: 0 });
+  const started = m.started;
   useEffect(() => {
-    const t0 = Date.now();
+    const t0 = started || Date.now();
     const id = window.setInterval(() => setT((v) => ({ tick: v.tick + 1, secs: Math.floor((Date.now() - t0) / 1000) })), 120);
     return () => window.clearInterval(id);
-  }, []);
+  }, [started]);
   return (
     <div className="live-status" role="status">
       <span className="live-glyph" aria-hidden>{GLYPHS[tick % GLYPHS.length]}</span>

@@ -8,6 +8,8 @@ export type Message = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  /** When a reply started (ms), so its timer keeps counting across a reload. */
+  started?: number;
   thinking?: string;
   tools?: Tool[];
   /** Order of text and tools (replies from before this existed have only content + tools). */
